@@ -1,8 +1,8 @@
 import { z } from 'zod';
 
-// The investigator's only way to answer. Bedrock has no forced tool choice or
-// structured output for these models, so the schema is enforced here, in code,
-// and evidence must point at tool results that actually happened.
+// The monitor's only way to answer. Bedrock has no forced tool choice or
+// structured output for these models, so the schema is enforced in code, and
+// evidence must point at tool results that actually happened in this run.
 export const ReportShape = {
   title: z.string().min(5).max(140).describe('One line: what is wrong, where. No severity words.'),
   severity: z
@@ -17,10 +17,10 @@ export const ReportShape = {
     confidence: z.enum(['high', 'medium', 'low']),
   }),
   evidence: z
-    .array(z.object({ id: z.string().regex(/^E\d+$/), claim: z.string().min(5).max(300) }))
+    .array(z.object({ id: z.string().regex(/^E-[0-9a-f]{4}-\d+$/), claim: z.string().min(5).max(300) }))
     .min(1)
     .max(12)
-    .describe('Each claim must cite the evidence id (E1, E2, …) printed at the top of a tool result.'),
+    .describe('Each claim must cite the evidence_id printed at the top of a tool result (like E-1a2b-3).'),
   suggested_fix: z.string().min(5).max(700).describe('A recommendation for a human. You cannot act.'),
   not_checked: z.array(z.string().max(200)).max(10).describe('What you could not or did not verify.'),
   rows: z.array(z.string()).min(1).describe('The patrol row keys this report explains, copied exactly.'),
@@ -38,9 +38,9 @@ export const ReportShape = {
 export const Report = z.object(ReportShape);
 export type Report = z.infer<typeof Report>;
 
-export function checkReport(r: Report, knownEvidence: Set<string>, knownRows: Set<string>): string[] {
+// Beyond the schema. Evidence ids are checked by the engine against the run's registry.
+export function checkReport(r: Report, knownRows: Set<string>): string[] {
   const problems: string[] = [];
-  for (const e of r.evidence) if (!knownEvidence.has(e.id)) problems.push(`evidence ${e.id} does not match any tool result`);
   for (const k of r.rows) if (!knownRows.has(k)) problems.push(`row key not in this patrol: ${k}`);
   if (r.noise_rule && r.severity !== 'noise') problems.push('noise_rule is only allowed with severity "noise"');
   if (r.severity === 'critical' && /^unknown$/i.test(r.impact.trim())) problems.push('critical needs measured impact; use major if impact is unknown');

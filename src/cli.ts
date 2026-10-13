@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { loadConfig, loadDotEnv, type Config } from './config.js';
@@ -9,10 +9,25 @@ import { Noise } from './patrol/noise.js';
 import { State } from './patrol/state.js';
 import { rowLine } from './patrol/summary.js';
 import { CardSink } from './output/sink.js';
-import { patrolOnce } from './runner.js';
+import { listAgents, loadAgent } from './engine/agent.js';
+import { Ledger } from './engine/ledger.js';
+import { findingsOutput, renderFindings } from './engine/output.js';
+import { runAgent, type Engine } from './engine/run.js';
+import { sdkSession } from './engine/session.js';
+import { patrolOnce, type MonitorAgent } from './runner.js';
 
-const USAGE = `sre-agent <command> [options]
+const USAGE = `engine <command> [options]
 
+Agents (folders in agents/):
+  agents                      list agents with version, model, tools and limits
+  run <agent> --task "<text>" one run of a task agent (research, codebase)
+      --path <dir>            folder the codebase agent may read (required for it)
+      --challenge             have a challenger check the answer
+  run monitor                 one patrol with the investigator (same as: patrol --llm)
+  runs [--agent <name>]       recent runs from the ledger, with cost and status
+  stop | resume               create or remove the STOP file: running agents stop at the next step
+
+Monitor:
   doctor                      check access, list datasources, show real metric labels
   patrol                      one patrol pass
       --at <ISO>              evaluate at a past time (replay against live data)
@@ -37,6 +52,10 @@ const { positionals, values: a } = parseArgs({
     step: { type: 'string' },
     out: { type: 'string' },
     replay: { type: 'string' },
+    task: { type: 'string' },
+    path: { type: 'string' },
+    agent: { type: 'string' },
+    challenge: { type: 'boolean', default: false },
     llm: { type: 'boolean', default: false },
     post: { type: 'boolean', default: false },
     fresh: { type: 'boolean', default: false },
@@ -57,6 +76,20 @@ function date(s: string | undefined, name: string): Date {
   if (Number.isNaN(d.getTime())) throw new Error(`--${name} must be an ISO time, e.g. 2026-09-29T12:00:00Z`);
   return d;
 }
+function makeEngine(cfg: Config): Engine {
+  return {
+    ledger: new Ledger(join(cfg.runsDir, 'ledger.jsonl')),
+    runsDir: cfg.runsDir,
+    stopFile: join(cfg.runsDir, 'STOP'),
+    session: sdkSession,
+    dailyCapUsd: cfg.llm.dailyCapUsd,
+    llmAvailable: cfg.llm.available,
+  };
+}
+function monitorAgent(cfg: Config): MonitorAgent {
+  return { engine: makeEngine(cfg), agent: loadAgent(join(cfg.agentsDir, 'monitor')) };
+}
+
 // Patrol times sit on window boundaries so recordings and replays line up.
 const align = (d: Date, min: number) => new Date(Math.floor(d.getTime() / (min * 60_000)) * min * 60_000);
 
@@ -120,7 +153,7 @@ async function doctor(cfg: Config) {
       console.log(`Tempo: ERROR ${(e as Error).message}`);
     }
   } else console.log('Tempo: not configured');
-  console.log(`\nLLM: ${cfg.llm.available ? `credentials present, model ${cfg.llm.model}` : 'no credentials (patrol runs without the investigator)'}`);
+  console.log(`\nLLM: ${cfg.llm.available ? 'credentials present' : 'no credentials (patrol runs without the investigator)'}`);
 }
 
 async function main() {
@@ -136,13 +169,83 @@ async function main() {
   const w = cfg.windowMinutes;
 
   switch (cmd) {
+    case 'agents': {
+      for (const ag of listAgents(cfg.agentsDir)) {
+        const l = ag.spec.limits;
+        console.log(`${ag.spec.name.padEnd(10)} @${ag.version}  ${ag.spec.model}  ${ag.spec.every ? `every ${ag.spec.every}m` : 'manual'}  tools: ${[...ag.spec.builtin_tools, ...(ag.spec.code ? [`${ag.spec.code} pack`] : [])].join(', ') || 'none'}  $${l.usd_per_run}/run $${l.usd_per_day}/day ${l.deadline_min}min  challenge: ${ag.spec.challenge.when}`);
+        if (ag.spec.description) console.log(`           ${ag.spec.description}`);
+      }
+      return;
+    }
+
+    case 'run': {
+      const name = positionals[1];
+      if (!name) throw new Error('usage: run <agent> --task "<text>"');
+      if (name === 'monitor') {
+        const state = a.fresh ? State.memory() : State.load(cfg.stateFile);
+        const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, align(new Date(), w), { llm: true, post: a.post, log }, monitorAgent(cfg));
+        for (const c of r.cards) console.log(`card: ${c}`);
+        return;
+      }
+      const agent = loadAgent(join(cfg.agentsDir, name));
+      if (agent.spec.code) throw new Error(`${name} is driven by its own code; use its command`);
+      if (!a.task) throw new Error('--task is required');
+      const needsPath = agent.spec.builtin_tools.some((t) => t === 'Read' || t === 'Grep' || t === 'Glob');
+      if (needsPath && !a.path) throw new Error(`${name} reads local files: --path <dir> is required`);
+      const roots = needsPath ? [resolve(a.path!)] : undefined;
+      const r = await runAgent(makeEngine(cfg), {
+        agent,
+        trigger: 'manual',
+        task: roots ? `${a.task}\n\nThe folder you may read: ${roots[0]}` : a.task,
+        output: findingsOutput,
+        ...(a.challenge ? { challenge: true } : {}),
+        ...(roots ? { roots } : {}),
+      });
+      log(`${r.runId}: ${r.status}, ${r.evidence.items.size} tool call(s), ${r.turns} turn(s), $${r.cost.toFixed(3)}${r.challenge ? `, challenge ${r.challenge.verdict}` : ''}${r.note ? ` (${r.note})` : ''}`);
+      const f = r.outputs[0];
+      if (f) {
+        const md = renderFindings(f, `${name}@${agent.version} · run ${r.runId} · $${r.cost.toFixed(2)}${r.challenge ? ` · challenge ${r.challenge.verdict}` : ''}`);
+        if (r.dir) writeFileSync(join(r.dir, 'answer.md'), md + '\n');
+        console.log(md);
+        if (r.challenge?.blocking.length) console.log(`\n## Challenge: ESCALATE\n${r.challenge.blocking.map((o) => `- ${o.claim}\n  if acted on: ${o.failure_scenario}\n  check: ${o.settling_check}`).join('\n')}`);
+      }
+      if (r.dir) log(`run folder: ${r.dir}`);
+      if (r.status !== 'ok') process.exitCode = 1;
+      return;
+    }
+
+    case 'runs': {
+      const lines = new Ledger(join(cfg.runsDir, 'ledger.jsonl')).read().filter((l) => !a.agent || l.agent === a.agent);
+      const ends = lines.filter((l) => l.ev === 'end').slice(-30);
+      for (const l of ends) if (l.ev === 'end') console.log(`${l.at.slice(0, 19)}  ${l.agent.padEnd(10)} ${l.status.padEnd(9)} $${l.cost.toFixed(3).padStart(6)}  ${String(l.turns).padStart(3)} turns  ${l.outputs} out${l.challenge ? `  challenge ${l.challenge}` : ''}${l.note ? `  (${l.note})` : ''}  ${l.run}`);
+      const open = lines.filter((l) => l.ev === 'start' && !lines.some((m) => m.ev === 'end' && m.run === l.run));
+      for (const l of open) console.log(`RUNNING or CRASHED: ${l.run} (started ${l.at})`);
+      const day = new Date().toISOString().slice(0, 10);
+      console.log(`today: $${new Ledger(join(cfg.runsDir, 'ledger.jsonl')).spent(day).toFixed(2)} of $${cfg.llm.dailyCapUsd} global cap`);
+      return;
+    }
+
+    case 'stop': {
+      mkdirSync(cfg.runsDir, { recursive: true });
+      writeFileSync(join(cfg.runsDir, 'STOP'), new Date().toISOString() + '\n');
+      console.log('STOP file written: running agents stop at their next step; new runs are skipped until `resume`.');
+      return;
+    }
+
+    case 'resume': {
+      const f = join(cfg.runsDir, 'STOP');
+      if (existsSync(f)) unlinkSync(f);
+      console.log('STOP file removed.');
+      return;
+    }
+
     case 'doctor':
       return doctor(cfg);
 
     case 'patrol': {
       const state = a.fresh ? State.memory() : State.load(cfg.stateFile);
       const at = align(a.at ? date(a.at, 'at') : new Date(), w);
-      const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log });
+      const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log }, a.llm ? monitorAgent(cfg) : undefined);
       for (const row of r.summary.send) console.log(rowLine(row));
       for (const c of r.cards) console.log(`card: ${c}`);
       return;
@@ -151,10 +254,11 @@ async function main() {
     case 'loop': {
       const tel = telemetry(cfg);
       const state = State.load(cfg.stateFile);
+      const monitor = a.llm ? monitorAgent(cfg) : undefined;
       for (;;) {
         const at = align(new Date(), w);
         try {
-          await patrolOnce(tel, cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log });
+          await patrolOnce(tel, cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log }, monitor);
         } catch (e) {
           log(`patrol failed: ${(e as Error).message}`);
         }
@@ -206,13 +310,15 @@ async function main() {
       const outDir = resolve(cfg.outDir, `replay-${from.toISOString().slice(0, 16).replace(/:/g, '')}`);
       mkdirSync(outDir, { recursive: true });
       const replayCfg = { ...cfg, outDir };
+      // Replayed investigations keep their own ledger and run folders.
+      const monitor = a.llm ? { engine: { ...makeEngine({ ...cfg, runsDir: join(outDir, 'runs') }) }, agent: loadAgent(join(cfg.agentsDir, 'monitor')) } : undefined;
       const timeline: string[] = [`# Replay ${from.toISOString()} → ${to.toISOString()} (step ${step} min, window ${w} min)`, ''];
       for (let t = from; t <= to; t = new Date(t.getTime() + step * 60_000)) {
-        const r = await patrolOnce(tel, replayCfg, noise, state, new CardSink(outDir), t, { llm: a.llm, post: false, log });
+        const r = await patrolOnce(tel, replayCfg, noise, state, new CardSink(outDir), t, { llm: a.llm, post: false, log }, monitor);
         const down = r.summary.sources.filter((s) => !s.ok).map((s) => s.source);
         timeline.push(`## ${t.toISOString()}  send ${r.summary.send.length} · known ${r.summary.known.length} · recovered ${r.summary.recovered.length}${down.length ? ` · blind: ${down.join(', ')}` : ''}`);
         for (const row of r.summary.send) timeline.push(`- ${rowLine(row)}`);
-        if (r.investigation) timeline.push(`- investigator: ${r.investigation.outcome}, ${r.investigation.reports.length} report(s), $${r.investigation.costUsd.toFixed(2)}`);
+        if (r.investigation) timeline.push(`- investigator: ${r.investigation.status}, ${r.investigation.outputs.length} report(s), $${r.investigation.cost.toFixed(2)}${r.investigation.challenge ? `, challenge ${r.investigation.challenge.verdict}` : ''}`);
       }
       writeFileSync(join(outDir, 'timeline.md'), timeline.join('\n') + '\n');
       console.log(timeline.join('\n'));

@@ -1,0 +1,14 @@
+name: codebase
+description: Read-only investigation of a local folder (code, docs, configs). No web, no shell.
+model: claude-sonnet-5-5
+builtin_tools: [Read, Grep, Glob]
+limits:
+  max_turns: 60
+  usd_per_run: 2
+  usd_per_day: 10
+  deadline_min: 20
+challenge:
+  when: never # turn on per run with --challenge
+  model: claude-opus-5-5
+  usd: 1
+  max_turns: 30

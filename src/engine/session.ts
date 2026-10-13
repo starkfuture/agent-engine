@@ -1,0 +1,98 @@
+import { cpSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createSdkMcpServer, query, type HookCallbackMatcher, type HookEvent, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
+
+// Everything one model session needs. The engine builds it; a Session runs it.
+// Tests swap in a fake Session that calls the tool handlers directly.
+export interface SessionRequest {
+  model: string;
+  system: string;
+  prompt: string;
+  tools: SdkMcpToolDefinition<any>[]; // in-process tools (credentialed packs + submit)
+  builtin: string[]; // built-in Claude Code tools allowed in this session
+  hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>>;
+  maxTurns: number;
+  maxBudgetUsd: number;
+  abort: AbortController;
+  cwd: string;
+  pluginDir?: string; // agent folder with skills/ and agents/
+}
+
+export type SessionEvent =
+  | { kind: 'tool_use'; name: string; input: unknown }
+  | { kind: 'text'; text: string }
+  | { kind: 'result'; ok: boolean; subtype: string; cost: number; turns: number; text: string };
+
+export type Session = (r: SessionRequest) => AsyncIterable<SessionEvent>;
+
+export const MCP_NAME = 'engine';
+export const mcpName = (tool: string) => `mcp__${MCP_NAME}__${tool}`;
+
+// The subprocess gets only what it needs to reach the model. Credentialed tools
+// run in this process; the model only sees their output.
+function llmEnv(): Record<string, string | undefined> {
+  const keep = /^(PATH|LANG|ANTHROPIC_API_KEY|ANTHROPIC_BASE_URL|CLAUDE_CODE_USE_BEDROCK|AWS_REGION|AWS_PROFILE|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_CONFIG_FILE|AWS_SHARED_CREDENTIALS_FILE|HTTPS?_PROXY|NO_PROXY)$/;
+  const env: Record<string, string | undefined> = {
+    CLAUDE_AGENT_SDK_CLIENT_APP: 'agent-engine/0.1.0',
+    DISABLE_AUTOUPDATER: '1',
+    DISABLE_TELEMETRY: '1',
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+  };
+  for (const [k, v] of Object.entries(process.env)) if (keep.test(k)) env[k] = v;
+  // A throwaway HOME keeps ~/.claude, ~/.aws and dotfiles out of reach. Bedrock
+  // via an SSO profile needs the real one for its token cache.
+  env.HOME = process.env.CLAUDE_CODE_USE_BEDROCK === '1' ? process.env.HOME : mkdtempSync(join(tmpdir(), 'engine-home-'));
+  env.TMPDIR = process.env.TMPDIR;
+  return env;
+}
+
+// Skills and subagents load as a local plugin, so the folder never needs
+// settingSources (which would also load parent CLAUDE.md files and settings).
+// The copy also pins what this run loaded, whatever happens to the folder mid-run.
+export function pluginCopy(dir: string, name: string): string {
+  const root = mkdtempSync(join(tmpdir(), 'engine-plugin-'));
+  mkdirSync(join(root, '.claude-plugin'));
+  writeFileSync(join(root, '.claude-plugin', 'plugin.json'), JSON.stringify({ name, version: '0.0.0' }));
+  for (const sub of ['skills', 'agents']) if (existsSync(join(dir, sub))) cpSync(join(dir, sub), join(root, sub), { recursive: true });
+  return root;
+}
+
+export const sdkSession: Session = async function* (r) {
+  const server = createSdkMcpServer({ name: MCP_NAME, version: '0.1.0', tools: r.tools, alwaysLoad: true, timeout: 60_000 });
+  const plugins = r.pluginDir ? [{ type: 'local' as const, path: r.pluginDir }] : [];
+  const run = query({
+    prompt: r.prompt,
+    options: {
+      model: r.model,
+      systemPrompt: r.system,
+      tools: r.builtin, // [] = no shell, no files, no web
+      mcpServers: { [MCP_NAME]: server },
+      allowedTools: [...r.builtin, ...r.tools.map((t) => mcpName(t.name))],
+      strictMcpConfig: true,
+      settingSources: [], // no ~/.claude, no CLAUDE.md from parent folders
+      plugins,
+      ...(r.pluginDir ? { skills: 'all' as const } : {}),
+      permissionMode: 'dontAsk', // anything not allowed is denied, never prompted
+      hooks: r.hooks,
+      maxTurns: r.maxTurns,
+      maxBudgetUsd: r.maxBudgetUsd,
+      abortController: r.abort,
+      persistSession: false,
+      cwd: r.cwd,
+      env: llmEnv(),
+    },
+  });
+  for await (const m of run) {
+    if (m.type === 'assistant') {
+      for (const b of m.message.content) {
+        if (b.type === 'tool_use') yield { kind: 'tool_use', name: b.name, input: b.input };
+        else if (b.type === 'text') yield { kind: 'text', text: b.text };
+      }
+    } else if (m.type === 'result') {
+      const ok = m.subtype === 'success' && !m.is_error;
+      yield { kind: 'result', ok, subtype: m.subtype, cost: m.total_cost_usd ?? 0, turns: m.num_turns ?? 0, text: m.subtype === 'success' ? m.result : '' };
+    }
+  }
+};
+

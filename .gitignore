@@ -5,3 +5,8 @@ dist/
 .state/
 out/
 data/
+
+# Engine run folders, ledger and STOP file.
+runs/
+# Lessons runs propose; a human promotes them into lessons.md.
+agents/*/memory/proposed.md

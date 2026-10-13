@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fence, redact, templateOf } from '../src/patrol/text.js';
+import { fence, redact, templateOf } from '../src/engine/text.js';
 import { workloadOf } from '../src/patrol/collectors.js';
 import { withMatcher } from '../src/investigate/tools.js';
 

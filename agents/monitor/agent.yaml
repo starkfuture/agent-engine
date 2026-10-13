@@ -1,0 +1,18 @@
+name: monitor
+description: Production patrol every 15 min; investigates only what is new or worse.
+model: claude-sonnet-5-5
+code: monitor
+every: 15m
+sensitive_tools: true # Grafana/Prometheus/Loki/Tempo read access
+builtin_tools: [] # no shell, no files, no web
+limits:
+  max_turns: 30
+  usd_per_run: 1.5
+  usd_per_day: 10
+  deadline_min: 10
+challenge:
+  when: gate # deterministic: protected journey rows or big spikes (src/runner.ts)
+  model: claude-opus-5-5
+  usd: 1
+  max_turns: 15
+sinks: [file, slack]

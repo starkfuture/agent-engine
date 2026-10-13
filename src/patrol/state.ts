@@ -11,7 +11,7 @@ export interface RowMemory {
 }
 export interface StateData {
   rows: Record<string, RowMemory>;
-  spend: Record<string, number>; // UTC day -> USD
+  spend?: Record<string, number>; // legacy; spend is in the engine ledger now
 }
 
 const H = 3600_000;
@@ -27,7 +27,7 @@ export type Novelty = 'fresh' | 'worse' | 'reminder' | 'known';
 
 export class State {
   constructor(
-    readonly data: StateData = { rows: {}, spend: {} },
+    readonly data: StateData = { rows: {} },
     private readonly file?: string,
   ) {}
 
@@ -82,14 +82,5 @@ export class State {
     return Object.entries(this.data.rows)
       .filter(([k, m]) => !flaggedKeys.has(k) && m.lastReportedAt && Date.parse(m.lastSeen) >= cutoff)
       .map(([k]) => k);
-  }
-
-  spentToday(at: Date): number {
-    return this.data.spend[at.toISOString().slice(0, 10)] ?? 0;
-  }
-
-  addSpend(at: Date, usd: number): void {
-    const d = at.toISOString().slice(0, 10);
-    this.data.spend[d] = (this.data.spend[d] ?? 0) + usd;
   }
 }

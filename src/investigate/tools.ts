@@ -1,12 +1,12 @@
-import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
+import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Config, HttpFamily } from '../config.js';
 import type { Telemetry } from '../clients/telemetry.js';
+import type { Evidence } from '../engine/evidence.js';
+import type { ToolFactory } from '../engine/run.js';
 import { workloadOf } from '../patrol/collectors.js';
-import { fence, redact, templateOf, truncate } from '../patrol/text.js';
-import { checkReport, Report, ReportShape } from './report.js';
+import { templateOf, truncate } from '../engine/text.js';
 
-const MAX_OUT = 9000;
 const H = 3600_000;
 
 // Add a label matcher to a selector that may be `metric`, `metric{...}` or `{...}`.
@@ -32,25 +32,15 @@ function familiesFor(cfg: Config, service: string): Array<{ f: HttpFamily; sel: 
 
 const hhmm = (sec: number) => new Date(sec * 1000).toISOString().slice(5, 16).replace('T', ' ');
 
-export interface Investigation {
-  server: ReturnType<typeof createSdkMcpServer>;
-  toolNames: string[];
-  evidence: Map<string, { tool: string; args: unknown }>;
-  reports: Report[];
+// Read-only telemetry tools, anchored at `at` (the patrol time) so a replay of
+// 29 Sep investigates 29 Sep, not today. Every result is redacted, fenced and
+// stamped with an evidence id from the run's shared registry.
+export function monitorTools(tel: Telemetry, cfg: Config, at: Date): ToolFactory {
+  return (evidence: Evidence, by: string) => buildTools(tel, cfg, at, evidence, by);
 }
 
-// Read-only tools, anchored at `at` (the patrol time) so a replay of 29 Sep
-// investigates 29 Sep, not today.
-export function buildInvestigation(tel: Telemetry, cfg: Config, at: Date, rowKeys: Set<string>): Investigation {
-  const evidence = new Map<string, { tool: string; args: unknown }>();
-  const reports: Report[] = [];
-  const atSec = Math.floor(at.getTime() / 1000);
-
-  const ok = (toolName: string, args: unknown, body: string) => {
-    const id = `E${evidence.size + 1}`;
-    evidence.set(id, { tool: toolName, args });
-    return { content: [{ type: 'text' as const, text: `evidence_id: ${id}\n${fence(toolName, truncate(redact(body), MAX_OUT))}` }] };
-  };
+function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, by: string): SdkMcpToolDefinition<any>[] {
+  const ok = (toolName: string, args: unknown, body: string) => ({ content: [{ type: 'text' as const, text: evidence.stamp(evidence.add(by, toolName, args, body)) }] });
   const fail = (msg: string) => ({ content: [{ type: 'text' as const, text: `error: ${msg}` }], isError: true });
   const guard =
     <A>(name: string, fn: (a: A) => Promise<string>) =>
@@ -231,21 +221,6 @@ export function buildInvestigation(tel: Telemetry, cfg: Config, at: Date, rowKey
         return [`${hits.length} traces for ${traceql}`, ...hits.map((h) => `${new Date(h.startSec * 1000).toISOString()} ${h.rootService} ${h.rootName} ${h.durationMs}ms trace=${h.traceId}`)].join('\n');
       }),
     ),
-    tool(
-      'submit_report',
-      'Submit one report per distinct problem. Call it once for every problem you found (several calls are fine). Invalid reports come back with the reason; fix and resubmit.',
-      ReportShape,
-      async (args) => {
-        const parsed = Report.safeParse(args);
-        if (!parsed.success) return fail(parsed.error.message);
-        const problems = checkReport(parsed.data, new Set(evidence.keys()), rowKeys);
-        if (problems.length) return fail(problems.join('; '));
-        reports.push(parsed.data);
-        return { content: [{ type: 'text' as const, text: `accepted report ${reports.length}` }] };
-      },
-    ),
   ];
-
-  const server = createSdkMcpServer({ name: 'sre', version: '0.1.0', tools, alwaysLoad: true, timeout: 60_000 });
-  return { server, toolNames: tools.map((t) => `mcp__sre__${t.name}`), evidence, reports };
+  return tools;
 }

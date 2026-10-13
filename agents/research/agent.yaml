@@ -1,0 +1,14 @@
+name: research
+description: Web research on a question; answers with cited findings. No local files, no credentials.
+model: claude-sonnet-5-5
+builtin_tools: [WebSearch, WebFetch]
+limits:
+  max_turns: 40
+  usd_per_run: 2
+  usd_per_day: 10
+  deadline_min: 20
+challenge:
+  when: never # turn on per run with --challenge
+  model: claude-opus-5-5
+  usd: 1
+  max_turns: 20

@@ -2,12 +2,16 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Config } from './config.js';
 import type { Telemetry } from './clients/telemetry.js';
-import { investigate, type InvestigationResult } from './investigate/run.js';
+import type { LoadedAgent } from './engine/agent.js';
+import { runAgent, type Engine, type RunResult } from './engine/run.js';
+import { monitorTask } from './investigate/prompt.js';
+import { checkReport, Report, ReportShape } from './investigate/report.js';
+import { monitorTools } from './investigate/tools.js';
 import { patrolCard, reportCard } from './output/card.js';
 import type { CardSink } from './output/sink.js';
 import type { Noise } from './patrol/noise.js';
 import type { State } from './patrol/state.js';
-import { buildSummary, renderSummary, type Summary } from './patrol/summary.js';
+import { buildSummary, renderSummary, type FlaggedRow, type Summary } from './patrol/summary.js';
 
 export interface PatrolOptions {
   llm: boolean;
@@ -17,14 +21,25 @@ export interface PatrolOptions {
 
 export interface PatrolResult {
   summary: Summary;
-  investigation?: InvestigationResult;
+  investigation?: RunResult<Report>;
   cards: string[];
   skippedLlm?: string;
 }
 
+export interface MonitorAgent {
+  engine: Engine;
+  agent: LoadedAgent;
+}
+
 const stamp = (iso: string) => iso.replace(/[:.]/g, '').slice(0, 15) + 'Z';
 
-export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, state: State, sink: CardSink, at: Date, o: PatrolOptions): Promise<PatrolResult> {
+// Deterministic challenge gate: the model's own severity never decides whether
+// its work gets challenged. Protected journeys (never_suppress) and big jumps do.
+export function needsChallenge(rows: FlaggedRow[], noise: Noise): boolean {
+  return rows.some((r) => noise.protected(r) || (r.counts.now >= 50 && r.counts.now >= 5 * Math.max(1, r.score.expected)));
+}
+
+export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, state: State, sink: CardSink, at: Date, o: PatrolOptions, monitor?: MonitorAgent): Promise<PatrolResult> {
   const log = o.log ?? (() => {});
   const summary = await buildSummary(tel, cfg, noise, state, at);
   const dir = join(cfg.outDir, 'patrols');
@@ -39,30 +54,40 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     return result; // quiet patrol: no LLM call, no card, $0
   }
 
-  // Decide whether the LLM runs. Each reason it doesn't is stated on the card.
   let skip: string | undefined;
   if (!o.llm) skip = 'LLM disabled for this run';
-  else if (!cfg.llm.available) skip = 'no LLM credentials configured';
-  else if (state.spentToday(at) + cfg.llm.maxUsdPerInvestigation > cfg.llm.dailyCapUsd) skip = `daily cap $${cfg.llm.dailyCapUsd} reached`;
+  else if (!monitor) skip = 'no monitor agent loaded';
+  else if (!monitor.engine.llmAvailable) skip = 'no LLM credentials configured';
 
-  const covered = new Set<string>();
-  if (!skip) {
-    log(`investigating ${summary.send.length} row(s) with ${cfg.llm.model}…`);
-    const inv = await investigate(tel, cfg, summary, at);
+  // The deterministic card goes out first: the AI never delays what code found.
+  result.cards.push(await sink.emit(patrolCard(summary, skip ?? 'AI investigation running; report cards follow'), `${stamp(summary.at)}-rows`, o.post));
+
+  if (!skip && monitor) {
+    const rowKeys = new Set(summary.send.map((r) => r.key));
+    const challenge = needsChallenge(summary.send, noise);
+    log(`investigating ${summary.send.length} row(s) with ${monitor.agent.spec.model}${challenge ? ', then a challenger' : ''}…`);
+    const inv = await runAgent<Report>(monitor.engine, {
+      agent: monitor.agent,
+      trigger: o.llm ? 'patrol' : 'manual',
+      task: monitorTask([...rowKeys]),
+      data: renderSummary(summary),
+      tools: monitorTools(tel, cfg, at),
+      output: {
+        tool: 'submit_report',
+        description: 'Submit one report per distinct problem. Call it once for every problem you found (several calls are fine). Invalid reports come back with the reason; fix and resubmit.',
+        shape: ReportShape,
+        evidenceOf: (r) => r.evidence.map((e) => e.id),
+        check: (r) => checkReport(r, rowKeys),
+      },
+      challenge,
+    });
     result.investigation = inv;
-    state.addSpend(at, inv.costUsd);
-    log(`investigation ${inv.outcome}: ${inv.reports.length} report(s), ${inv.toolCalls} tool call(s), ${inv.turns} turn(s), $${inv.costUsd.toFixed(3)}${inv.note ? ` (${inv.note})` : ''}`);
-    const footer = `${cfg.llm.model} · ${inv.toolCalls} tool calls · $${inv.costUsd.toFixed(2)}`;
-    for (const [i, r] of inv.reports.entries()) {
-      result.cards.push(await sink.emit(reportCard(r, summary.at, footer), `${stamp(summary.at)}-${i + 1}`, o.post && r.severity !== 'noise'));
-      r.rows.forEach((k) => covered.add(k));
-    }
-    if (inv.outcome !== 'ok') skip = `investigator ${inv.outcome}${inv.note ? `: ${inv.note}` : ''}`;
+    log(`investigation ${inv.status}: ${inv.outputs.length} report(s), ${inv.evidence.items.size} tool call(s), ${inv.turns} turn(s), $${inv.cost.toFixed(3)}${inv.challenge ? `, challenge ${inv.challenge.verdict}` : ''}${inv.note ? ` (${inv.note})` : ''}`);
+    const footer = `${monitor.agent.spec.model} · ${inv.evidence.items.size} tool calls · $${inv.cost.toFixed(2)} · run ${inv.runId}`;
+    for (const [i, r] of inv.outputs.entries())
+      result.cards.push(await sink.emit(reportCard(r, summary.at, footer, inv.challenge), `${stamp(summary.at)}-${i + 1}`, o.post && r.severity !== 'noise'));
+    if (inv.status !== 'ok') skip = `investigator ${inv.status}${inv.note ? `: ${inv.note}` : ''}`;
   }
-
-  // Anything the investigator didn't cover still gets reported, as raw rows.
-  const uncovered: Summary = { ...summary, send: summary.send.filter((r) => !covered.has(r.key)) };
-  if (uncovered.send.length) result.cards.push(await sink.emit(patrolCard(uncovered, skip ?? 'not covered by any report'), `${stamp(summary.at)}-rows`, o.post));
   if (skip) result.skippedLlm = skip;
 
   for (const r of summary.send) state.reported(r, at);

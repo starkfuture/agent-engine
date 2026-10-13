@@ -19,7 +19,7 @@ export class CardSink {
       const res = await fetch(this.webhook, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text: card.text, blocks: card.blocks }),
+        body: JSON.stringify({ text: card.text, blocks: card.blocks, unfurl_links: false, unfurl_media: false }), // no link previews: unfurling is an outbound channel
         signal: AbortSignal.timeout(10_000),
       });
       if (!res.ok) throw new Error(`Slack webhook: HTTP ${res.status} ${await res.text()}`);

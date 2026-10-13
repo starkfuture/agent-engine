@@ -1,4 +1,47 @@
-# sre-agent
+# agent-engine (repo: sre-agent)
+
+A small host for **self-running agents** on the Claude Agent SDK. An agent is a folder; the engine runs it in a fresh session with hard limits, makes every claim cite a real tool result, optionally has a challenger check the answer, and records every run in a ledger. Agents are read-only and produce drafts.
+
+The first agent is **monitor**, an AI SRE patrol (below). The others, **research** (web) and **codebase** (a local folder), take tasks on demand.
+
+Design and research: `../agent_workspace/research/agent-engine-2026-10-14/` (05-DESIGN.md and 08-adjudication.md are the decisions).
+
+## The engine
+
+```bash
+npm run dev -- agents                                   # list agents: version, model, tools, limits
+npm run dev -- run research --task "How does X do Y?"   # web research, cited findings
+npm run dev -- run codebase --path ../backend-nest --task "Where is the token validated?"
+npm run dev -- run research --task "..." --challenge    # plus an independent challenger
+npm run dev -- runs                                     # ledger: status, cost, challenge verdict
+npm run dev -- stop | resume                            # kill switch for every agent
+```
+
+**An agent folder** (`agents/<name>/`):
+
+| File | What |
+|---|---|
+| `agent.yaml` | Model, interval, built-in tools, limits (turns, $/run, $/day, deadline), challenge policy, sinks |
+| `CLAUDE.md` | The system prompt |
+| `memory/lessons.md` | Read at every run start; curated by humans |
+| `memory/proposed.md` | Where runs propose lessons; a human promotes them (gitignored) |
+| `skills/`, `agents/` | Claude Code skills and subagents, loaded as a local plugin |
+
+Code-driven parts (a deterministic gate, credentialed tools, output checks) live in `src/`. The monitor's are `src/runner.ts` and `src/investigate/`.
+
+**What the engine enforces, in code:**
+- **Fresh session per run.** No `settingSources`, so no parent `CLAUDE.md` or settings. A throwaway `HOME`. The model holds no credentials: credentialed tools run in the engine process.
+- **Rule of Two at load time.** An agent can't have both sensitive reads (local files or credentialed tools) and web tools. Agent folders can't carry hooks or settings.
+- **Evidence.** Every tool result is redacted, fenced as untrusted data, and stamped with a per-run id (`E-7f3a-4`). Outputs come only through a submit tool; the engine checks the schema, that every cited id exists in this run, and the agent's own rules. The evidence hook fails closed.
+- **File access.** File tools stay inside `--path` and away from credential-like paths.
+- **Limits:** max turns, $ per run, a wall-clock deadline, $ per agent per day, a global $ per day, loop detection (the same call 3×), one run per agent at a time, and the STOP file. Money is reserved in the ledger before a run starts and settled after it; a crashed run keeps its reservation.
+- **challenge-lite.** One blind challenger in a fresh session, with the same read tools.
+  - A blocking objection needs a failure scenario, a settling check and a real evidence id; otherwise it becomes a note.
+  - The verdict is `upheld` or `escalate`, the latter meaning a human decides. There is no rebuttal round and no consensus-seeking.
+  - Grow it only from `challenge.json` evidence.
+- **Run folder** `runs/<agent>/<run>/`: `input.md`, `transcript.jsonl` (redacted), `evidence.jsonl`, `output.json`, `challenge.json`.
+
+## The monitor agent
 
 An AI SRE patrol for Stark's production platform. Every 15 minutes, code builds a **not-200 summary** of production. When something is new or worse, an LLM investigator works out what broke, since when, the impact and the likely cause, and writes a card.
 
@@ -13,8 +56,9 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
    - **Logs:** error lines grouped into stable templates.
    - **Traces:** error traces by root operation.
 2. **Filter.** Steady rows, known noise (`config/noise.yaml`) and already-reported rows are dropped. A quiet patrol ends here and costs $0.
-3. **Investigate.** Only if rows remain, the Agent SDK runs one investigator. It has read-only tools and no shell or files, and must submit schema-checked reports that cite evidence ids.
-4. **Card.** Cards go to `out/cards/`, and to Slack only with `--post` and a webhook. Rows the investigator didn't cover still get a card.
+3. **Card first.** The rows card goes to `out/cards/` (and to Slack with `--post` and a webhook) before any AI runs.
+4. **Investigate.** Only if rows remain, the engine runs the `monitor` agent. It has read-only telemetry tools and no shell, files or web, and must submit schema-checked reports that cite evidence ids.
+5. **Challenge.** For protected journeys or big spikes (a deterministic gate, never the model's severity), a challenger re-checks the report. Its verdict goes on the card.
 
 The baseline is `min(1 d, 7 d)`, scaled by current traffic, so a one-day incident doesn't become its own baseline the next day. The 1 h window only labels a row "started" or "ongoing".
 
@@ -25,7 +69,7 @@ npm install
 cp .env.example .env          # set LOKI/TEMPO uids after `doctor`
 npm run dev -- doctor         # VPN on: checks access and shows the real metric labels
 npm run dev -- patrol         # one patrol now, no LLM
-npm run dev -- patrol --llm   # with the investigator (ANTHROPIC_API_KEY or Bedrock)
+npm run dev -- patrol --llm   # with the monitor agent (ANTHROPIC_API_KEY or Bedrock)
 npm run dev -- loop --llm     # every 15 min (local shadow)
 ```
 
@@ -44,9 +88,9 @@ npm run dev -- replay --from 2026-09-29T00:00:00Z --to 2026-10-01T00:00:00Z --re
 ### Tests
 
 ```bash
-npm test             # unit and patrol tests on a synthetic 29 Sep incident
+npm test             # engine rules (fake model session) and the patrol on a synthetic 29 Sep incident
 npm run typecheck
-npm run smoke:llm    # real model, fake telemetry: checks the LLM path without VPN
+npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end to end, without VPN
 ```
 
 ## Layout
@@ -57,23 +101,33 @@ npm run smoke:llm    # real model, fake telemetry: checks the LLM path without V
 | `config/noise.yaml` | Known noise (reason and expiry required) and the never-suppress list. |
 | `src/clients/telemetry.ts` | Grafana datasource proxy client (Prometheus, Loki, Tempo), plus record and replay. |
 | `src/patrol/` | Collectors, scoring, noise, state, summary. |
-| `src/investigate/` | Tools, prompt, report schema, Agent SDK runner. |
+| `src/engine/` | The engine: agent loader, run, session (SDK), evidence, guard, ledger, challenge, generic output. |
+| `agents/` | Agent folders: `monitor`, `research`, `codebase`. |
+| `src/investigate/` | Monitor: telemetry tools, task prompt, report schema. |
 | `src/output/` | Card rendering (Slack Block Kit and Markdown) and the sink. |
-| `src/runner.ts`, `src/cli.ts` | Patrol orchestration and commands. |
+| `src/runner.ts`, `src/cli.ts` | Patrol orchestration (card first, challenge gate) and commands. |
 
 ## Guardrails in code
 
 - **Telemetry is read-only by construction.** The client has no write method, and Prometheus and Loki calls are concurrency-capped.
-- **The model holds no credentials.** Tools run in this process. The SDK subprocess gets only model credentials, with `tools: []`, `settingSources: []`, `strictMcpConfig` and `dontAsk`.
+- **The model holds no credentials.** Tools run in this process. The SDK subprocess gets only model credentials, with no built-in tools, `settingSources: []`, `strictMcpConfig` and `dontAsk`.
 - **PII and secrets are redacted** before anything reaches the model, a card or disk. Log text is fenced as untrusted data.
 - **Reports are checked in code:** the zod schema, cited evidence ids must exist, row keys must be real, and a critical report must have measured impact.
-- **Spend is capped:** a per-investigation budget (`SRE_MAX_USD_PER_INVESTIGATION`) and a daily cap (`SRE_DAILY_CAP_USD`). The patrol keeps reporting when the cap is reached.
+- **Spend is capped** by the engine: `agents/monitor/agent.yaml` limits plus `ENGINE_DAILY_CAP_USD`. The patrol keeps reporting when a cap is reached.
 
 ## Not built yet
 
-- Paging and the "on fire" rules: these are Prometheus rules, kept separate on purpose.
-- The in-cluster deploy: `sre` namespace, Bedrock EU and three identities.
-- Slack thread Q&A.
-- Business metrics and support-ticket counts.
-- The daily Opus sweep.
-- GitHub and code tools for the investigator.
+- **Engine:**
+  - launchd/cron scheduling for interval agents (`loop` covers the monitor today);
+  - Slack or webhook task intake;
+  - a cross-vendor challenger;
+  - memory consolidation;
+  - OTEL;
+  - action runs behind approval buttons.
+- **Monitor:**
+  - Paging and the "on fire" rules: these are Prometheus rules, kept separate on purpose.
+  - The in-cluster deploy: `sre` namespace, Bedrock EU and three identities.
+  - Slack thread Q&A.
+  - Business metrics and support-ticket counts.
+  - The daily Opus sweep.
+  - GitHub and code tools for the investigator.

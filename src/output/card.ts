@@ -1,6 +1,7 @@
+import type { ChallengeResult } from '../engine/challenge.js';
 import type { Report } from '../investigate/report.js';
 import { rowLine, type Summary } from '../patrol/summary.js';
-import { redact } from '../patrol/text.js';
+import { redact } from '../engine/text.js';
 
 const SEV = { critical: '🔴', major: '🟠', minor: '🟡', noise: '⚪' } as const;
 const clip = (s: string, n = 2900) => (s.length > n ? `${s.slice(0, n - 1)}…` : s); // Slack section text limit is 3000
@@ -11,7 +12,16 @@ export interface Card {
   markdown: string;
 }
 
-export function reportCard(r: Report, patrolAt: string, footer: string): Card {
+// What the challenger concluded, in one block. Escalate = a human decides.
+function challengeLines(c: ChallengeResult | undefined): string[] {
+  if (!c) return [];
+  if (c.verdict === 'error') return [`Challenge did not complete (${c.note ?? 'unknown'}); this report is unchallenged.`];
+  const head = c.verdict === 'upheld' ? `Challenge: upheld. ${c.overall}` : `⚠️ Challenge: ESCALATE, needs a human decision. ${c.overall}`;
+  return [head, ...c.blocking.map((o) => `• Objection: ${o.claim} (if acted on: ${o.failure_scenario}; check: ${o.settling_check}; ${o.evidence.join(', ')})`), ...(c.notes.length ? [`${c.notes.length} non-blocking note(s) in the run folder.`] : [])];
+}
+
+export function reportCard(r: Report, patrolAt: string, footer: string, challenge?: ChallengeResult): Card {
+  const ch = challengeLines(challenge);
   const md = [
     `## ${SEV[r.severity]} ${r.title}`,
     `**Status:** ${r.status} · **Since:** ${r.started_at} · **Severity (advisory):** ${r.severity} · **Confidence:** ${r.cause.confidence}`,
@@ -28,6 +38,7 @@ export function reportCard(r: Report, patrolAt: string, footer: string): Card {
     ...r.evidence.map((e) => `- ${e.id}: ${e.claim}`),
     ...(r.not_checked.length ? ['', '**Not checked**', ...r.not_checked.map((x) => `- ${x}`)] : []),
     ...(r.noise_rule ? ['', '**Proposed noise rule (needs review)**', '```yaml', JSON.stringify(r.noise_rule, null, 2), '```'] : []),
+    ...(ch.length ? ['', '**Challenge**', ...ch] : []),
     '',
     `_Rows: ${r.rows.join(', ')} · patrol ${patrolAt} · ${footer}_`,
   ].join('\n');
@@ -45,6 +56,7 @@ export function reportCard(r: Report, patrolAt: string, footer: string): Card {
     section('Suggested fix', r.suggested_fix),
     section('Evidence', r.evidence.map((e) => `• ${e.id}: ${e.claim}`).join('\n')),
     ...(r.not_checked.length ? [section('Not checked', r.not_checked.map((x) => `• ${x}`).join('\n'))] : []),
+    ...(ch.length ? [section('Challenge', ch.join('\n'))] : []),
     { type: 'context', elements: [{ type: 'mrkdwn', text: clip(`patrol ${patrolAt} · ${footer}`, 300) }] },
   ];
   return { text: redact(`${SEV[r.severity]} ${r.title}`), blocks: JSON.parse(redact(JSON.stringify(blocks))), markdown: redact(md) };

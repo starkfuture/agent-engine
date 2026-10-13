@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { redact } from '../patrol/text.js';
+import { redact } from '../engine/text.js';
 
 export interface Sample {
   labels: Record<string, string>;

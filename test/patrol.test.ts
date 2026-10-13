@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -10,7 +10,12 @@ import { CardSink } from '../src/output/sink.js';
 import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
 import { buildSummary, renderSummary } from '../src/patrol/summary.js';
-import { patrolOnce } from '../src/runner.js';
+import { loadAgent } from '../src/engine/agent.js';
+import { Ledger } from '../src/engine/ledger.js';
+import type { Session } from '../src/engine/session.js';
+import type { FlaggedRow } from '../src/patrol/summary.js';
+import { needsChallenge, patrolOnce, type MonitorAgent } from '../src/runner.js';
+import { fakeSession, ok } from './fake-session.js';
 import { DAY, FakeTelemetry, H, INCIDENT_START, world } from './fake.js';
 
 const cfg = (): Config => ({
@@ -32,7 +37,9 @@ const cfg = (): Config => ({
   noiseFile: '/dev/null',
   stateFile: join(mkdtempSync(join(tmpdir(), 'sre-test-')), 'state.json'),
   outDir: mkdtempSync(join(tmpdir(), 'sre-out-')),
-  llm: { model: 'x', maxUsdPerInvestigation: 1, dailyCapUsd: 10, maxTurns: 5, available: false },
+  llm: { available: false, dailyCapUsd: 10 },
+  agentsDir: join(import.meta.dirname, '..', 'agents'),
+  runsDir: mkdtempSync(join(tmpdir(), 'sre-runs-')),
   slackWebhookUrl: undefined,
 });
 
@@ -110,10 +117,52 @@ test('quiet patrol costs nothing and writes no card', async () => {
 
 test('without LLM credentials the patrol still writes a rows card and says why', async () => {
   const c = cfg();
-  const r = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false });
+  const r = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false }, monitor(c, fakeSession(), false));
   assert.equal(r.skippedLlm, 'no LLM credentials configured');
   assert.equal(r.cards.length, 1);
   assert.ok(r.cards[0]!.endsWith('-rows.md'));
+});
+
+function monitor(c: Config, session: Session, llmAvailable = true): MonitorAgent {
+  return {
+    engine: { ledger: new Ledger(join(c.runsDir, 'ledger.jsonl')), runsDir: c.runsDir, stopFile: join(c.runsDir, 'STOP'), session, dailyCapUsd: 20, llmAvailable },
+    agent: loadAgent(join(c.agentsDir, 'monitor')),
+  };
+}
+
+test('the rows card goes out before the AI; reports cite real tool results; protected journeys get challenged', async () => {
+  const c = cfg();
+  const noise = new Noise({ never_suppress: [{ section: 'http', route: '.*(reset|signup).*', status: '4..' }] });
+  const keys = ['http|backend-production|/v1/auth/password/reset|400', 'http|backend-production|/v1/auth/signup|400'];
+  const session = fakeSession(
+    async function* (sim) {
+      const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+      const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+      assert.match(out.text, /password\/reset 400 \| 75/);
+      const r = await sim.mcp('submit_report', report({ evidence: [{ id, claim: '75 of 95 reset requests returned 400' }], rows: keys }));
+      assert.equal(r.isError, false, r.text);
+      yield ok(0.4, 6);
+    },
+    async function* (sim) {
+      assert.equal(sim.req.model, 'claude-opus-5-5');
+      await sim.mcp('submit_challenge', { objections: [], overall: 'Holds up: the counts match the evidence.' });
+      yield ok(0.2, 2);
+    },
+  );
+  const r = await patrolOnce(new FakeTelemetry(world), c, noise, State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false }, monitor(c, session));
+  assert.equal(r.investigation?.status, 'ok');
+  assert.equal(r.investigation?.challenge?.verdict, 'upheld');
+  assert.equal(r.cards.length, 2);
+  assert.ok(r.cards[0]!.endsWith('-rows.md'), 'deterministic card first');
+  assert.match(readFileSync(r.cards[1]!, 'utf8'), /Challenge: upheld/);
+  assert.equal(session.requests[0]!.builtin.length, 0, 'monitor gets no built-in tools');
+});
+
+test('challenge gate is deterministic: an unprotected modest spike is not challenged', () => {
+  const row = { key: 'k', section: 'http', service: 's', subject: '/v1/products', status: '404', counts: { now: 30, h1: 2, d1: 2, d7: 2 }, score: { verdict: 'spike', expected: 2, z: 9, trend: 'started' }, novelty: 'fresh', firstSeen: '' } as unknown as FlaggedRow;
+  assert.equal(needsChallenge([row], new Noise({})), false);
+  assert.equal(needsChallenge([{ ...row, counts: { ...row.counts, now: 60 } }], new Noise({})), true);
+  assert.equal(needsChallenge([row], new Noise({ never_suppress: [{ section: 'http', route: '/v1/products' }] })), true);
 });
 
 const report = (over: Partial<Report> = {}): Report => ({
@@ -124,19 +173,18 @@ const report = (over: Partial<Report> = {}): Report => ({
   what_broke: 'POST /v1/auth/password/reset returns 400',
   impact: '~75% of reset requests in 15 min',
   cause: { hypothesis: 'validation change', confidence: 'medium' },
-  evidence: [{ id: 'E1', claim: '75 of 95 requests were 400' }],
+  evidence: [{ id: 'E-abcd-1', claim: '75 of 95 requests were 400' }],
   suggested_fix: 'roll back the validation change',
   not_checked: [],
   rows: ['http|backend-production|/v1/auth/password/reset|400'],
   ...over,
 });
 
-test('reports must cite real evidence and real rows', () => {
+test('reports must cover real rows and state measured impact for critical', () => {
   const rows = new Set(['http|backend-production|/v1/auth/password/reset|400']);
-  assert.deepEqual(checkReport(report(), new Set(['E1']), rows), []);
-  assert.match(checkReport(report(), new Set(['E2']), rows).join(), /E1 does not match/);
-  assert.match(checkReport(report({ rows: ['made-up'] }), new Set(['E1']), rows).join(), /not in this patrol/);
-  assert.match(checkReport(report({ impact: 'unknown' }), new Set(['E1']), rows).join(), /critical needs measured impact/);
+  assert.deepEqual(checkReport(report(), rows), []);
+  assert.match(checkReport(report({ rows: ['made-up'] }), rows).join(), /not in this patrol/);
+  assert.match(checkReport(report({ impact: 'unknown' }), rows).join(), /critical needs measured impact/);
 });
 
 test('card redacts what the model wrote', () => {

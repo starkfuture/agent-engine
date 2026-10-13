@@ -49,13 +49,13 @@ export interface Config {
   stateFile: string;
   outDir: string;
   llm: {
-    model: string;
-    maxUsdPerInvestigation: number;
-    dailyCapUsd: number;
-    maxTurns: number;
     // True when some credential the Agent SDK can use is present.
     available: boolean;
+    // Across all agents. Per-agent limits live in agents/<name>/agent.yaml.
+    dailyCapUsd: number;
   };
+  agentsDir: string;
+  runsDir: string;
   slackWebhookUrl: string | undefined;
 }
 
@@ -92,12 +92,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     stateFile: r(env.SRE_STATE_FILE ?? '.state/state.json'),
     outDir: r(env.SRE_OUT_DIR ?? 'out'),
     llm: {
-      model: env.SRE_MODEL || 'claude-sonnet-5-5',
-      maxUsdPerInvestigation: num(env.SRE_MAX_USD_PER_INVESTIGATION, 1.5),
-      dailyCapUsd: num(env.SRE_DAILY_CAP_USD, 10),
-      maxTurns: num(env.SRE_MAX_TURNS, 30),
       available: Boolean(env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_USE_BEDROCK === '1'),
+      dailyCapUsd: num(env.ENGINE_DAILY_CAP_USD, 20),
     },
+    agentsDir: r(env.ENGINE_AGENTS_DIR ?? 'agents'),
+    runsDir: r(env.ENGINE_RUNS_DIR ?? 'runs'),
     slackWebhookUrl: opt(env.SLACK_WEBHOOK_URL),
   };
 }

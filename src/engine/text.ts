@@ -3,9 +3,13 @@ import { createHash } from 'node:crypto';
 // PII and secrets are masked before any text leaves this process (LLM, Slack,
 // files on disk). Order matters: the most specific patterns run first.
 const REDACTIONS: Array<[RegExp, string]> = [
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '<private-key>'],
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '<jwt>'],
+  [/https:\/\/hooks\.slack\.com\/[A-Za-z0-9/_-]+/g, '<slack-webhook>'],
+  [/\b(?:sk-ant-[A-Za-z0-9_-]{8,}|glsa_[A-Za-z0-9_]{16,}|glc_[A-Za-z0-9+/=_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{16})\b/g, '<secret>'],
   [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 <secret>'],
-  [/\b(password|passwd|secret|token|api[_-]?key|authorization)("?\s*[:=]\s*"?)[^\s",}]+/gi, '$1$2<secret>'],
+  // key=value / "key": "value" where the key names a secret (covers ANTHROPIC_API_KEY=, aws_secret_access_key =, "accessToken": …)
+  [/\b([A-Za-z0-9_]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|authorization|credential)[A-Za-z0-9_]*)("?\s*[:=]\s*"?)[^\s",}]+/gi, '$1$2<secret>'],
   [/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<email>'],
   [/\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}\b/g, '<iban>'],
   // International form only: bare digit runs are usually order/VIN/ids we need as evidence.

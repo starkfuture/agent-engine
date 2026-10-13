@@ -1,7 +1,7 @@
 import type { ErrorCounter, HttpFamily, Sources } from '../config.js';
 import type { Sample, Telemetry } from '../clients/telemetry.js';
 import { DEFAULT_THRESHOLDS, isErrorStatus, scoreErrors, scoreTraffic, type Counts, type Thresholds } from './score.js';
-import { redact, templateOf, truncate } from './text.js';
+import { redact, templateOf, truncate } from '../engine/text.js';
 import { rowKey, type Change, type Row } from './types.js';
 
 const H = 3600_000;
