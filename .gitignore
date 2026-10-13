@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+# Local runtime state, outputs and exported prod telemetry: never commit.
+.state/
+out/
+data/

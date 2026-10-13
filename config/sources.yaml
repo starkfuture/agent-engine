@@ -1,0 +1,49 @@
+# What the patrol reads. Everything is a read-only query through the Grafana
+# datasource proxy. Labels marked UNVERIFIED must be checked with
+# `npm run dev -- doctor` (VPN on) before the replay can be trusted.
+
+http_families:
+  # The V3 services: one metric name per service, all carrying the same labels.
+  - id: v3
+    selector: '{__name__=~"[a-z_]+_svc_http_requests_total"}'
+    service_label: app
+    route_label: route
+    status_label: status_code
+
+  # Legacy /v1 backend. The 29-30 Sep sign-up/reset 400s live on this series.
+  - id: legacy-v1
+    selector: 'backend_be_production_http_requests_total'
+    service: backend-production
+    route_label: route         # UNVERIFIED
+    status_label: status_code  # UNVERIFIED
+
+  - id: keycloak
+    selector: 'http_server_requests_seconds_count{job="keycloak-production",uri!~"/auth/health.*|/auth/metrics"}'
+    service: keycloak
+    route_label: uri
+    status_label: status
+
+  # Mesh view of the legacy backend: no route, but it does not depend on app code.
+  - id: legacy-mesh
+    selector: 'istio_requests_total{destination_workload="backend-production",reporter="waypoint"}'
+    service: backend-production-mesh
+    status_label: response_code
+
+# Counters where any increase is bad, compared against the same baselines.
+error_counters:
+  - id: sqs-consumer-errors
+    selector: 'app_svc_sqs_message_errors_total'
+    group_by: [app, queue]       # queue label UNVERIFIED
+
+workloads:
+  namespaces: 'microservices|backend.*'
+
+logs:
+  selector: '{namespace="microservices"}'
+  error_filter: '|~ `(?i)(level"?\s*[:=]\s*"?(error|fatal)|\b(ERROR|FATAL)\b)`'
+  service_label: app
+  max_lines: 3000
+
+traces:
+  traceql: '{ status = error }'
+  limit: 300

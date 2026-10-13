@@ -1,0 +1,23 @@
+# Known noise: matching patrol rows are dropped before the LLM sees them.
+# Every entry needs a reason and an expiry; expired entries stop matching.
+# never_suppress wins over noise. All fields are regexes, anchored, case-insensitive.
+#
+# Grow this list from the shadow week, one reviewed entry at a time. It starts
+# empty on purpose: nothing is noise until someone has looked at it.
+
+never_suppress:
+  - section: http
+    route: '.*(login|logout|token|sign-?up|register|password|reset|confirm|checkout|payment|order).*'
+    status: '5..'
+  - section: http
+    service: keycloak
+    status: '5..'
+
+noise: []
+#  - id: example
+#    section: http            # http | drop | workload | errors | logs | traces
+#    service: some-service
+#    route: '/health.*'
+#    status: '404'
+#    reason: 'why this is expected'
+#    expires: 2026-12-31
