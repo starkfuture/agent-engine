@@ -8,7 +8,7 @@ import { FILE_TOOLS, WEB_TOOLS, type LoadedAgent } from './agent.js';
 import { challengeLite, type ChallengeResult } from './challenge.js';
 import { Evidence, evidenceHook } from './evidence.js';
 import { pathGuard } from './guard.js';
-import { pluginCopy, type Session, type SessionEvent, type SessionRequest } from './session.js';
+import { pluginCopy, SpendMeter, type Session, type SessionEvent, type SessionRequest } from './session.js';
 import { snapshot } from './snapshot.js';
 import type { RunStatus, Store } from './store.js';
 import { fence, redact, safeJson } from './text.js';
@@ -143,6 +143,9 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     abort.abort();
   };
   const timer = setTimeout(() => stop('deadline', `deadline ${spec.limits.deadline_min} min`), spec.limits.deadline_min * 60_000);
+  // The kill switch acts within seconds, also while the model is mid-turn.
+  const stopPoll = setInterval(() => existsSync(engine.stopFile) && stop('stopped', 'stop file'), 2000);
+  stopPoll.unref();
   input.signal?.addEventListener('abort', () => stop('stopped', String(input.signal?.reason ?? 'cancelled')));
   try {
     input.onAdmitted?.(runId);
@@ -155,6 +158,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     mkdirSync(dir, { recursive: true });
     const runDir = dir;
     const transcript = (by: string, e: SessionEvent) => {
+      if (e.kind === 'usage') return; // per-turn cost; the result carries the totals
       try {
         appendFileSync(join(runDir, 'transcript.jsonl'), safeJson({ by, ...e }) + '\n');
       } catch {
@@ -198,6 +202,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
 
     // Author.
     let gotResult = false;
+    const meter = new SpendMeter();
     const watchAuthor = watcher(engine.stopFile, stop);
     modelStarted = true;
     try {
@@ -213,6 +218,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
         maxBudgetUsd: spec.limits.usd_per_run,
       })) {
         transcript('author', e);
+        meter.observe(e);
         watchAuthor(e);
         if (e.kind === 'result') {
           gotResult = true;
@@ -230,7 +236,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
         note = (err as Error).message.slice(0, 300);
       }
     }
-    if (!gotResult) cost = spec.limits.usd_per_run; // aborted or crashed: book the whole allowance
+    if (!gotResult) cost = meter.unsettled(spec.limits.usd_per_run); // aborted or crashed: what was spent, plus the turn in flight
     if (evidence.failure && status === 'ok') {
       status = 'error';
       note = evidence.failure;
@@ -278,6 +284,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     if (!cost && modelStarted) cost = reserve; // unknown spend: book the whole reservation
   } finally {
     clearTimeout(timer);
+    clearInterval(stopPoll);
     if (stopped) status = stopped; // also when the deadline or STOP hit during the challenge
     const best = (f: () => void) => {
       try {

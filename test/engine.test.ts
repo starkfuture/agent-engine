@@ -315,7 +315,40 @@ test('a setup failure after admission settles the run and frees the agent', asyn
 
 // ---------- limits the SDK doesn't enforce ----------
 
-test('deadline aborts the run and books the whole allowance', async () => {
+test('a run that ends without a result books what it spent plus the turn in flight; unknown spend books the allowance', async () => {
+  const { SpendMeter } = await import('../src/engine/session.js');
+  const m = new SpendMeter();
+  m.observe({ kind: 'usage', id: 'a', cost: 0.1 });
+  m.observe({ kind: 'usage', id: 'a', cost: 0.1 }); // same message, several content blocks
+  m.observe({ kind: 'tool_use', name: 'Read', input: {} });
+  m.observe({ kind: 'usage', id: 'b', cost: 0.2 });
+  assert.ok(Math.abs(m.unsettled(2) - (0.3 + 0.5)) < 1e-9);
+  assert.equal(m.unsettled(0.6), 0.6, 'never above the allowance');
+  const noUsage = new SpendMeter();
+  noUsage.observe({ kind: 'text', text: 'hi' });
+  assert.equal(noUsage.unsettled(2), 2, 'turns happened but no usage arrived');
+  const unpriced = new SpendMeter();
+  unpriced.observe({ kind: 'usage', id: 'x' });
+  assert.equal(unpriced.unsettled(2), 2, 'a model without a price');
+});
+
+test('the kill switch stops a run within seconds, even mid-turn with no events', async () => {
+  const d = agentDir(`${web}\nlimits: { usd_per_run: 1 }`);
+  const s = fakeSession(async function* (sim) {
+    yield { kind: 'usage', id: 'm1', cost: 0.05 };
+    await sim.sleep(20_000);
+    yield ok();
+  });
+  const e = engine(s);
+  setTimeout(() => writeFileSync(e.stopFile, 'now'), 300);
+  const t0 = Date.now();
+  const r = await runAgent(e, { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput });
+  assert.equal(r.status, 'stopped');
+  assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0} ms`);
+  assert.ok(Math.abs(r.cost - 0.55) < 1e-9, String(r.cost));
+});
+
+test('deadline aborts the run; with no completed turn it books the in-flight margin', async () => {
   const d = agentDir(`${web}\nlimits: { deadline_min: 0.001, usd_per_run: 0.7 }`);
   const s = fakeSession(async function* (sim) {
     await sim.sleep(5_000);
@@ -324,7 +357,7 @@ test('deadline aborts the run and books the whole allowance', async () => {
   const e = engine(s);
   const r = await runAgent(e, { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput });
   assert.equal(r.status, 'deadline');
-  assert.equal(r.cost, 0.7);
+  assert.equal(r.cost, 0.5, 'min(allowance, max(25%, $0.5))');
   assert.equal(e.store.get(r.runId)?.status, 'deadline');
 });
 

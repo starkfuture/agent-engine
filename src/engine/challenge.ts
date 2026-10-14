@@ -1,7 +1,7 @@
 import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Evidence } from './evidence.js';
-import type { Session, SessionEvent, SessionRequest } from './session.js';
+import { SpendMeter, type Session, type SessionEvent, type SessionRequest } from './session.js';
 import { fence, safeJson } from './text.js';
 
 // challenge-lite: one blind challenger in a fresh context, with the same read
@@ -110,9 +110,11 @@ export async function challengeLite(a: ChallengeArgs): Promise<ChallengeResult> 
   let turns = 0;
   let gotResult = false;
   let failed: string | undefined;
+  const meter = new SpendMeter();
   try {
     for await (const e of a.session({ ...a.base, model: a.model, system: SYSTEM, prompt, tools: [...a.tools, submit], maxTurns: a.maxTurns, maxBudgetUsd: a.usd })) {
       a.onEvent?.(e);
+      meter.observe(e);
       if (e.kind === 'result') {
         gotResult = true;
         cost = e.cost;
@@ -123,7 +125,7 @@ export async function challengeLite(a: ChallengeArgs): Promise<ChallengeResult> 
   } catch (err) {
     failed = (err as Error).message.slice(0, 300);
   }
-  if (!gotResult) cost = a.usd; // aborted or crashed: book the whole allowance
+  if (!gotResult) cost = meter.unsettled(a.usd); // aborted or crashed: what was spent, plus the turn in flight
   failed ??= gotResult ? undefined : 'no result from the challenger session';
   const toolCalls = a.evidence.byWhom('challenger') - before;
   const base = { cost, turns, toolCalls };

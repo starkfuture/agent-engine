@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -109,6 +109,7 @@ test('only admins get the kill switch and lesson approval', async () => {
   for (const t of ['stop_all', 'resume', 'approve_lesson']) assert.ok(admin.includes(t), t);
   const { call } = await connect(ctx, who('root'));
   await call('stop_all', { reason: 'testing' });
+  assert.ok(existsSync(ctx.engine.stopFile));
   const skipped = await (await connect(ctx, who('ana'))).call('run_agent', { agent: 'research', task: 'Anything at all, please.' });
   assert.match(skipped.text, /skipped[\s\S]*stop file/);
   await call('approve_lesson', { agent: 'research', lesson: 'Prefer the official docs over blog posts.' });
@@ -145,6 +146,21 @@ test('runs start in the background; only the owner or an admin can cancel', asyn
   assert.match((await (await connect(ctx, who('bo'))).call('cancel_run', { run_id: runId })).text, /only cancel your own/);
   const c = await ana.call('cancel_run', { run_id: runId });
   assert.match(c.text, /stopped/, c.text);
+  assert.equal(ctx.engine.store.get(runId)!.status, 'stopped');
+});
+
+test('stop_all stops runs in progress at once', async () => {
+  const slow: Script = async function* (sim) {
+    yield say();
+    await sim.sleep(30_000);
+    yield ok();
+  };
+  const { ctx, who } = context(fakeSession(slow));
+  const started = await (await connect(ctx, who('ana'))).call('run_agent', { agent: 'research', task: 'A long question that takes a while.' });
+  const runId = /run (\S+): running/.exec(started.text)![1]!;
+  const t0 = Date.now();
+  assert.match((await (await connect(ctx, who('root'))).call('stop_all', { reason: 'incident' })).text, /1 run\(s\) in this server told to stop/);
+  while (ctx.engine.store.get(runId)!.status === 'running' && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 50));
   assert.equal(ctx.engine.store.get(runId)!.status, 'stopped');
 });
 

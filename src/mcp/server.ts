@@ -298,7 +298,8 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       async ({ reason }) => {
         mkdirSync(ctx.cfg.runsDir, { recursive: true });
         writeFileSync(ctx.engine.stopFile, `${new Date().toISOString()} ${user.name}: ${reason.replace(/\s+/g, ' ')}\n`);
-        return text('STOP set');
+        for (const r of runs.values()) r.controller.abort(`stop_all by ${user.name}`);
+        return text(`STOP set; ${runs.size} run(s) in this server told to stop now`);
       },
     );
     s.registerTool('resume', { description: 'Admin: clear the kill switch.', inputSchema: {} }, async () => {

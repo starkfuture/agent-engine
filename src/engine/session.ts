@@ -28,7 +28,8 @@ export const READ_DENY = ['**/.env', '**/.env.*', '**/*.pem', '**/*.key', '**/*.
 export type SessionEvent =
   | { kind: 'tool_use'; name: string; input: unknown }
   | { kind: 'text'; text: string }
-  | { kind: 'result'; ok: boolean; subtype: string; cost: number; turns: number; text: string; usage?: unknown }; // usage: per-model tokens and cost basis, kept in transcript.jsonl
+  | { kind: 'result'; ok: boolean; subtype: string; cost: number; turns: number; text: string; usage?: unknown } // usage: per-model tokens and cost basis, kept in transcript.jsonl
+  | { kind: 'usage'; id: string; cost?: number }; // one completed model turn; cost undefined when the model has no price
 
 export type Session = (r: SessionRequest) => AsyncIterable<SessionEvent>;
 
@@ -103,6 +104,40 @@ export function realCost(cliTotal: number, usage: unknown, multiplier = 1): numb
   return sum;
 }
 
+// Price one model turn from its usage block (Messages API field names).
+export function turnCost(model: string, u: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number | null; cache_read_input_tokens?: number | null } | undefined, multiplier = 1): number | undefined {
+  const key = Object.keys(PRICES).find((k) => model.includes(k));
+  if (!key || !u) return undefined;
+  const p = PRICES[key]!;
+  return (((u.input_tokens ?? 0) * p[0] + (u.output_tokens ?? 0) * p[1] + (u.cache_creation_input_tokens ?? 0) * p[2] + (u.cache_read_input_tokens ?? 0) * p[3]) / 1e6) * multiplier;
+}
+
+// What a session spent so far, from completed turns. Used when a session ends
+// without a result message (cancelled, deadline, crash): book what was spent
+// plus the turn that may have been in flight, never more than the allowance.
+// If spend can't be known (turns happened but no usage arrived, or a model
+// has no price), book the whole allowance.
+export class SpendMeter {
+  private readonly seen = new Set<string>();
+  private priced = 0;
+  private unpriced = false;
+  private steps = 0;
+
+  observe(e: SessionEvent): void {
+    if (e.kind === 'usage') {
+      if (this.seen.has(e.id)) return;
+      this.seen.add(e.id);
+      if (e.cost === undefined) this.unpriced = true;
+      else this.priced += e.cost;
+    } else if (e.kind === 'tool_use' || e.kind === 'text') this.steps++;
+  }
+
+  unsettled(allowance: number): number {
+    if (this.unpriced || (this.steps > 0 && this.seen.size === 0)) return allowance;
+    return Math.min(allowance, this.priced + Math.max(0.25 * allowance, 0.5));
+  }
+}
+
 export const sdkSession: Session = async function* (r) {
   const server = createSdkMcpServer({ name: MCP_NAME, version: '0.1.0', tools: r.tools, alwaysLoad: true, timeout: 60_000 });
   const plugins = r.pluginDir ? [{ type: 'local' as const, path: r.pluginDir }] : [];
@@ -133,15 +168,17 @@ export const sdkSession: Session = async function* (r) {
       env: llmEnv(),
     },
   });
+  const multiplier = process.env.CLAUDE_CODE_USE_BEDROCK === '1' ? BEDROCK_EU : 1;
   for await (const m of run) {
     if (m.type === 'assistant') {
+      yield { kind: 'usage', id: m.message.id ?? m.uuid, cost: turnCost(String(m.message.model ?? r.model), m.message.usage as never, multiplier) };
       for (const b of m.message.content) {
         if (b.type === 'tool_use') yield { kind: 'tool_use', name: b.name, input: b.input };
         else if (b.type === 'text') yield { kind: 'text', text: b.text };
       }
     } else if (m.type === 'result') {
       const ok = m.subtype === 'success' && !m.is_error;
-      const cost = realCost(m.total_cost_usd ?? 0, m.modelUsage, process.env.CLAUDE_CODE_USE_BEDROCK === '1' ? BEDROCK_EU : 1);
+      const cost = realCost(m.total_cost_usd ?? 0, m.modelUsage, multiplier);
       yield { kind: 'result', ok, subtype: m.subtype, cost, turns: m.num_turns ?? 0, text: m.subtype === 'success' ? m.result : '', usage: { cliCostUsd: m.total_cost_usd, models: m.modelUsage } };
     }
   }
