@@ -8,6 +8,7 @@ import { loadConfig } from '../src/config.js';
 import { listAgents, loadAgent } from '../src/engine/agent.js';
 import { judge } from '../src/engine/challenge.js';
 import { Evidence } from '../src/engine/evidence.js';
+import { redactDeep } from '../src/engine/text.js';
 import { pathAllowed } from '../src/engine/guard.js';
 import { findingsOutput, type Findings } from '../src/engine/output.js';
 import { runAgent, type Engine, type ToolFactory } from '../src/engine/run.js';
@@ -164,6 +165,15 @@ test('a quote copied with Read line numbers still matches', () => {
   const ev = new Evidence();
   const it = ev.add('author', 'Read', {}, 'const a = 1;\nconst b = 2;');
   assert.equal(ev.quoteProblem(it.id, '     1→const a = 1;\n     2→const b = 2;'), undefined);
+});
+
+test('token counts are not mistaken for secrets', () => {
+  const v = redactDeep({ inputTokens: 1200, max_output_tokens: 64000, token: 'abc123secret', apiToken: 99, refreshTokens: 'r-secret' }) as Record<string, unknown>;
+  assert.equal(v.inputTokens, 1200);
+  assert.equal(v.max_output_tokens, 64000);
+  assert.equal(v.token, '<secret>');
+  assert.equal(v.apiToken, '<secret>');
+  assert.equal(v.refreshTokens, '<secret>');
 });
 
 test('secrets inside structured tool output never reach the model', async () => {

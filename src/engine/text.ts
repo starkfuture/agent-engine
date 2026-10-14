@@ -32,7 +32,14 @@ export function redact(s: string): string {
   return out;
 }
 
-export const SECRET_KEY_EXACT = new RegExp(`^${SECRET_KEY}$`, 'i');
+const SECRET_KEY_EXACT = new RegExp(`^${SECRET_KEY}$`, 'i');
+// Whether a key's value is a secret to mask. Token *counts* (inputTokens: 1200)
+// are usage numbers; a string under the same key is still masked.
+export function secretValue(k: string, x: unknown): boolean {
+  if (!SECRET_KEY_EXACT.test(k)) return false;
+  if (typeof x === 'string') return true;
+  return typeof x === 'number' && !/tokens$/i.test(k);
+}
 
 // Redact a structured value before it is serialised. Serialising first hides
 // secrets behind JSON escaping (\"password\":\"x\"), so walk the values instead:
@@ -53,7 +60,7 @@ export function redactDeep(v: unknown, depth = 0): unknown {
   if (Array.isArray(v)) return v.map((x) => redactDeep(x, depth));
   if (v && typeof v === 'object') {
     const out: Record<string, unknown> = {};
-    for (const [k, x] of Object.entries(v)) out[k] = SECRET_KEY_EXACT.test(k) && (typeof x === 'string' || typeof x === 'number') ? '<secret>' : redactDeep(x, depth);
+    for (const [k, x] of Object.entries(v)) out[k] = secretValue(k, x) ? '<secret>' : redactDeep(x, depth);
     return out;
   }
   return v;

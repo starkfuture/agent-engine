@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { HookCallbackMatcher } from '@anthropic-ai/claude-agent-sdk';
-import { fence, redact, redactDeep, safeJson, SECRET_KEY_EXACT, truncate } from './text.js';
+import { fence, redact, redactDeep, safeJson, secretValue, truncate } from './text.js';
 
 const MAX_OUT = 9000;
 
@@ -79,7 +79,7 @@ export function redactShape(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(redactShape);
   if (v && typeof v === 'object') {
     const out: Record<string, unknown> = {};
-    for (const [k, x] of Object.entries(v)) out[k] = SECRET_KEY_EXACT.test(k) && typeof x === 'string' ? '<secret>' : redactShape(x);
+    for (const [k, x] of Object.entries(v)) out[k] = secretValue(k, x) && typeof x === 'string' ? '<secret>' : redactShape(x);
     return out;
   }
   return v;

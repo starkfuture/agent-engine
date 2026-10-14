@@ -28,7 +28,7 @@ export const READ_DENY = ['**/.env', '**/.env.*', '**/*.pem', '**/*.key', '**/*.
 export type SessionEvent =
   | { kind: 'tool_use'; name: string; input: unknown }
   | { kind: 'text'; text: string }
-  | { kind: 'result'; ok: boolean; subtype: string; cost: number; turns: number; text: string };
+  | { kind: 'result'; ok: boolean; subtype: string; cost: number; turns: number; text: string; usage?: unknown }; // usage: per-model tokens and cost basis, kept in transcript.jsonl
 
 export type Session = (r: SessionRequest) => AsyncIterable<SessionEvent>;
 
@@ -103,7 +103,7 @@ export const sdkSession: Session = async function* (r) {
       }
     } else if (m.type === 'result') {
       const ok = m.subtype === 'success' && !m.is_error;
-      yield { kind: 'result', ok, subtype: m.subtype, cost: m.total_cost_usd ?? 0, turns: m.num_turns ?? 0, text: m.subtype === 'success' ? m.result : '' };
+      yield { kind: 'result', ok, subtype: m.subtype, cost: m.total_cost_usd ?? 0, turns: m.num_turns ?? 0, text: m.subtype === 'success' ? m.result : '', usage: m.modelUsage };
     }
   }
 };
