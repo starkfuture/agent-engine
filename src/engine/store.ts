@@ -21,6 +21,7 @@ export interface RunRow {
   challenge: string | null;
   note: string | null;
   ended_at: string | null;
+  requested_by: string | null;
 }
 
 export interface Admission {
@@ -34,6 +35,10 @@ export interface Admission {
   agentCap: number;
   globalCap: number;
   monthlyCap?: number; // across all agents, UTC calendar month
+  concurrency?: number; // runs of this agent at once (default 1)
+  user?: string; // who asked (MCP); scheduled runs have none
+  userCap?: number; // that person's daily spend, across agents
+  userMaxRunning?: number; // that person's runs at once
 }
 
 // How long past its deadline a "running" row may sit before it is reaped as
@@ -60,8 +65,15 @@ export class Store {
         challenge TEXT, note TEXT, ended_at TEXT
       );
       CREATE INDEX IF NOT EXISTS runs_day ON runs (day, agent);
+      CREATE INDEX IF NOT EXISTS runs_started ON runs (started_at);
       CREATE INDEX IF NOT EXISTS runs_running ON runs (status) WHERE status = 'running';
     `);
+    this.migrate();
+  }
+
+  private migrate(): void {
+    const cols = new Set((this.db.prepare(`PRAGMA table_info(runs)`).all() as Array<{ name: string }>).map((c) => c.name));
+    if (!cols.has('requested_by')) this.db.exec(`ALTER TABLE runs ADD COLUMN requested_by TEXT`);
   }
 
   private tx<T>(fn: () => T): T {
@@ -88,24 +100,31 @@ export class Store {
   }
 
   // `day` is a UTC day (2026-10-14) or a month prefix (2026-10).
-  private spentIn(day: string, agent?: string): number {
-    const sql = `SELECT COALESCE(SUM(CASE WHEN status = 'running' THEN reserve ELSE COALESCE(cost, 0) END), 0) AS s FROM runs WHERE ${day.length === 7 ? 'substr(day, 1, 7)' : 'day'} = ?${agent ? ' AND agent = ?' : ''}`;
-    const row = (agent ? this.db.prepare(sql).get(day, agent) : this.db.prepare(sql).get(day)) as { s: number };
+  private spentIn(day: string, agent?: string, user?: string): number {
+    const where = [`${day.length === 7 ? 'substr(day, 1, 7)' : 'day'} = ?`, ...(agent ? ['agent = ?'] : []), ...(user ? ['requested_by = ?'] : [])];
+    const sql = `SELECT COALESCE(SUM(CASE WHEN status = 'running' THEN reserve ELSE COALESCE(cost, 0) END), 0) AS s FROM runs WHERE ${where.join(' AND ')}`;
+    const row = this.db.prepare(sql).get(day, ...(agent ? [agent] : []), ...(user ? [user] : [])) as { s: number };
     return row.s;
+  }
+
+  private running(col: 'agent' | 'requested_by', v: string): string[] {
+    return (this.db.prepare(`SELECT id FROM runs WHERE status = 'running' AND ${col} = ?`).all(v) as Array<{ id: string }>).map((r) => r.id);
   }
 
   admit(a: Admission): { ok: true } | { ok: false; reason: string } {
     const day = a.now.toISOString().slice(0, 10);
     return this.tx(() => {
       this.reap(a.now);
-      const busy = this.db.prepare(`SELECT id FROM runs WHERE status = 'running' AND agent = ?`).get(a.agent) as { id: string } | undefined;
-      if (busy) return { ok: false as const, reason: `another run of this agent is in progress (${busy.id})` };
+      const busy = this.running('agent', a.agent);
+      if (busy.length >= (a.concurrency ?? 1)) return { ok: false as const, reason: `another run of this agent is in progress (${busy.join(', ')})` };
+      if (a.user && a.userMaxRunning !== undefined && this.running('requested_by', a.user).length >= a.userMaxRunning) return { ok: false as const, reason: `you already have ${a.userMaxRunning} run(s) in progress` };
+      if (a.user && a.userCap !== undefined && this.spentIn(day, undefined, a.user) + a.reserve > a.userCap) return { ok: false as const, reason: `your daily cap $${a.userCap} reached` };
       if (this.spentIn(day, a.agent) + a.reserve > a.agentCap) return { ok: false as const, reason: `agent daily cap $${a.agentCap} reached` };
       if (this.spentIn(day) + a.reserve > a.globalCap) return { ok: false as const, reason: `global daily cap $${a.globalCap} reached` };
       if (a.monthlyCap !== undefined && this.spentIn(day.slice(0, 7)) + a.reserve > a.monthlyCap) return { ok: false as const, reason: `monthly cap $${a.monthlyCap} reached` };
       this.db
-        .prepare(`INSERT INTO runs (id, agent, version, trigger, day, started_at, deadline_at, pid, reserve, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')`)
-        .run(a.id, a.agent, a.version, a.trigger, day, a.now.toISOString(), new Date(a.now.getTime() + a.deadlineMs).toISOString(), process.pid, a.reserve);
+        .prepare(`INSERT INTO runs (id, agent, version, trigger, day, started_at, deadline_at, pid, reserve, status, requested_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)`)
+        .run(a.id, a.agent, a.version, a.trigger, day, a.now.toISOString(), new Date(a.now.getTime() + a.deadlineMs).toISOString(), process.pid, a.reserve, a.user ?? null);
       return { ok: true as const };
     });
   }
@@ -117,20 +136,23 @@ export class Store {
   }
 
   // A run that never started, recorded so `runs` shows why.
-  skipped(a: { id: string; agent: string; version: string; trigger: string; now: Date; note: string }): void {
+  skipped(a: { id: string; agent: string; version: string; trigger: string; now: Date; note: string; user?: string }): void {
     const at = a.now.toISOString();
     this.db
-      .prepare(`INSERT INTO runs (id, agent, version, trigger, day, started_at, deadline_at, pid, reserve, status, cost, turns, outputs, note, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'skipped', 0, 0, 0, ?, ?)`)
-      .run(a.id, a.agent, a.version, a.trigger, at.slice(0, 10), at, at, process.pid, a.note, at);
+      .prepare(`INSERT INTO runs (id, agent, version, trigger, day, started_at, deadline_at, pid, reserve, status, cost, turns, outputs, note, ended_at, requested_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'skipped', 0, 0, 0, ?, ?, ?)`)
+      .run(a.id, a.agent, a.version, a.trigger, at.slice(0, 10), at, at, process.pid, a.note, at, a.user ?? null);
   }
 
-  spent(day: string, agent?: string): number {
-    return this.spentIn(day, agent);
+  // `day` is a UTC day or a month prefix (2026-10).
+  spent(day: string, agent?: string, user?: string): number {
+    return this.spentIn(day, agent, user);
   }
 
-  recent(limit = 30, agent?: string): RunRow[] {
-    const sql = `SELECT * FROM runs${agent ? ' WHERE agent = ?' : ''} ORDER BY started_at DESC LIMIT ?`;
-    return (agent ? this.db.prepare(sql).all(agent, limit) : this.db.prepare(sql).all(limit)) as unknown as RunRow[];
+  recent(limit = 30, agentOrFilter?: string | { agent?: string; user?: string }): RunRow[] {
+    const f = typeof agentOrFilter === 'string' ? { agent: agentOrFilter } : (agentOrFilter ?? {});
+    const where = [...(f.agent ? ['agent = ?'] : []), ...(f.user ? ['requested_by = ?'] : [])];
+    const sql = `SELECT * FROM runs${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY started_at DESC LIMIT ?`;
+    return this.db.prepare(sql).all(...(f.agent ? [f.agent] : []), ...(f.user ? [f.user] : []), limit) as unknown as RunRow[];
   }
 
   get(id: string): RunRow | undefined {

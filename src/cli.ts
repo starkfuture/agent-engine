@@ -12,10 +12,15 @@ import { CardSink } from './output/sink.js';
 import { listAgents, loadAgent } from './engine/agent.js';
 import { Store } from './engine/store.js';
 import { redact } from './engine/text.js';
-import { findingsOutput, renderFindings } from './engine/output.js';
+import { findingsOutput } from './engine/output.js';
+import { writeAnswer } from './engine/answer.js';
 import { runAgent, type Engine } from './engine/run.js';
 import { sdkSession } from './engine/session.js';
 import { patrolOnce, type MonitorAgent } from './runner.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { buildServer, slackNotifier, startHttp, type McpContext } from './mcp/server.js';
+import { loadRepos } from './mcp/repos.js';
+import { Users } from './mcp/users.js';
 
 const USAGE = `engine <command> [options]
 
@@ -27,6 +32,14 @@ Agents (folders in agents/):
   run monitor                 one patrol with the investigator (same as: patrol --llm)
   runs [--agent <name>]       recent runs with status, cost and challenge verdict
   stop | resume               create or remove the STOP file: running agents stop at the next step
+
+MCP server (several developers, one engine):
+  serve [--host 127.0.0.1] [--port 8787]
+                              Streamable HTTP MCP at /mcp; each person uses their own bearer token
+  mcp-stdio --as <user>       the same tools over stdio, for one local user
+  user add <name> [--admin] [--slack <U…>] [--usd <per day>]
+                              issue a token (printed once; only its hash is stored)
+  user list | user remove <name>
 
 Monitor:
   doctor                      check access, list datasources, show real metric labels
@@ -56,6 +69,12 @@ const { positionals, values: a } = parseArgs({
     task: { type: 'string' },
     path: { type: 'string' },
     agent: { type: 'string' },
+    host: { type: 'string' },
+    port: { type: 'string' },
+    as: { type: 'string' },
+    admin: { type: 'boolean', default: false },
+    slack: { type: 'string' },
+    usd: { type: 'string' },
     challenge: { type: 'boolean', default: false },
     llm: { type: 'boolean', default: false },
     post: { type: 'boolean', default: false },
@@ -206,14 +225,8 @@ async function main() {
         ...(roots ? { roots } : {}),
       });
       log(`${r.runId}: ${r.status}, ${r.evidence.items.size} tool call(s), ${r.turns} turn(s), $${r.cost.toFixed(3)}${r.challenge ? `, challenge ${r.challenge.verdict}` : ''}${r.note ? ` (${r.note})` : ''}`);
-      const f = r.outputs[0];
-      if (f) {
-        const dissent = (r.challenge?.blocking ?? []).map((o) => `- ${o.claim}\n  - if acted on: ${o.failure_scenario}\n  - check: ${o.settling_check} (${o.evidence.join(', ')})`);
-        const verdict = r.challenge ? ` · challenge ${r.challenge.verdict}${r.challenge.note ? ` (${r.challenge.note})` : ''}` : '';
-        const md = redact(renderFindings(f, `${name}@${agent.version} · run ${r.runId} · $${r.cost.toFixed(2)}${verdict}`, dissent));
-        if (r.dir) writeFileSync(join(r.dir, 'answer.md'), md + '\n');
-        console.log(md);
-      }
+      const md = writeAnswer(agent, r);
+      if (md) console.log(md);
       if (r.dir) log(`run folder: ${r.dir}`);
       if (r.status !== 'ok') process.exitCode = 1;
       return;
@@ -234,6 +247,54 @@ async function main() {
       mkdirSync(cfg.runsDir, { recursive: true });
       writeFileSync(join(cfg.runsDir, 'STOP'), new Date().toISOString() + '\n');
       console.log('STOP file written: running agents stop at their next step; new runs are skipped until `resume`.');
+      return;
+    }
+
+    case 'user': {
+      const users = Users.load(cfg.mcp.usersFile);
+      const sub = positionals[1];
+      if (sub === 'list') {
+        for (const u of users.list()) console.log(`${u.name.padEnd(16)} ${u.role.padEnd(6)} ${u.slack_id ?? '-'}  $${u.usd_per_day ?? cfg.mcp.userDailyCapUsd}/day  added ${u.added_at.slice(0, 10)}`);
+        return;
+      }
+      const name = positionals[2];
+      if (!name) throw new Error('usage: user add|remove <name>');
+      if (sub === 'remove') {
+        console.log(users.remove(name) ? `${name} removed; their token no longer works` : `no user ${name}`);
+        return;
+      }
+      if (sub !== 'add') throw new Error('usage: user add|list|remove');
+      const usd = a.usd ? Number(a.usd) : undefined;
+      if (usd !== undefined && !(usd > 0)) throw new Error('--usd must be a positive number');
+      const token = users.add(name, { admin: a.admin, ...(a.slack ? { slackId: a.slack } : {}), ...(usd ? { usdPerDay: usd } : {}) });
+      console.error(`${name} added (${a.admin ? 'admin' : 'member'}). Give them this token; it is not stored and won't be shown again:`);
+      console.log(token);
+      return;
+    }
+
+    case 'serve':
+    case 'mcp-stdio': {
+      const ctx: McpContext = {
+        cfg,
+        engine: makeEngine(cfg),
+        users: Users.load(cfg.mcp.usersFile),
+        repos: loadRepos(cfg.mcp.reposFile),
+        ...(cfg.mcp.notifySlack && cfg.slackWebhookUrl ? { notify: slackNotifier(cfg.slackWebhookUrl) } : {}),
+        log,
+      };
+      if (cmd === 'mcp-stdio') {
+        const user = ctx.users.list().find((u) => u.name === a.as);
+        if (!user) throw new Error('--as <user>: a user from `user list`');
+        await buildServer(ctx, user).connect(new StdioServerTransport());
+        return;
+      }
+      const host = a.host ?? '127.0.0.1';
+      const port = Number(a.port ?? 8787);
+      if (!ctx.users.list().length) throw new Error('no users yet: add one with `user add <name> --admin`');
+      startHttp(ctx, { host, port });
+      log(`MCP on http://${host}:${port}/mcp · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
+      if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
+      await new Promise(() => {}); // until killed
       return;
     }
 

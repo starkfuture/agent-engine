@@ -47,6 +47,9 @@ export interface RunInput<T> {
   output: OutputSpec<T>;
   challenge?: boolean;
   roots?: string[]; // git folders the file tools may read; each is snapshotted
+  user?: { name: string; usdPerDay?: number; maxRunning?: number }; // who asked (MCP)
+  signal?: AbortSignal; // cancel this run (status 'stopped')
+  onAdmitted?: (runId: string) => void; // called once the run is admitted, before the model starts
 }
 
 export interface RunResult<T> {
@@ -92,8 +95,12 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
   if (input.tools && hasAny(spec.builtin_tools, WEB_TOOLS)) throw new Error(`${spec.name}: credentialed tools and web tools can't share a run (Rule of Two)`);
 
   const skipped = (note: string): RunResult<T> => {
-    engine.store.skipped({ id: runId, agent: spec.name, version: agent.version, trigger: input.trigger, now, note });
+    engine.store.skipped({ id: runId, agent: spec.name, version: agent.version, trigger: input.trigger, now, note, ...(input.user ? { user: input.user.name } : {}) });
     return { runId, status: 'skipped', outputs: [], evidence, cost: 0, turns: 0, note };
+  };
+  const settleSkipped = (note: string): RunResult<T> => {
+    engine.store.settle(runId, { status: 'stopped', cost: 0, turns: 0, outputs: 0, note, now: clock() });
+    return { runId, status: 'stopped', outputs: [], evidence, cost: 0, turns: 0, note };
   };
   if (!engine.llmAvailable) return skipped('no LLM credentials configured');
   if (existsSync(engine.stopFile)) return skipped(`stop file present: ${engine.stopFile}`);
@@ -111,8 +118,11 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     agentCap: spec.limits.usd_per_day,
     globalCap: engine.dailyCapUsd,
     ...(engine.monthlyCapUsd !== undefined ? { monthlyCap: engine.monthlyCapUsd } : {}),
+    concurrency: spec.concurrency,
+    ...(input.user ? { user: input.user.name, userCap: input.user.usdPerDay, userMaxRunning: input.user.maxRunning } : {}),
   });
   if (!admitted.ok) return skipped(admitted.reason);
+  if (input.signal?.aborted) return settleSkipped('cancelled before start');
 
   // From here on the run is admitted: whatever happens, it gets settled.
   const outputs: T[] = [];
@@ -133,6 +143,12 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     abort.abort();
   };
   const timer = setTimeout(() => stop('deadline', `deadline ${spec.limits.deadline_min} min`), spec.limits.deadline_min * 60_000);
+  input.signal?.addEventListener('abort', () => stop('stopped', String(input.signal?.reason ?? 'cancelled')));
+  try {
+    input.onAdmitted?.(runId);
+  } catch {
+    /* a caller's callback must not leave an admitted run unsettled */
+  }
 
   try {
     dir = join(engine.runsDir, spec.name, runId);

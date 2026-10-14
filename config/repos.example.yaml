@@ -1,0 +1,9 @@
+# Repos the codebase agent may read on the engine host. Copy to repos.local.yaml
+# (gitignored) and point at clones on this machine. Callers pick a name; they
+# never pass a path. The agent reads a snapshot of git-tracked files, minus
+# secret files.
+repos:
+  sre-agent: ~/Desktop/work/sre-agent
+  backend-nest: ~/Desktop/work/backend-nest
+  frontend-next: ~/Desktop/work/frontend-next
+  admin-next: ~/Desktop/work/admin-next

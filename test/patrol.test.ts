@@ -41,6 +41,7 @@ const cfg = (): Config => ({
   agentsDir: join(import.meta.dirname, '..', 'agents'),
   runsDir: mkdtempSync(join(tmpdir(), 'sre-runs-')),
   slackWebhookUrl: undefined,
+  mcp: { usersFile: '/nonexistent', reposFile: '/nonexistent', userDailyCapUsd: 10, userMaxRunning: 2, notifySlack: false },
 });
 
 test('incident rows are flagged, steady noise is not', async () => {

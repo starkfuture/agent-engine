@@ -58,6 +58,13 @@ export interface Config {
   agentsDir: string;
   runsDir: string;
   slackWebhookUrl: string | undefined;
+  mcp: {
+    usersFile: string; // hashed tokens, one per person (gitignored)
+    reposFile: string; // repos the codebase agent may read on this host (gitignored)
+    userDailyCapUsd: number; // per person, across agents
+    userMaxRunning: number; // per person, at once
+    notifySlack: boolean; // @-mention the requester in Slack when a run ends
+  };
 }
 
 const expandHome = (p: string) => (p.startsWith('~/') ? resolve(homedir(), p.slice(2)) : resolve(p));
@@ -109,5 +116,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     agentsDir: r(env.ENGINE_AGENTS_DIR ?? 'agents'),
     runsDir: r(env.ENGINE_RUNS_DIR ?? 'runs'),
     slackWebhookUrl: opt(env.SLACK_WEBHOOK_URL),
+    mcp: {
+      usersFile: r(env.ENGINE_USERS_FILE ?? 'config/users.local.json'),
+      reposFile: r(env.ENGINE_REPOS_FILE ?? 'config/repos.local.yaml'),
+      userDailyCapUsd: num(env.ENGINE_USER_DAILY_CAP_USD, 10, 'ENGINE_USER_DAILY_CAP_USD'),
+      userMaxRunning: num(env.ENGINE_USER_MAX_RUNNING, 2, 'ENGINE_USER_MAX_RUNNING'),
+      notifySlack: env.ENGINE_NOTIFY_SLACK === '1',
+    },
   };
 }

@@ -148,3 +148,34 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
   - Business metrics and support-ticket counts.
   - The daily Opus sweep.
   - GitHub and code tools for the investigator.
+
+## MCP server: one engine, several developers
+
+One process holds the engine: budgets, run history, the kill switch, and the
+credentials. Each person connects from Claude Code (or any MCP client) with
+their own token.
+
+```bash
+npm run dev -- user add ana --slack U0123ABCD        # prints a token once; only its hash is stored
+npm run dev -- user add lead --admin                 # admins also get stop_all/resume/approve_lesson
+cp config/repos.example.yaml config/repos.local.yaml # repos the codebase agent may read on this host
+npm run dev -- serve --port 8787                     # http://127.0.0.1:8787/mcp
+```
+
+Each developer:
+
+```bash
+export ENGINE_TOKEN=eng_…
+claude mcp add --transport http engine http://<host>:8787/mcp --header "Authorization: Bearer $ENGINE_TOKEN"
+```
+
+Tools: `list_agents`, `list_repos`, `run_agent` (background; `wait_seconds` ≤ 55
+for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
+`proposed_lessons`; admins add `approve_lesson`, `stop_all`, `resume`.
+
+- Runs are recorded with who asked. Per person: `ENGINE_USER_DAILY_CAP_USD` (default 10)
+  and `ENGINE_USER_MAX_RUNNING` (default 2); per agent: `concurrency` in agent.yaml.
+- `ENGINE_NOTIFY_SLACK=1` with `SLACK_WEBHOOK_URL` @-mentions the requester when a run ends.
+- Callers name a repo; they never pass a path. Scheduled agents (monitor) can't be started over MCP.
+- Bind is loopback by default. Anywhere else, put TLS in front (tokens travel in a header).
+- `mcp-stdio --as <user>` serves the same tools over stdio for one local user.

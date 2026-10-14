@@ -31,6 +31,7 @@ export const AgentSpec = z
     builtin_tools: z.array(BUILTIN).default([]),
     // Packs that reach credentialed or sensitive systems (Grafana, k8s, …).
     sensitive_tools: z.boolean().default(false),
+    concurrency: z.number().int().min(1).max(10).default(1), // runs of this agent at once
     limits: z
       .object({
         max_turns: z.number().int().min(1).max(200).default(30),

@@ -10,3 +10,7 @@ data/
 runs/
 # Lessons runs propose; a human promotes them into lessons.md.
 agents/*/memory/proposed.md
+
+# MCP server: hashed user tokens and this host's repo paths.
+config/users.local.json
+config/repos.local.yaml
