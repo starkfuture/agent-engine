@@ -53,6 +53,7 @@ export interface Config {
     available: boolean;
     // Across all agents. Per-agent limits live in agents/<name>/agent.yaml.
     dailyCapUsd: number;
+    monthlyCapUsd: number;
   };
   agentsDir: string;
   runsDir: string;
@@ -103,6 +104,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     llm: {
       available: Boolean(env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_USE_BEDROCK === '1'),
       dailyCapUsd: num(env.ENGINE_DAILY_CAP_USD, 20, 'ENGINE_DAILY_CAP_USD'),
+      monthlyCapUsd: num(env.ENGINE_MONTHLY_CAP_USD, 150, 'ENGINE_MONTHLY_CAP_USD'),
     },
     agentsDir: r(env.ENGINE_AGENTS_DIR ?? 'agents'),
     runsDir: r(env.ENGINE_RUNS_DIR ?? 'runs'),

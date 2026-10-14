@@ -127,7 +127,7 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 - **The model holds no credentials.** Tools run in this process. The SDK subprocess gets only model credentials, with no built-in tools, `settingSources: []`, `strictMcpConfig` and `dontAsk`.
 - **PII and secrets are redacted** before anything reaches the model, a card or disk. Log text is fenced as untrusted data.
 - **Reports are checked in code:** the zod schema, cited evidence ids must exist, row keys must be real, and a critical report must have measured impact.
-- **Spend is capped** by the engine: `agents/monitor/agent.yaml` limits plus `ENGINE_DAILY_CAP_USD`. The patrol keeps reporting when a cap is reached.
+- **Spend is capped** by the engine: `agents/monitor/agent.yaml` limits plus `ENGINE_DAILY_CAP_USD` and `ENGINE_MONTHLY_CAP_USD` (all agents). Set a spend limit on the Anthropic workspace too: the SDK checks a run's budget between turns, so one run can overshoot by a turn. The patrol keeps reporting when a cap is reached.
 
 ## Not built yet
 

@@ -37,7 +37,7 @@ const cfg = (): Config => ({
   noiseFile: '/dev/null',
   stateFile: join(mkdtempSync(join(tmpdir(), 'sre-test-')), 'state.json'),
   outDir: mkdtempSync(join(tmpdir(), 'sre-out-')),
-  llm: { available: false, dailyCapUsd: 10 },
+  llm: { available: false, dailyCapUsd: 10, monthlyCapUsd: 100 },
   agentsDir: join(import.meta.dirname, '..', 'agents'),
   runsDir: mkdtempSync(join(tmpdir(), 'sre-runs-')),
   slackWebhookUrl: undefined,

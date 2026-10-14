@@ -86,6 +86,7 @@ function makeEngine(cfg: Config, runsDir = cfg.runsDir): Engine {
     stopFile: join(cfg.runsDir, 'STOP'),
     session: sdkSession,
     dailyCapUsd: cfg.llm.dailyCapUsd,
+    monthlyCapUsd: cfg.llm.monthlyCapUsd,
     llmAvailable: cfg.llm.available,
   };
 }
@@ -225,7 +226,7 @@ async function main() {
           `${r.started_at.slice(0, 19)}  ${r.agent.padEnd(10)} ${r.status.padEnd(9)} $${(r.cost ?? r.reserve).toFixed(3).padStart(6)}  ${String(r.turns ?? 0).padStart(3)} turns  ${r.outputs ?? 0} out  ${r.trigger}${r.challenge ? `  challenge ${r.challenge}` : ''}${r.note ? `  (${r.note})` : ''}  ${r.id}`,
         );
       const day = new Date().toISOString().slice(0, 10);
-      console.log(`today: $${store.spent(day).toFixed(2)} of $${cfg.llm.dailyCapUsd} global cap (running runs count their reservation)`);
+      console.log(`today: $${store.spent(day).toFixed(2)} of $${cfg.llm.dailyCapUsd} daily cap · this month: $${store.spent(day.slice(0, 7)).toFixed(2)} of $${cfg.llm.monthlyCapUsd} (running runs count their reservation)`);
       return;
     }
 

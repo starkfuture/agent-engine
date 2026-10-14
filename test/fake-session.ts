@@ -1,11 +1,22 @@
 import type { HookInput } from '@anthropic-ai/claude-agent-sdk';
+import { toolText } from '../src/engine/evidence.js';
 import { mcpName, type Session, type SessionEvent, type SessionRequest } from '../src/engine/session.js';
+
+// The CLI keeps a PostToolUse rewrite only if it has the tool's output shape
+// (same type, same keys with the same types); otherwise the original is shown.
+function sameShape(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a)) return Array.isArray(b);
+  if (a && typeof a === 'object') return !!b && typeof b === 'object' && !Array.isArray(b) && Object.keys(a).every((k) => sameShape((a as any)[k], (b as any)[k]));
+  return typeof a === typeof b;
+}
 
 // Plays the model, as close to the real SDK as matters for the engine:
 // - every tool call emits a tool_use event (MCP tools with their mcp__engine__ name),
 //   delivered before anything else the script yields;
 // - built-in tools outside the session's allowlist are refused;
 // - built-in tools run the engine's real hooks around an SDK-shaped response;
+//   a rewrite of the wrong shape is dropped, additionalContext is shown next to
+//   the result, and continue: false ends the session;
 // - once the run is aborted, the stream ends with an error, like query() does.
 export class Sim {
   readonly pending: SessionEvent[] = [];
@@ -36,12 +47,20 @@ export class Sim {
         if (out.hookSpecificOutput?.permissionDecision === 'deny') return `denied: ${out.hookSpecificOutput.permissionDecisionReason}`;
       }
     let output: unknown = response;
+    const context: string[] = [];
     for (const m of (this.req.hooks.PostToolUse ?? []).filter(matches))
       for (const h of m.hooks) {
-        const out = (await h({ ...base, hook_event_name: 'PostToolUse', tool_response: response } as HookInput, 't', { signal: this.req.abort.signal })) as { hookSpecificOutput?: { updatedToolOutput?: unknown } };
-        if (out.hookSpecificOutput?.updatedToolOutput !== undefined) output = out.hookSpecificOutput.updatedToolOutput;
+        const out = (await h({ ...base, hook_event_name: 'PostToolUse', tool_response: response } as HookInput, 't', { signal: this.req.abort.signal })) as {
+          continue?: boolean;
+          stopReason?: string;
+          hookSpecificOutput?: { updatedToolOutput?: unknown; additionalContext?: string };
+        };
+        if (out.continue === false) throw new Error(`stopped by hook: ${out.stopReason ?? ''}`);
+        const upd = out.hookSpecificOutput?.updatedToolOutput;
+        if (upd !== undefined && sameShape(response, upd)) output = upd;
+        if (out.hookSpecificOutput?.additionalContext) context.push(out.hookSpecificOutput.additionalContext);
       }
-    return typeof output === 'string' ? output : JSON.stringify(output);
+    return [toolText(output), ...context].join('\n');
   }
 
   sleep(ms: number): Promise<void> {

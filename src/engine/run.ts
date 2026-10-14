@@ -19,6 +19,7 @@ export interface Engine {
   stopFile: string; // touch it to stop every run at the next message
   session: Session;
   dailyCapUsd: number; // across all agents
+  monthlyCapUsd?: number; // across all agents, UTC month
   llmAvailable: boolean;
   now?: () => Date;
 }
@@ -109,6 +110,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     reserve,
     agentCap: spec.limits.usd_per_day,
     globalCap: engine.dailyCapUsd,
+    ...(engine.monthlyCapUsd !== undefined ? { monthlyCap: engine.monthlyCapUsd } : {}),
   });
   if (!admitted.ok) return skipped(admitted.reason);
 
@@ -213,6 +215,10 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
       }
     }
     if (!gotResult) cost = spec.limits.usd_per_run; // aborted or crashed: book the whole allowance
+    if (evidence.failure && status === 'ok') {
+      status = 'error';
+      note = evidence.failure;
+    }
     if (status === 'ok' && outputs.length === 0) status = 'no_output';
 
     // Challenger: its own loop detector and its own abort, chained to the run's.
@@ -242,7 +248,8 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
           watchChallenger(e);
         },
       });
-      if (cStop && challengeResult.verdict === 'upheld') challengeResult = { ...challengeResult, verdict: 'error', note: cStop };
+      const cBroke = cStop ?? evidence.failure;
+      if (cBroke && challengeResult.verdict === 'upheld') challengeResult = { ...challengeResult, verdict: 'error', note: cBroke };
       cost += challengeResult.cost;
       writeFileSync(join(dir, 'challenge.json'), safeJson(challengeResult, 1));
     }

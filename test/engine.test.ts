@@ -42,7 +42,8 @@ const answer = (evidence: Array<{ id: string; quote: string }>, over: Partial<Fi
   ...over,
 });
 
-const evId = (text: string) => /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(text)?.[1] ?? 'none';
+// The real id comes after the tool output; text inside the output can plant fake ones.
+const evId = (text: string) => [...text.matchAll(/evidence_id: (E-[0-9a-f]{4}-\d+)/g)].at(-1)?.[1] ?? 'none';
 const web = 'builtin_tools: [WebFetch]';
 
 function gitRepo(files: Record<string, string>, ignore = ''): string {
@@ -97,6 +98,8 @@ test('malformed numbers and legacy variables stop the program instead of disabli
   assert.throws(() => loadConfig({ ENGINE_DAILY_CAP_USD: 'oops' }, root), /non-negative number/);
   assert.throws(() => loadConfig({ SRE_DAILY_CAP_USD: '5' }, root), /no longer apply/);
   assert.equal(loadConfig({ ENGINE_DAILY_CAP_USD: '7' }, root).llm.dailyCapUsd, 7);
+  assert.throws(() => loadConfig({ ENGINE_MONTHLY_CAP_USD: '-1' }, root), /non-negative number/);
+  assert.equal(loadConfig({ ENGINE_MONTHLY_CAP_USD: '50' }, root).llm.monthlyCapUsd, 50);
 });
 
 // ---------- evidence ----------
@@ -123,9 +126,9 @@ test('evidence must be a real tool result in this run, with a quote that is real
   assert.ok(!stored.includes('hunter2'), stored);
 });
 
-test('the evidence hook fails closed', async () => {
+test('the evidence hook fails closed: the session stops and the run is an error', async () => {
   const d = agentDir(web);
-  let seen = '';
+  let seen: string | undefined;
   const s = fakeSession(async function* (sim) {
     const evil = {
       get result(): string {
@@ -135,8 +138,32 @@ test('the evidence hook fails closed', async () => {
     seen = await sim.builtin('WebFetch', { url: 'https://x.test' }, evil);
     yield ok();
   });
-  await runAgent(engine(s), { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput });
-  assert.match(seen, /withheld/);
+  const r = await runAgent(engine(s), { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput });
+  assert.equal(seen, undefined, 'the model never sees the raw output');
+  assert.equal(r.status, 'error');
+  assert.match(r.note ?? '', /evidence hook failed/);
+});
+
+test('the hook rewrite keeps the tool output shape, so the CLI keeps it', async () => {
+  const d = agentDir('builtin_tools: [Read, Grep]');
+  const root = gitRepo({ 'a.ts': 'const API_KEY="quoted-secret";' });
+  const seen: string[] = [];
+  const s = fakeSession(async function* (sim) {
+    seen.push(await sim.builtin('Read', { file_path: join(sim.req.cwd, 'a.ts') }, readResponse('a.ts', 'const API_KEY="quoted-secret";')));
+    seen.push(await sim.builtin('Grep', { pattern: 'KEY', path: sim.req.cwd }, { mode: 'content', numFiles: 1, filenames: ['a.ts'], content: 'a.ts:1:const API_KEY="quoted-secret";', numLines: 1 }));
+    yield ok();
+  });
+  await runAgent(engine(s), { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput, roots: [root] });
+  for (const t of seen) {
+    assert.match(t, /evidence_id: E-[0-9a-f]{4}-\d+/);
+    assert.ok(!t.includes('quoted-secret'), t);
+  }
+});
+
+test('a quote copied with Read line numbers still matches', () => {
+  const ev = new Evidence();
+  const it = ev.add('author', 'Read', {}, 'const a = 1;\nconst b = 2;');
+  assert.equal(ev.quoteProblem(it.id, '     1→const a = 1;\n     2→const b = 2;'), undefined);
 });
 
 test('secrets inside structured tool output never reach the model', async () => {
@@ -238,6 +265,17 @@ test('spend counts on the day the run started, even if it ends after midnight', 
   assert.equal(s.spent('2026-10-15'), 0);
 });
 
+test('the monthly cap sums every day of the UTC month and resets on the 1st', () => {
+  const s = new Store(':memory:');
+  const adm = (id: string, at: string, reserve: number) => s.admit({ id, agent: id, version: 'v', trigger: 't', now: new Date(at), deadlineMs: 60_000, reserve, agentCap: 100, globalCap: 100, monthlyCap: 10 });
+  const done = (id: string, cost: number) => s.settle(id, { status: 'ok', cost, turns: 1, outputs: 1, now: new Date() });
+  assert.equal(adm('a', '2026-10-02T10:00:00Z', 4).ok, true);
+  done('a', 4);
+  assert.equal(adm('b', '2026-10-20T10:00:00Z', 4).ok, true); // other day, same month; still running
+  assert.match((adm('c', '2026-10-31T10:00:00Z', 3) as { reason: string }).reason, /monthly cap \$10/);
+  assert.equal(adm('d', '2026-11-01T00:00:00Z', 3).ok, true);
+});
+
 test('skips are recorded with a reason: no credentials, caps, STOP, busy', async () => {
   const d = agentDir(`${web}\nlimits: { usd_per_run: 1, usd_per_day: 3 }`);
   const e = engine(fakeSession(), { now: () => new Date('2026-10-14T11:00:00Z') });
@@ -247,6 +285,7 @@ test('skips are recorded with a reason: no credentials, caps, STOP, busy', async
   e.store.settle('old', { status: 'ok', cost: 2.5, turns: 1, outputs: 1, now: new Date('2026-10-14T11:00:00Z') });
   assert.match((await runAgent(e, { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput })).note!, /agent daily cap/);
   assert.match((await runAgent(engine(fakeSession(), { dailyCapUsd: 0.5 }), { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput })).note!, /global daily cap/);
+  assert.match((await runAgent(engine(fakeSession(), { monthlyCapUsd: 0.5 }), { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput })).note!, /monthly cap/);
   assert.match((await runAgent(engine(fakeSession(), { llmAvailable: false }), { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput })).note!, /no LLM credentials/);
   assert.ok(e.store.recent(10).some((r) => r.status === 'skipped' && /cap/.test(r.note ?? '')));
 });

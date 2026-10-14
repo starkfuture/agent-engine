@@ -33,6 +33,7 @@ export interface Admission {
   reserve: number;
   agentCap: number;
   globalCap: number;
+  monthlyCap?: number; // across all agents, UTC calendar month
 }
 
 // How long past its deadline a "running" row may sit before it is reaped as
@@ -86,8 +87,9 @@ export class Store {
     }
   }
 
+  // `day` is a UTC day (2026-10-14) or a month prefix (2026-10).
   private spentIn(day: string, agent?: string): number {
-    const sql = `SELECT COALESCE(SUM(CASE WHEN status = 'running' THEN reserve ELSE COALESCE(cost, 0) END), 0) AS s FROM runs WHERE day = ?${agent ? ' AND agent = ?' : ''}`;
+    const sql = `SELECT COALESCE(SUM(CASE WHEN status = 'running' THEN reserve ELSE COALESCE(cost, 0) END), 0) AS s FROM runs WHERE ${day.length === 7 ? 'substr(day, 1, 7)' : 'day'} = ?${agent ? ' AND agent = ?' : ''}`;
     const row = (agent ? this.db.prepare(sql).get(day, agent) : this.db.prepare(sql).get(day)) as { s: number };
     return row.s;
   }
@@ -100,6 +102,7 @@ export class Store {
       if (busy) return { ok: false as const, reason: `another run of this agent is in progress (${busy.id})` };
       if (this.spentIn(day, a.agent) + a.reserve > a.agentCap) return { ok: false as const, reason: `agent daily cap $${a.agentCap} reached` };
       if (this.spentIn(day) + a.reserve > a.globalCap) return { ok: false as const, reason: `global daily cap $${a.globalCap} reached` };
+      if (a.monthlyCap !== undefined && this.spentIn(day.slice(0, 7)) + a.reserve > a.monthlyCap) return { ok: false as const, reason: `monthly cap $${a.monthlyCap} reached` };
       this.db
         .prepare(`INSERT INTO runs (id, agent, version, trigger, day, started_at, deadline_at, pid, reserve, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')`)
         .run(a.id, a.agent, a.version, a.trigger, day, a.now.toISOString(), new Date(a.now.getTime() + a.deadlineMs).toISOString(), process.pid, a.reserve);

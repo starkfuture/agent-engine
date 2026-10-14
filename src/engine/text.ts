@@ -32,7 +32,7 @@ export function redact(s: string): string {
   return out;
 }
 
-const SECRET_KEY_EXACT = new RegExp(`^${SECRET_KEY}$`, 'i');
+export const SECRET_KEY_EXACT = new RegExp(`^${SECRET_KEY}$`, 'i');
 
 // Redact a structured value before it is serialised. Serialising first hides
 // secrets behind JSON escaping (\"password\":\"x\"), so walk the values instead:
