@@ -65,6 +65,44 @@ export function pluginCopy(dir: string, name: string): string {
   return root;
 }
 
+// $/MTok: input, output, cache write (5 min), cache read. First-party list
+// prices (research/ai-sre-2026-10-07/04-runtime-hosting.md). Bedrock EU is
+// assumed at 1.1x; confirm on the AWS bill.
+const PRICES: Record<string, [number, number, number, number]> = {
+  'claude-sonnet-5-5': [2, 10, 2.5, 0.2],
+  'claude-opus-5-5': [4, 20, 5, 0.2],
+};
+const BEDROCK_EU = 1.1;
+
+interface ModelUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheCreationInputTokens?: number;
+  cacheReadInputTokens?: number;
+  costUSD?: number;
+  costBasis?: string;
+  canonicalModel?: string;
+}
+
+// The CLI prices models it doesn't know (costBasis "unknown") at a fallback
+// rate: Sonnet 5.5 is booked at Opus 5.5 prices. Re-price those from tokens
+// with our table; keep the CLI's number for anything we can't price.
+export function realCost(cliTotal: number, usage: unknown, multiplier = 1): number {
+  if (!usage || typeof usage !== 'object') return cliTotal;
+  let sum = 0;
+  for (const [model, raw] of Object.entries(usage as Record<string, ModelUsage>)) {
+    const u = raw ?? {};
+    if (u.costBasis === 'list' && typeof u.costUSD === 'number') {
+      sum += u.costUSD;
+      continue;
+    }
+    const p = PRICES[u.canonicalModel ?? model];
+    if (!p) return cliTotal; // unknown model: stay conservative
+    sum += (((u.inputTokens ?? 0) * p[0] + (u.outputTokens ?? 0) * p[1] + (u.cacheCreationInputTokens ?? 0) * p[2] + (u.cacheReadInputTokens ?? 0) * p[3]) / 1e6) * multiplier;
+  }
+  return sum;
+}
+
 export const sdkSession: Session = async function* (r) {
   const server = createSdkMcpServer({ name: MCP_NAME, version: '0.1.0', tools: r.tools, alwaysLoad: true, timeout: 60_000 });
   const plugins = r.pluginDir ? [{ type: 'local' as const, path: r.pluginDir }] : [];
@@ -103,7 +141,8 @@ export const sdkSession: Session = async function* (r) {
       }
     } else if (m.type === 'result') {
       const ok = m.subtype === 'success' && !m.is_error;
-      yield { kind: 'result', ok, subtype: m.subtype, cost: m.total_cost_usd ?? 0, turns: m.num_turns ?? 0, text: m.subtype === 'success' ? m.result : '', usage: m.modelUsage };
+      const cost = realCost(m.total_cost_usd ?? 0, m.modelUsage, process.env.CLAUDE_CODE_USE_BEDROCK === '1' ? BEDROCK_EU : 1);
+      yield { kind: 'result', ok, subtype: m.subtype, cost, turns: m.num_turns ?? 0, text: m.subtype === 'success' ? m.result : '', usage: { cliCostUsd: m.total_cost_usd, models: m.modelUsage } };
     }
   }
 };

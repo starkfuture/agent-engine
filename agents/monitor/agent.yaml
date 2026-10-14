@@ -6,9 +6,9 @@ every: 15m
 sensitive_tools: true # Grafana/Prometheus/Loki/Tempo read access
 builtin_tools: [] # no shell, no files, no web
 limits:
-  max_turns: 30
-  usd_per_run: 1.5
-  usd_per_day: 10
+  max_turns: 40
+  usd_per_run: 2.5 # the CLI enforces this on its own price, which books Sonnet 5.5 at Opus rates (~1.7x): ~$1.5 real
+  usd_per_day: 25
   deadline_min: 10
 challenge:
   when: gate # deterministic: protected journey rows or big spikes (src/runner.ts)

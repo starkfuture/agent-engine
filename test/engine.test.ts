@@ -483,3 +483,14 @@ test('lessons are proposed for human review, never written into lessons.md', asy
   assert.match(readFileSync(join(d, 'memory', 'proposed.md'), 'utf8'), /Vendor docs lag/);
   assert.ok(!existsSync(join(d, 'memory', 'lessons.md')));
 });
+
+test('real cost re-prices models the CLI does not know, keeps list-priced ones, stays conservative otherwise', async () => {
+  const { realCost } = await import('../src/engine/session.js');
+  const sonnet = { inputTokens: 8, outputTokens: 1085, cacheReadInputTokens: 18718, cacheCreationInputTokens: 1795, costUSD: 0.0344506, costBasis: 'unknown', canonicalModel: 'claude-sonnet-5-5' };
+  const haiku = { costUSD: 0.001039, costBasis: 'list' };
+  const c = realCost(0.0355, { 'claude-sonnet-5-5': sonnet, 'claude-haiku-4-5': haiku });
+  assert.ok(Math.abs(c - (0.0190971 + 0.001039)) < 1e-6, String(c));
+  assert.equal(realCost(0.5, { 'some-new-model': { costBasis: 'unknown', inputTokens: 10 } }), 0.5);
+  assert.equal(realCost(0.5, undefined), 0.5);
+  assert.ok(Math.abs(realCost(0, { 'claude-sonnet-5-5': sonnet }, 1.1) - 0.0190971 * 1.1) < 1e-6);
+});

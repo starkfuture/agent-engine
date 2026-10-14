@@ -103,8 +103,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     outDir: r(env.SRE_OUT_DIR ?? 'out'),
     llm: {
       available: Boolean(env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_USE_BEDROCK === '1'),
-      dailyCapUsd: num(env.ENGINE_DAILY_CAP_USD, 20, 'ENGINE_DAILY_CAP_USD'),
-      monthlyCapUsd: num(env.ENGINE_MONTHLY_CAP_USD, 150, 'ENGINE_MONTHLY_CAP_USD'),
+      dailyCapUsd: num(env.ENGINE_DAILY_CAP_USD, 30, 'ENGINE_DAILY_CAP_USD'),
+      monthlyCapUsd: num(env.ENGINE_MONTHLY_CAP_USD, 300, 'ENGINE_MONTHLY_CAP_USD'),
     },
     agentsDir: r(env.ENGINE_AGENTS_DIR ?? 'agents'),
     runsDir: r(env.ENGINE_RUNS_DIR ?? 'runs'),
