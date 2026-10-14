@@ -67,10 +67,11 @@ export function pluginCopy(dir: string, name: string): string {
 }
 
 // $/MTok: input, output, cache write (5 min), cache read. First-party list
-// prices (research/ai-sre-2026-10-07/04-runtime-hosting.md). Bedrock EU is
-// assumed at 1.1x; confirm on the AWS bill.
+// prices (platform.claude.com/docs/en/about-claude/pricing, 2026-10-14: cache
+// hits on the 5.5 models are 0.05x input). Bedrock EU is assumed at 1.1x;
+// confirm on the AWS bill.
 const PRICES: Record<string, [number, number, number, number]> = {
-  'claude-sonnet-5-5': [2, 10, 2.5, 0.2],
+  'claude-sonnet-5-5': [2, 10, 2.5, 0.1],
   'claude-opus-5-5': [4, 20, 5, 0.2],
 };
 const BEDROCK_EU = 1.1;
