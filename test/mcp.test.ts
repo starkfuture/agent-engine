@@ -210,8 +210,12 @@ test('tokens: only hashes are stored, file is private, removal revokes', () => {
   assert.equal(Users.load(file).authenticate(token)?.name, 'cy');
   assert.equal(Users.load(file).authenticate(token + 'x'), undefined);
   assert.throws(() => users.add('cy'), /exists/);
-  users.remove('cy');
-  assert.equal(Users.load(file).authenticate(token), undefined);
+  const server = Users.load(file); // a running server, loaded before the removal
+  assert.equal(server.authenticate(token)?.name, 'cy');
+  users.remove('cy'); // the CLI, another process
+  assert.equal(server.authenticate(token), undefined, 'revocation reaches a running server');
+  const late = Users.load(file).add('dee');
+  assert.equal(server.authenticate(late)?.name, 'dee', 'new users too');
 });
 
 test('HTTP: bearer token per person, POST only, local Host header on a loopback bind', async (t) => {
