@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, loadDotEnv } from '../src/config.js';
 import { loadAgent } from '../src/engine/agent.js';
-import { Ledger } from '../src/engine/ledger.js';
+import { Store } from '../src/engine/store.js';
 import { sdkSession } from '../src/engine/session.js';
 import { CardSink } from '../src/output/sink.js';
 import { Noise } from '../src/patrol/noise.js';
@@ -22,7 +22,7 @@ if (!cfg.llm.available) {
   console.error('No LLM credentials: set ANTHROPIC_API_KEY, or CLAUDE_CODE_USE_BEDROCK=1 with AWS credentials.');
   process.exit(2);
 }
-const engine = { ledger: new Ledger(join(cfg.runsDir, 'ledger.jsonl')), runsDir: cfg.runsDir, stopFile: join(cfg.runsDir, 'STOP'), session: sdkSession, dailyCapUsd: 5, llmAvailable: true };
+const engine = { store: new Store(join(cfg.runsDir, 'engine.db')), runsDir: cfg.runsDir, stopFile: join(cfg.runsDir, 'STOP'), session: sdkSession, dailyCapUsd: 5, llmAvailable: true };
 // The signup/reset rows are protected journeys, so the challenger runs too.
 const noise = Noise.load(cfg.noiseFile);
 const r = await patrolOnce(new FakeTelemetry(world), cfg, noise, State.memory(), new CardSink(cfg.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false, log: (s) => console.error(s) }, { engine, agent: loadAgent(join(cfg.agentsDir, 'monitor')) });

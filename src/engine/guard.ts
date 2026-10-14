@@ -1,30 +1,37 @@
 import { realpathSync } from 'node:fs';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { HookCallbackMatcher } from '@anthropic-ai/claude-agent-sdk';
+import { isSecretFile } from './snapshot.js';
 
-// Paths that hold credentials or keys. Denied even inside an allowed root.
-const SECRET_PATH = /(^|[/\\])(\.env(\.[^/\\]*)?|\.aws|\.ssh|\.gnupg|\.kube|\.docker|\.npmrc|\.netrc|\.pgpass|\.git-credentials|\.config[/\\](gh|golive|gcloud)|[^/\\]*\.(pem|key|p12|pfx|jks)|id_(rsa|ed25519|ecdsa|dsa)[^/\\]*|credentials[^/\\]*|[^/\\]*token[^/\\]*|[^/\\]*secret[^/\\]*)([/\\]|$)/i;
+// Defense in depth only. The boundary for file tools is the snapshot (secret
+// files are not on disk) plus the CLI's own blockReadsOutsideWorkingDirectories
+// and deny rules (see session.ts), which judge every file a search touches.
+// This hook catches the obvious escapes early, with a clear reason.
 
+// Resolve symlinks; for a path that doesn't exist, resolve its nearest existing
+// parent (on macOS /tmp is itself a symlink to /private/tmp).
 function real(p: string): string {
+  const abs = resolve(p);
   try {
-    return realpathSync(p);
+    return realpathSync(abs);
   } catch {
-    return resolve(p); // not there yet: judge the lexical path
+    const parent = dirname(abs);
+    return parent === abs ? abs : join(real(parent), basename(abs));
   }
 }
 
 export function pathAllowed(p: string, roots: string[], cwd: string): string | undefined {
+  if (p.startsWith('~')) return `home-relative paths are not allowed: ${p}`;
+  if (p.split(/[/\\]/).includes('..')) return `".." is not allowed in paths: ${p}`;
   const abs = real(isAbsolute(p) ? p : resolve(cwd, p));
-  if (SECRET_PATH.test(abs)) return `path looks like a credential or key: ${p}`;
+  if (isSecretFile(abs)) return `path is a credential file: ${p}`;
   const inside = roots.some((r) => {
     const rel = relative(real(r), abs);
-    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel) && !rel.startsWith(`..${sep}`));
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
   });
   return inside ? undefined : `path is outside the allowed folders: ${p}`;
 }
 
-// File tools may only touch the given roots. Patterns are checked too, since
-// Glob("/Users/**") or Grep(glob: "../../**") would otherwise walk anywhere.
 export function pathGuard(roots: string[], cwd: string): HookCallbackMatcher {
   return {
     matcher: 'Read|Grep|Glob',
@@ -32,16 +39,16 @@ export function pathGuard(roots: string[], cwd: string): HookCallbackMatcher {
       async (input) => {
         if (input.hook_event_name !== 'PreToolUse') return {};
         const a = (input.tool_input ?? {}) as Record<string, unknown>;
-        const candidates = [a.file_path, a.path, a.pattern, a.glob].filter((v): v is string => typeof v === 'string');
+        const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
         let reason: string | undefined;
-        for (const c of candidates) {
-          if (c === a.pattern && input.tool_name === 'Grep') continue; // Grep's pattern is a regex, not a path
-          if (c.includes('..')) reason = `".." is not allowed in paths: ${c}`;
-          else if (c === a.file_path || c === a.path || isAbsolute(c)) reason = pathAllowed(c, roots, cwd);
-          else if (SECRET_PATH.test(c)) reason = `pattern targets credential-like files: ${c}`;
+        const path = str(a.file_path) ?? str(a.path);
+        if (path) reason = pathAllowed(path, roots, cwd);
+        // Glob patterns and Grep globs: the CLI splits Grep globs on spaces and commas.
+        const patterns = [str(a.glob), input.tool_name === 'Glob' ? str(a.pattern) : undefined].filter((v): v is string => !!v).flatMap((g) => (g.includes('{') ? [g] : g.split(/[\s,]+/)));
+        for (const g of patterns) {
           if (reason) break;
+          if (g.startsWith('~') || isAbsolute(g) || g.split('/').includes('..')) reason = pathAllowed(g.replace(/[*?[{].*$/, '') || '/', roots, cwd);
         }
-        if (!a.path && input.tool_name !== 'Read') reason ??= pathAllowed(cwd, roots, cwd);
         return reason ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } } : {};
       },
     ],

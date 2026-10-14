@@ -11,11 +11,11 @@
     "sre-agent": "dist/cli.js"
   },
   "scripts": {
-    "dev": "node --import tsx src/cli.ts",
+    "dev": "node --disable-warning=ExperimentalWarning --import tsx src/cli.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "node --import tsx --test test/*.test.ts",
-    "smoke:llm": "node --import tsx scripts/smoke-investigator.ts"
+    "test": "node --disable-warning=ExperimentalWarning --import tsx --test test/*.test.ts",
+    "smoke:llm": "node --disable-warning=ExperimentalWarning --import tsx scripts/smoke-investigator.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.283",

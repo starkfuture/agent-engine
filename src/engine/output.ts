@@ -11,7 +11,10 @@ export const FindingsShape = {
       z.object({
         claim: z.string().min(5).max(600),
         status: z.enum(['confirmed', 'ruled_out', 'inconclusive']),
-        evidence: z.array(z.string()).max(10).describe('evidence_ids of the tool results that show it'),
+        evidence: z
+          .array(z.object({ id: z.string(), quote: z.string().min(3).max(300).describe('Exact text copied from that tool result that shows the claim') }))
+          .max(10)
+          .describe('The tool results that show it: evidence_id plus an exact quote from each'),
       }),
     )
     .max(30),
@@ -24,7 +27,7 @@ export type Findings = z.infer<typeof Findings>;
 
 export const findingsOutput: OutputSpec<Findings> = {
   tool: 'submit_findings',
-  description: 'Submit your answer once, when done. Every confirmed or ruled-out finding must cite evidence ids. Invalid submissions come back with the reason; fix and resubmit.',
+  description: 'Submit your answer once, when done. Every confirmed or ruled-out finding must cite evidence: the evidence_id and an exact quote copied from that tool result. Invalid submissions come back with the reason; fix and resubmit.',
   shape: FindingsShape,
   evidenceOf: (f) => f.findings.flatMap((x) => x.evidence),
   check: (f) => f.findings.filter((x) => x.status !== 'inconclusive' && !x.evidence.length).map((x) => `finding "${x.claim.slice(0, 60)}" is ${x.status} but cites no evidence`),
@@ -32,16 +35,17 @@ export const findingsOutput: OutputSpec<Findings> = {
   max: 1,
 };
 
-export function renderFindings(f: Findings, footer: string): string {
+export function renderFindings(f: Findings, footer: string, dissent: string[] = []): string {
   return [
     `# ${f.title}`,
     '',
     f.summary,
     '',
     '## Findings',
-    ...f.findings.map((x) => `- **${x.status}**: ${x.claim}${x.evidence.length ? ` (${x.evidence.join(', ')})` : ''}`),
+    ...f.findings.map((x) => `- **${x.status}**: ${x.claim}${x.evidence.map((e) => `\n  - ${e.id}: “${e.quote}”`).join('')}`),
     ...(f.next_steps.length ? ['', '## Next steps', ...f.next_steps.map((s) => `- ${s}`)] : []),
     ...(f.not_checked.length ? ['', '## Not checked', ...f.not_checked.map((s) => `- ${s}`)] : []),
+    ...(dissent.length ? ['', '## ⚠️ Challenge: ESCALATE (a human decides)', ...dissent] : []),
     '',
     `_${footer}_`,
   ].join('\n');

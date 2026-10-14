@@ -1,7 +1,7 @@
 import type { ChallengeResult } from '../engine/challenge.js';
 import type { Report } from '../investigate/report.js';
 import { rowLine, type Summary } from '../patrol/summary.js';
-import { redact } from '../engine/text.js';
+import { cleanModelText, redact } from '../engine/text.js';
 
 const SEV = { critical: '🔴', major: '🟠', minor: '🟡', noise: '⚪' } as const;
 const clip = (s: string, n = 2900) => (s.length > n ? `${s.slice(0, n - 1)}…` : s); // Slack section text limit is 3000
@@ -20,8 +20,24 @@ function challengeLines(c: ChallengeResult | undefined): string[] {
   return [head, ...c.blocking.map((o) => `• Objection: ${o.claim} (if acted on: ${o.failure_scenario}; check: ${o.settling_check}; ${o.evidence.join(', ')})`), ...(c.notes.length ? [`${c.notes.length} non-blocking note(s) in the run folder.`] : [])];
 }
 
-export function reportCard(r: Report, patrolAt: string, footer: string, challenge?: ChallengeResult): Card {
-  const ch = challengeLines(challenge);
+// Every model-written string is redacted and cleaned on its own before it goes
+// into the card. (Redacting the serialised blocks broke JSON on `KEY="…"`.)
+const m = (s: string) => cleanModelText(redact(s));
+
+export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult): Card {
+  const r: Report = {
+    ...raw,
+    title: m(raw.title),
+    started_at: m(raw.started_at),
+    what_broke: m(raw.what_broke),
+    impact: m(raw.impact),
+    cause: { ...raw.cause, hypothesis: m(raw.cause.hypothesis) },
+    evidence: raw.evidence.map((e) => ({ ...e, quote: m(e.quote), claim: m(e.claim) })),
+    suggested_fix: m(raw.suggested_fix),
+    not_checked: raw.not_checked.map(m),
+    rows: raw.rows.map(m),
+  };
+  const ch = challengeLines(challenge).map(m);
   const md = [
     `## ${SEV[r.severity]} ${r.title}`,
     `**Status:** ${r.status} · **Since:** ${r.started_at} · **Severity (advisory):** ${r.severity} · **Confidence:** ${r.cause.confidence}`,
@@ -35,9 +51,9 @@ export function reportCard(r: Report, patrolAt: string, footer: string, challeng
     `**Suggested fix:** ${r.suggested_fix}`,
     '',
     '**Evidence**',
-    ...r.evidence.map((e) => `- ${e.id}: ${e.claim}`),
+    ...r.evidence.map((e) => `- ${e.id}: ${e.claim} (“${e.quote}”)`),
     ...(r.not_checked.length ? ['', '**Not checked**', ...r.not_checked.map((x) => `- ${x}`)] : []),
-    ...(r.noise_rule ? ['', '**Proposed noise rule (needs review)**', '```yaml', JSON.stringify(r.noise_rule, null, 2), '```'] : []),
+    ...(r.noise_rule ? ['', '**Proposed noise rule (needs review)**', '```yaml', m(JSON.stringify(r.noise_rule, null, 2)), '```'] : []),
     ...(ch.length ? ['', '**Challenge**', ...ch] : []),
     '',
     `_Rows: ${r.rows.join(', ')} · patrol ${patrolAt} · ${footer}_`,
@@ -59,7 +75,7 @@ export function reportCard(r: Report, patrolAt: string, footer: string, challeng
     ...(ch.length ? [section('Challenge', ch.join('\n'))] : []),
     { type: 'context', elements: [{ type: 'mrkdwn', text: clip(`patrol ${patrolAt} · ${footer}`, 300) }] },
   ];
-  return { text: redact(`${SEV[r.severity]} ${r.title}`), blocks: JSON.parse(redact(JSON.stringify(blocks))), markdown: redact(md) };
+  return { text: `${SEV[r.severity]} ${r.title}`, blocks, markdown: md };
 }
 
 // Without the LLM (no credentials, budget cap hit, or the investigator failed),

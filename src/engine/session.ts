@@ -16,8 +16,14 @@ export interface SessionRequest {
   maxBudgetUsd: number;
   abort: AbortController;
   cwd: string;
+  roots?: string[]; // folders file tools may read (snapshots); cwd is the first
   pluginDir?: string; // agent folder with skills/ and agents/
 }
+
+// Read deny rules for the CLI. It turns them into ripgrep exclusions and checks
+// every Grep/Glob result against them, so they hold per file, not per call.
+// Belt and braces: the snapshot already leaves these files out.
+export const READ_DENY = ['**/.env', '**/.env.*', '**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx', '**/id_rsa*', '**/id_ed25519*', '**/.npmrc', '**/.netrc', '**/*.tfstate', '**/kubeconfig'].map((g) => `Read(${g})`);
 
 export type SessionEvent =
   | { kind: 'tool_use'; name: string; input: unknown }
@@ -32,7 +38,8 @@ export const mcpName = (tool: string) => `mcp__${MCP_NAME}__${tool}`;
 // The subprocess gets only what it needs to reach the model. Credentialed tools
 // run in this process; the model only sees their output.
 function llmEnv(): Record<string, string | undefined> {
-  const keep = /^(PATH|LANG|ANTHROPIC_API_KEY|ANTHROPIC_BASE_URL|CLAUDE_CODE_USE_BEDROCK|AWS_REGION|AWS_PROFILE|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_CONFIG_FILE|AWS_SHARED_CREDENTIALS_FILE|HTTPS?_PROXY|NO_PROXY)$/;
+  const keep =
+    /^(PATH|LANG|NODE_EXTRA_CA_CERTS|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|ANTHROPIC_BEDROCK_BASE_URL|CLAUDE_CODE_USE_BEDROCK|AWS_BEARER_TOKEN_BEDROCK|AWS_REGION|AWS_DEFAULT_REGION|AWS_PROFILE|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_CONFIG_FILE|AWS_SHARED_CREDENTIALS_FILE|AWS_STS_REGIONAL_ENDPOINTS|AWS_ROLE_ARN|AWS_ROLE_SESSION_NAME|AWS_WEB_IDENTITY_TOKEN_FILE|AWS_CONTAINER_CREDENTIALS_FULL_URI|AWS_CONTAINER_CREDENTIALS_RELATIVE_URI|AWS_CONTAINER_AUTHORIZATION_TOKEN|AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE|HTTPS?_PROXY|NO_PROXY)$/;
   const env: Record<string, string | undefined> = {
     CLAUDE_AGENT_SDK_CLIENT_APP: 'agent-engine/0.1.0',
     DISABLE_AUTOUPDATER: '1',
@@ -73,6 +80,11 @@ export const sdkSession: Session = async function* (r) {
       settingSources: [], // no ~/.claude, no CLAUDE.md from parent folders
       plugins,
       ...(r.pluginDir ? { skills: 'all' as const } : {}),
+      ...(r.roots && r.roots.length > 1 ? { additionalDirectories: r.roots.slice(1) } : {}),
+      settings: {
+        disableSkillShellExecution: true,
+        ...(r.roots ? { permissions: { deny: READ_DENY, blockReadsOutsideWorkingDirectories: true } } : {}),
+      },
       permissionMode: 'dontAsk', // anything not allowed is denied, never prompted
       hooks: r.hooks,
       maxTurns: r.maxTurns,

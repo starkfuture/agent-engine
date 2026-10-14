@@ -10,7 +10,8 @@ import { State } from './patrol/state.js';
 import { rowLine } from './patrol/summary.js';
 import { CardSink } from './output/sink.js';
 import { listAgents, loadAgent } from './engine/agent.js';
-import { Ledger } from './engine/ledger.js';
+import { Store } from './engine/store.js';
+import { redact } from './engine/text.js';
 import { findingsOutput, renderFindings } from './engine/output.js';
 import { runAgent, type Engine } from './engine/run.js';
 import { sdkSession } from './engine/session.js';
@@ -24,7 +25,7 @@ Agents (folders in agents/):
       --path <dir>            folder the codebase agent may read (required for it)
       --challenge             have a challenger check the answer
   run monitor                 one patrol with the investigator (same as: patrol --llm)
-  runs [--agent <name>]       recent runs from the ledger, with cost and status
+  runs [--agent <name>]       recent runs with status, cost and challenge verdict
   stop | resume               create or remove the STOP file: running agents stop at the next step
 
 Monitor:
@@ -76,10 +77,12 @@ function date(s: string | undefined, name: string): Date {
   if (Number.isNaN(d.getTime())) throw new Error(`--${name} must be an ISO time, e.g. 2026-09-29T12:00:00Z`);
   return d;
 }
-function makeEngine(cfg: Config): Engine {
+// One store and one STOP file for every entry point (patrol, loop, run, replay),
+// so caps, single flight and the kill switch can't be sidestepped.
+function makeEngine(cfg: Config, runsDir = cfg.runsDir): Engine {
   return {
-    ledger: new Ledger(join(cfg.runsDir, 'ledger.jsonl')),
-    runsDir: cfg.runsDir,
+    store: new Store(join(cfg.runsDir, 'engine.db')),
+    runsDir,
     stopFile: join(cfg.runsDir, 'STOP'),
     session: sdkSession,
     dailyCapUsd: cfg.llm.dailyCapUsd,
@@ -196,7 +199,7 @@ async function main() {
       const r = await runAgent(makeEngine(cfg), {
         agent,
         trigger: 'manual',
-        task: roots ? `${a.task}\n\nThe folder you may read: ${roots[0]}` : a.task,
+        task: a.task,
         output: findingsOutput,
         ...(a.challenge ? { challenge: true } : {}),
         ...(roots ? { roots } : {}),
@@ -204,10 +207,11 @@ async function main() {
       log(`${r.runId}: ${r.status}, ${r.evidence.items.size} tool call(s), ${r.turns} turn(s), $${r.cost.toFixed(3)}${r.challenge ? `, challenge ${r.challenge.verdict}` : ''}${r.note ? ` (${r.note})` : ''}`);
       const f = r.outputs[0];
       if (f) {
-        const md = renderFindings(f, `${name}@${agent.version} · run ${r.runId} · $${r.cost.toFixed(2)}${r.challenge ? ` · challenge ${r.challenge.verdict}` : ''}`);
+        const dissent = (r.challenge?.blocking ?? []).map((o) => `- ${o.claim}\n  - if acted on: ${o.failure_scenario}\n  - check: ${o.settling_check} (${o.evidence.join(', ')})`);
+        const verdict = r.challenge ? ` · challenge ${r.challenge.verdict}${r.challenge.note ? ` (${r.challenge.note})` : ''}` : '';
+        const md = redact(renderFindings(f, `${name}@${agent.version} · run ${r.runId} · $${r.cost.toFixed(2)}${verdict}`, dissent));
         if (r.dir) writeFileSync(join(r.dir, 'answer.md'), md + '\n');
         console.log(md);
-        if (r.challenge?.blocking.length) console.log(`\n## Challenge: ESCALATE\n${r.challenge.blocking.map((o) => `- ${o.claim}\n  if acted on: ${o.failure_scenario}\n  check: ${o.settling_check}`).join('\n')}`);
       }
       if (r.dir) log(`run folder: ${r.dir}`);
       if (r.status !== 'ok') process.exitCode = 1;
@@ -215,13 +219,13 @@ async function main() {
     }
 
     case 'runs': {
-      const lines = new Ledger(join(cfg.runsDir, 'ledger.jsonl')).read().filter((l) => !a.agent || l.agent === a.agent);
-      const ends = lines.filter((l) => l.ev === 'end').slice(-30);
-      for (const l of ends) if (l.ev === 'end') console.log(`${l.at.slice(0, 19)}  ${l.agent.padEnd(10)} ${l.status.padEnd(9)} $${l.cost.toFixed(3).padStart(6)}  ${String(l.turns).padStart(3)} turns  ${l.outputs} out${l.challenge ? `  challenge ${l.challenge}` : ''}${l.note ? `  (${l.note})` : ''}  ${l.run}`);
-      const open = lines.filter((l) => l.ev === 'start' && !lines.some((m) => m.ev === 'end' && m.run === l.run));
-      for (const l of open) console.log(`RUNNING or CRASHED: ${l.run} (started ${l.at})`);
+      const store = new Store(join(cfg.runsDir, 'engine.db'));
+      for (const r of store.recent(30, a.agent).reverse())
+        console.log(
+          `${r.started_at.slice(0, 19)}  ${r.agent.padEnd(10)} ${r.status.padEnd(9)} $${(r.cost ?? r.reserve).toFixed(3).padStart(6)}  ${String(r.turns ?? 0).padStart(3)} turns  ${r.outputs ?? 0} out  ${r.trigger}${r.challenge ? `  challenge ${r.challenge}` : ''}${r.note ? `  (${r.note})` : ''}  ${r.id}`,
+        );
       const day = new Date().toISOString().slice(0, 10);
-      console.log(`today: $${new Ledger(join(cfg.runsDir, 'ledger.jsonl')).spent(day).toFixed(2)} of $${cfg.llm.dailyCapUsd} global cap`);
+      console.log(`today: $${store.spent(day).toFixed(2)} of $${cfg.llm.dailyCapUsd} global cap (running runs count their reservation)`);
       return;
     }
 
@@ -310,11 +314,12 @@ async function main() {
       const outDir = resolve(cfg.outDir, `replay-${from.toISOString().slice(0, 16).replace(/:/g, '')}`);
       mkdirSync(outDir, { recursive: true });
       const replayCfg = { ...cfg, outDir };
-      // Replayed investigations keep their own ledger and run folders.
-      const monitor = a.llm ? { engine: { ...makeEngine({ ...cfg, runsDir: join(outDir, 'runs') }) }, agent: loadAgent(join(cfg.agentsDir, 'monitor')) } : undefined;
+      // Replayed investigations write their run folders next to the replay, but
+      // share the store and STOP file: real money, same caps, same kill switch.
+      const monitor = a.llm ? { engine: makeEngine(cfg, join(outDir, 'runs')), agent: loadAgent(join(cfg.agentsDir, 'monitor')) } : undefined;
       const timeline: string[] = [`# Replay ${from.toISOString()} → ${to.toISOString()} (step ${step} min, window ${w} min)`, ''];
       for (let t = from; t <= to; t = new Date(t.getTime() + step * 60_000)) {
-        const r = await patrolOnce(tel, replayCfg, noise, state, new CardSink(outDir), t, { llm: a.llm, post: false, log }, monitor);
+        const r = await patrolOnce(tel, replayCfg, noise, state, new CardSink(outDir), t, { llm: a.llm, post: false, trigger: 'replay', log }, monitor);
         const down = r.summary.sources.filter((s) => !s.ok).map((s) => s.source);
         timeline.push(`## ${t.toISOString()}  send ${r.summary.send.length} · known ${r.summary.known.length} · recovered ${r.summary.recovered.length}${down.length ? ` · blind: ${down.join(', ')}` : ''}`);
         for (const row of r.summary.send) timeline.push(`- ${rowLine(row)}`);

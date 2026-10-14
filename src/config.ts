@@ -60,7 +60,14 @@ export interface Config {
 }
 
 const expandHome = (p: string) => (p.startsWith('~/') ? resolve(homedir(), p.slice(2)) : resolve(p));
-const num = (v: string | undefined, d: number) => (v === undefined || v === '' ? d : Number(v));
+// A malformed number must stop the program: NaN in a cap comparison is always
+// false, which would silently disable the cap.
+const num = (v: string | undefined, d: number, name = 'value') => {
+  if (v === undefined || v.trim() === '') return d;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`${name} must be a non-negative number, got "${v}"`);
+  return n;
+};
 const opt = (v: string | undefined) => (v === undefined || v === '' ? undefined : v);
 
 // Minimal .env reader: KEY=VALUE lines, no interpolation. Real env wins.
@@ -80,20 +87,22 @@ export function loadSources(file: string): Sources {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.cwd()): Config {
   const r = (p: string) => resolve(root, p);
+  const legacy = ['SRE_MODEL', 'SRE_MAX_USD_PER_INVESTIGATION', 'SRE_DAILY_CAP_USD', 'SRE_MAX_TURNS'].filter((k) => env[k] !== undefined);
+  if (legacy.length) throw new Error(`${legacy.join(', ')} no longer apply: set model and limits in agents/monitor/agent.yaml and the global cap in ENGINE_DAILY_CAP_USD`);
   return {
     grafanaUrl: (env.GRAFANA_URL ?? 'https://monitoring.starkfuture.com').replace(/\/$/, ''),
     grafanaTokenFile: expandHome(env.GRAFANA_TOKEN_FILE ?? '~/.config/golive/grafana-token'),
     promUid: env.PROM_DATASOURCE_UID || 'prometheus',
     lokiUid: opt(env.LOKI_DATASOURCE_UID),
     tempoUid: opt(env.TEMPO_DATASOURCE_UID),
-    windowMinutes: num(env.PATROL_WINDOW_MINUTES, 15),
+    windowMinutes: num(env.PATROL_WINDOW_MINUTES, 15, 'PATROL_WINDOW_MINUTES'),
     sources: loadSources(r(env.SRE_SOURCES_FILE ?? 'config/sources.yaml')),
     noiseFile: r(env.SRE_NOISE_FILE ?? 'config/noise.yaml'),
     stateFile: r(env.SRE_STATE_FILE ?? '.state/state.json'),
     outDir: r(env.SRE_OUT_DIR ?? 'out'),
     llm: {
       available: Boolean(env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_USE_BEDROCK === '1'),
-      dailyCapUsd: num(env.ENGINE_DAILY_CAP_USD, 20),
+      dailyCapUsd: num(env.ENGINE_DAILY_CAP_USD, 20, 'ENGINE_DAILY_CAP_USD'),
     },
     agentsDir: r(env.ENGINE_AGENTS_DIR ?? 'agents'),
     runsDir: r(env.ENGINE_RUNS_DIR ?? 'runs'),

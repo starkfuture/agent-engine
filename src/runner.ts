@@ -12,10 +12,12 @@ import type { CardSink } from './output/sink.js';
 import type { Noise } from './patrol/noise.js';
 import type { State } from './patrol/state.js';
 import { buildSummary, renderSummary, type FlaggedRow, type Summary } from './patrol/summary.js';
+import { redact, safeJson } from './engine/text.js';
 
 export interface PatrolOptions {
   llm: boolean;
   post: boolean;
+  trigger?: string; // 'patrol' (default) | 'replay' | 'manual'
   log?: (s: string) => void;
 }
 
@@ -44,8 +46,8 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   const summary = await buildSummary(tel, cfg, noise, state, at);
   const dir = join(cfg.outDir, 'patrols');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, `${stamp(summary.at)}.md`), renderSummary(summary) + '\n');
-  writeFileSync(join(dir, `${stamp(summary.at)}.json`), JSON.stringify(summary, null, 1));
+  writeFileSync(join(dir, `${stamp(summary.at)}.md`), redact(renderSummary(summary)) + '\n');
+  writeFileSync(join(dir, `${stamp(summary.at)}.json`), safeJson(summary, 1));
   log(`patrol ${summary.at}: ${summary.send.length} to send, ${summary.known.length} known, ${summary.suppressed.length} noise, ${summary.recovered.length} recovered, sources down: ${summary.sources.filter((s) => !s.ok).map((s) => s.source).join(', ') || 'none'}`);
 
   const result: PatrolResult = { summary, cards: [] };
@@ -60,27 +62,37 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   else if (!monitor.engine.llmAvailable) skip = 'no LLM credentials configured';
 
   // The deterministic card goes out first: the AI never delays what code found.
-  result.cards.push(await sink.emit(patrolCard(summary, skip ?? 'AI investigation running; report cards follow'), `${stamp(summary.at)}-rows`, o.post));
+  result.cards.push(await sink.emit(patrolCard(summary, skip ?? 'AI investigation started'), `${stamp(summary.at)}-rows`, o.post));
 
   if (!skip && monitor) {
     const rowKeys = new Set(summary.send.map((r) => r.key));
     const challenge = needsChallenge(summary.send, noise);
     log(`investigating ${summary.send.length} row(s) with ${monitor.agent.spec.model}${challenge ? ', then a challenger' : ''}…`);
-    const inv = await runAgent<Report>(monitor.engine, {
-      agent: monitor.agent,
-      trigger: o.llm ? 'patrol' : 'manual',
-      task: monitorTask([...rowKeys]),
-      data: renderSummary(summary),
-      tools: monitorTools(tel, cfg, at),
-      output: {
-        tool: 'submit_report',
-        description: 'Submit one report per distinct problem. Call it once for every problem you found (several calls are fine). Invalid reports come back with the reason; fix and resubmit.',
-        shape: ReportShape,
-        evidenceOf: (r) => r.evidence.map((e) => e.id),
-        check: (r) => checkReport(r, rowKeys),
-      },
-      challenge,
-    });
+    let inv: RunResult<Report>;
+    try {
+      inv = await runAgent<Report>(monitor.engine, {
+        agent: monitor.agent,
+        trigger: o.trigger ?? 'patrol',
+        task: monitorTask([...rowKeys]),
+        data: renderSummary(summary),
+        tools: monitorTools(tel, cfg, at),
+        output: {
+          tool: 'submit_report',
+          description: 'Submit one report per distinct problem. Call it once for every problem you found (several calls are fine). Invalid reports come back with the reason; fix and resubmit.',
+          shape: ReportShape,
+          evidenceOf: (r) => r.evidence,
+          check: (r) => checkReport(r, rowKeys),
+        },
+        challenge,
+      });
+    } catch (e) {
+      // The rows card already went out; record why there is no report and keep the state moving.
+      result.skippedLlm = `investigator crashed: ${(e as Error).message.slice(0, 200)}`;
+      log(result.skippedLlm);
+      for (const r of summary.send) state.reported(r, at);
+      state.save();
+      return result;
+    }
     result.investigation = inv;
     log(`investigation ${inv.status}: ${inv.outputs.length} report(s), ${inv.evidence.items.size} tool call(s), ${inv.turns} turn(s), $${inv.cost.toFixed(3)}${inv.challenge ? `, challenge ${inv.challenge.verdict}` : ''}${inv.note ? ` (${inv.note})` : ''}`);
     const footer = `${monitor.agent.spec.model} · ${inv.evidence.items.size} tool calls · $${inv.cost.toFixed(2)} · run ${inv.runId}`;

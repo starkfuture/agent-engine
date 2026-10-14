@@ -30,16 +30,30 @@ npm run dev -- stop | resume                            # kill switch for every 
 Code-driven parts (a deterministic gate, credentialed tools, output checks) live in `src/`. The monitor's are `src/runner.ts` and `src/investigate/`.
 
 **What the engine enforces, in code:**
-- **Fresh session per run.** No `settingSources`, so no parent `CLAUDE.md` or settings. A throwaway `HOME`. The model holds no credentials: credentialed tools run in the engine process.
-- **Rule of Two at load time.** An agent can't have both sensitive reads (local files or credentialed tools) and web tools. Agent folders can't carry hooks or settings.
-- **Evidence.** Every tool result is redacted, fenced as untrusted data, and stamped with a per-run id (`E-7f3a-4`). Outputs come only through a submit tool; the engine checks the schema, that every cited id exists in this run, and the agent's own rules. The evidence hook fails closed.
-- **File access.** File tools stay inside `--path` and away from credential-like paths.
-- **Limits:** max turns, $ per run, a wall-clock deadline, $ per agent per day, a global $ per day, loop detection (the same call 3×), one run per agent at a time, and the STOP file. Money is reserved in the ledger before a run starts and settled after it; a crashed run keeps its reservation.
-- **challenge-lite.** One blind challenger in a fresh session, with the same read tools.
+- **Fresh session per run.** No `settingSources`, so no parent `CLAUDE.md` or settings. A throwaway `HOME`. Skill shell execution is off. The model holds no credentials: credentialed tools run in the engine process.
+- **Rule of Two.** An agent can't have both sensitive reads (local files or credentialed tools, including tools passed in code) and web tools. It's checked at load and again at run time. Agent folders can't carry hooks or settings.
+- **File access is a snapshot, not a filter.**
+  - The codebase agent reads a temp copy of the folder's **git-tracked files**, with secret files (`.env*`, keys, `.npmrc`, `tfstate`, …) and symlinks removed. No search pattern can reach what isn't there.
+  - The CLI's own `blockReadsOutsideWorkingDirectories` and `Read(...)` deny rules check every file a search touches.
+  - A small hook catches `~`, `..` and absolute escapes early.
+- **Evidence.**
+  - Every tool result is redacted, fenced as untrusted data and stamped with a per-run id (`E-7f3a-4`).
+  - Answers come only through a submit tool. Every cited piece of evidence needs an **exact quote** that the engine finds in that tool result.
+  - Redaction walks structured values before anything is serialised, so JSON escaping can't hide a secret. It's a backstop; the boundary is what agents can reach.
+  - The evidence hook fails closed.
+- **Admission is one SQLite transaction** (`runs/engine.db`): caps per agent and global, with running runs counted at their reservation, plus one run per agent. Two processes can't both pass a cap.
+  - A crashed run, whose process is gone or which is far past its deadline, is settled at its full reservation.
+  - Spend counts on the day the run started.
+  - Every entry point (patrol, loop, run, replay) shares the same store and STOP file.
+- **Limits:** max turns, $ per run, a wall-clock deadline, loop detection (the same call 3×) and the STOP file. Every admitted run is settled, even when setup or bookkeeping throws.
+- **challenge-lite.** One blind challenger in a fresh session, with the task, the context, the output and the same read tools, but not the author's system prompt.
   - A blocking objection needs a failure scenario, a settling check and a real evidence id; otherwise it becomes a note.
-  - The verdict is `upheld` or `escalate`, the latter meaning a human decides. There is no rebuttal round and no consensus-seeking.
-  - Grow it only from `challenge.json` evidence.
-- **Run folder** `runs/<agent>/<run>/`: `input.md`, `transcript.jsonl` (redacted), `evidence.jsonl`, `output.json`, `challenge.json`.
+  - The verdict is `upheld` or `escalate` (a human decides), with no rebuttal round and no consensus-seeking.
+  - A challenge that failed, ended without a result, or checked nothing itself is `error`, never `upheld`. Only the first submission counts. The challenger has its own loop detector.
+- **Run folder** `runs/<agent>/<run>/`: `input.md`, `transcript.jsonl`, `evidence.jsonl`, `output.json`, `challenge.json`, `answer.md` (with any dissent). All of them are redacted.
+- **Model-written text for humans** (cards): redacted per field, image syntax removed, links to unknown hosts defanged.
+
+Review and research behind v0.2: `../agent_workspace/research/agent-engine-2026-10-14/` (09–12).
 
 ## The monitor agent
 
@@ -56,7 +70,7 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
    - **Logs:** error lines grouped into stable templates.
    - **Traces:** error traces by root operation.
 2. **Filter.** Steady rows, known noise (`config/noise.yaml`) and already-reported rows are dropped. A quiet patrol ends here and costs $0.
-3. **Card first.** The rows card goes to `out/cards/` (and to Slack with `--post` and a webhook) before any AI runs.
+3. **Card first.** The rows card goes to `out/cards/` (and to Slack with `--post` and a webhook) before any AI runs. If the investigator crashes, the rows are still marked reported.
 4. **Investigate.** Only if rows remain, the engine runs the `monitor` agent. It has read-only telemetry tools and no shell, files or web, and must submit schema-checked reports that cite evidence ids.
 5. **Challenge.** For protected journeys or big spikes (a deterministic gate, never the model's severity), a challenger re-checks the report. Its verdict goes on the card.
 
@@ -117,14 +131,17 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 
 ## Not built yet
 
-- **Engine:**
-  - launchd/cron scheduling for interval agents (`loop` covers the monitor today);
+- **Engine (see 12-v0.2-plan.md for reasons):**
+  - launchd/cron scheduling, plus a process-group supervisor for hard kills (`loop` covers the monitor today);
+  - a provider-side cap (an Anthropic workspace monthly limit) as the outer boundary: an owner setting, not code;
+  - a credential-injecting proxy and an OS sandbox (`srt`) around the subprocess;
   - Slack or webhook task intake;
   - a cross-vendor challenger;
   - memory consolidation;
   - OTEL;
   - action runs behind approval buttons.
 - **Monitor:**
+  - a replay eval harness on labelled incidents (needs the 09-29 export), then hypothesis lists with code-derived confidence, the engine re-running cited queries, and pinned starter queries;
   - Paging and the "on fire" rules: these are Prometheus rules, kept separate on purpose.
   - The in-cluster deploy: `sre` namespace, Bedrock EU and three identities.
   - Slack thread Q&A.

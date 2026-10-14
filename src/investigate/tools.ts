@@ -5,7 +5,7 @@ import type { Telemetry } from '../clients/telemetry.js';
 import type { Evidence } from '../engine/evidence.js';
 import type { ToolFactory } from '../engine/run.js';
 import { workloadOf } from '../patrol/collectors.js';
-import { templateOf, truncate } from '../engine/text.js';
+import { fence, redact, templateOf, truncate } from '../engine/text.js';
 
 const H = 3600_000;
 
@@ -41,7 +41,8 @@ export function monitorTools(tel: Telemetry, cfg: Config, at: Date): ToolFactory
 
 function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, by: string): SdkMcpToolDefinition<any>[] {
   const ok = (toolName: string, args: unknown, body: string) => ({ content: [{ type: 'text' as const, text: evidence.stamp(evidence.add(by, toolName, args, body)) }] });
-  const fail = (msg: string) => ({ content: [{ type: 'text' as const, text: `error: ${msg}` }], isError: true });
+  // Error text can carry upstream bodies or URLs: redact and fence it like any result.
+  const fail = (msg: string) => ({ content: [{ type: 'text' as const, text: `error:\n${fence('error', redact(msg).slice(0, 500))}` }], isError: true });
   const guard =
     <A>(name: string, fn: (a: A) => Promise<string>) =>
     async (a: A) => {
