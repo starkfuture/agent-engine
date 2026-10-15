@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -51,12 +51,12 @@ function gitRepo(): string {
   return root;
 }
 
-function context(session: Session, over: { userCap?: number; notify?: (t: string) => Promise<void> } = {}) {
+function context(session: Session, over: { userCap?: number; notify?: (t: string) => Promise<void>; memoryDir?: string } = {}) {
   const runsDir = tmp('runs-');
   const engine: Engine = { store: new Store(join(runsDir, 'engine.db')), runsDir, stopFile: join(runsDir, 'STOP'), session, dailyCapUsd: 20, monthlyCapUsd: 100, llmAvailable: true };
   const users = Users.load(join(tmp('users-'), 'users.json'));
   const tokens = { ana: users.add('ana', { slackId: 'U0ANA12345' }), bo: users.add('bo'), root: users.add('root', { admin: true }) };
-  const cfg = { agentsDir: agentsDir(), runsDir, mcp: { usersFile: users.file, reposFile: '', userDailyCapUsd: over.userCap ?? 10, userMaxRunning: 2, notifySlack: false } } as unknown as Config;
+  const cfg = { agentsDir: agentsDir(), runsDir, memoryDir: over.memoryDir, mcp: { usersFile: users.file, reposFile: '', userDailyCapUsd: over.userCap ?? 10, userMaxRunning: 2, notifySlack: false } } as unknown as Config;
   const ctx: McpContext = { cfg, engine, users, repos: new Map([['app', { path: gitRepo() }]]), ...(over.notify ? { notify: over.notify } : {}) };
   const who = (name: string) => users.list().find((u) => u.name === name)!;
   return { ctx, tokens, who };
@@ -115,6 +115,40 @@ test('only admins get the kill switch and lesson approval', async () => {
   assert.match(skipped.text, /skipped[\s\S]*stop file/);
   await call('approve_lesson', { agent: 'research', lesson: 'Prefer the official docs over blog posts.' });
   assert.match(readFileSync(join(ctx.cfg.agentsDir, 'research', 'memory', 'lessons.md'), 'utf8'), /official docs.*approved by root/);
+});
+
+test('a private agent’s runs are readable by the requester and admins only', async () => {
+  const s = fakeSession(researchOk);
+  const { ctx, who } = context(s);
+  const ana = await connect(ctx, who('ana'));
+  const r = await ana.call('run_agent', { agent: 'research', task: 'Where is feature X configured?', wait_seconds: 10 });
+  const runId = /run (\S+): ok/.exec(r.text)![1]!;
+  const evid = /(E-[0-9a-f]{4}-\d+)/.exec((await ana.call('get_run', { run_id: runId })).text)![1]!;
+
+  const bo = await connect(ctx, who('bo'));
+  assert.match((await bo.call('get_run', { run_id: runId })).text, /error: no run/, 'looks like a missing run');
+  assert.match((await bo.call('get_evidence', { run_id: runId, evidence_id: evid })).text, /error: no run/);
+  assert.ok(!(await bo.call('list_runs')).text.includes(runId));
+  assert.match((await bo.call('proposed_lessons', { agent: 'research' })).text, /admins only/);
+  const root = await connect(ctx, who('root'));
+  assert.match((await root.call('get_run', { run_id: runId })).text, /asked by ana/);
+  assert.ok((await root.call('list_runs')).text.includes(runId));
+
+  // Shared agents: any user reads them.
+  appendFileSync(join(ctx.cfg.agentsDir, 'research', 'agent.yaml'), '\nvisibility: everyone\n');
+  assert.match((await bo.call('get_run', { run_id: runId })).text, /asked by ana/);
+  assert.ok((await bo.call('list_runs')).text.includes(runId));
+});
+
+test('with a memory dir, approved lessons live there (a persistent volume), not in the image', async () => {
+  const memoryDir = tmp('memory-');
+  const { ctx, who } = context(fakeSession(), { memoryDir });
+  const root = await connect(ctx, who('root'));
+  const before = (await root.call('list_agents')).text;
+  await root.call('approve_lesson', { agent: 'research', lesson: 'Prefer the official docs over blog posts.' });
+  assert.match(readFileSync(join(memoryDir, 'research', 'lessons.md'), 'utf8'), /official docs/);
+  assert.ok(!existsSync(join(ctx.cfg.agentsDir, 'research', 'memory', 'lessons.md')), 'agent folder untouched');
+  assert.notEqual((await root.call('list_agents')).text, before, 'the lesson changes the agent version');
 });
 
 test('the codebase agent reads only named repos, never a caller path; scheduled agents are not runnable', async () => {
@@ -244,6 +278,7 @@ test('HTTP: bearer token per person, POST only, local Host header on a loopback 
     req.end(JSON.stringify(init));
   });
   assert.equal(rebound, 403);
+  assert.equal((await post({ authorization: `Bearer ${tokens.ana}`, origin: 'https://evil.test' })).status, 403, 'a browser page cannot drive the endpoint');
   assert.equal((await fetch(`${base}/mcp`, { headers: { authorization: `Bearer ${tokens.ana}` } })).status, 405);
   assert.equal((await fetch(`${base}/healthz`)).status, 200);
   const client = new Client({ name: 't', version: '1' });

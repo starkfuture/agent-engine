@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -114,10 +115,23 @@ function date(s: string | undefined, name: string): Date {
   if (Number.isNaN(d.getTime())) throw new Error(`--${name} must be an ISO time, e.g. 2026-09-29T12:00:00Z`);
   return d;
 }
+// The engine code a run used: ENGINE_BUILD (the image tag when hosted), else
+// this checkout's commit, marked -dirty when it has local edits.
+function engineBuild(cfg: Config): string | undefined {
+  if (cfg.build) return cfg.build;
+  try {
+    return execFileSync('git', ['-C', import.meta.dirname, 'describe', '--always', '--dirty'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // One store and one STOP file for every entry point (patrol, loop, run, replay),
 // so caps, single flight and the kill switch can't be sidestepped.
 function makeEngine(cfg: Config, runsDir = cfg.runsDir): Engine {
+  const build = engineBuild(cfg);
   return {
+    ...(build ? { build } : {}),
     store: new Store(join(cfg.runsDir, 'engine.db')),
     runsDir,
     stopFile: join(cfg.runsDir, 'STOP'),
@@ -128,7 +142,7 @@ function makeEngine(cfg: Config, runsDir = cfg.runsDir): Engine {
   };
 }
 function monitorAgent(cfg: Config): MonitorAgent {
-  return { engine: makeEngine(cfg), agent: loadAgent(join(cfg.agentsDir, 'monitor')) };
+  return { engine: makeEngine(cfg), agent: loadAgent(join(cfg.agentsDir, 'monitor'), cfg.memoryDir) };
 }
 
 // Patrol times sit on window boundaries so recordings and replays line up.
@@ -211,7 +225,7 @@ async function main() {
 
   switch (cmd) {
     case 'agents': {
-      for (const ag of listAgents(cfg.agentsDir)) {
+      for (const ag of listAgents(cfg.agentsDir, cfg.memoryDir)) {
         const l = ag.spec.limits;
         console.log(`${ag.spec.name.padEnd(10)} @${ag.version}  ${ag.spec.model}  ${ag.spec.every ? `every ${ag.spec.every}m` : 'manual'}  tools: ${[...ag.spec.builtin_tools, ...(ag.spec.code ? [`${ag.spec.code} pack`] : [])].join(', ') || 'none'}  $${l.usd_per_run}/run $${l.usd_per_day}/day ${l.deadline_min}min  challenge: ${ag.spec.challenge.when}`);
         if (ag.spec.description) console.log(`           ${ag.spec.description}`);
@@ -228,7 +242,7 @@ async function main() {
         for (const c of r.cards) console.log(`card: ${c}`);
         return;
       }
-      const agent = loadAgent(join(cfg.agentsDir, name));
+      const agent = loadAgent(join(cfg.agentsDir, name), cfg.memoryDir);
       if (agent.spec.code) throw new Error(`${name} is driven by its own code; use its command`);
       if (!a.task) throw new Error('--task is required');
       const needsPath = agent.spec.builtin_tools.some((t) => t === 'Read' || t === 'Grep' || t === 'Glob');
@@ -398,7 +412,7 @@ async function main() {
       const replayCfg = { ...cfg, outDir };
       // Replayed investigations write their run folders next to the replay, but
       // share the store and STOP file: real money, same caps, same kill switch.
-      const monitor = a.llm ? { engine: makeEngine(cfg, join(outDir, 'runs')), agent: loadAgent(join(cfg.agentsDir, 'monitor')) } : undefined;
+      const monitor = a.llm ? { engine: makeEngine(cfg, join(outDir, 'runs')), agent: loadAgent(join(cfg.agentsDir, 'monitor'), cfg.memoryDir) } : undefined;
       const timeline: string[] = [`# Replay ${from.toISOString()} → ${to.toISOString()} (step ${step} min, window ${w} min)`, ''];
       for (let t = from; t <= to; t = new Date(t.getTime() + step * 60_000)) {
         const r = await patrolOnce(tel, replayCfg, noise, state, new CardSink(outDir), t, { llm: a.llm, post: false, trigger: 'replay', log }, monitor);

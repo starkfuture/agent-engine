@@ -7,8 +7,11 @@ import { z } from 'zod';
 // An agent is a folder:
 //   agent.yaml          limits, tools, triggers, challenge, sinks
 //   CLAUDE.md           the system prompt
-//   memory/lessons.md   human-curated lessons, read at run start
+//   memory/lessons.md   human-curated lessons (in git), read at run start
 //   memory/proposed.md  lessons runs propose (engine appends; a human promotes)
+// With a memory root (ENGINE_MEMORY_DIR, on a persistent volume when hosted),
+// runtime writes go to <root>/<agent>/ instead: proposed.md and lessons
+// approved over MCP. Both lesson files are read; git ones come first.
 //   skills/, agents/    Claude Code skills and subagents, loaded as a local plugin
 // Code (gate, credentialed tools, output checks) lives in src/agents/<code>.ts.
 
@@ -51,6 +54,9 @@ export const AgentSpec = z
       .strict()
       .default({ when: 'never', usd: 1, max_turns: 15 }),
     sinks: z.array(z.enum(['file', 'slack'])).default(['file']),
+    // Who may read a run over MCP: the requester and admins, or every user.
+    // Agents that read customer data stay at the default.
+    visibility: z.enum(['requester', 'everyone']).default('requester'),
   })
   .strict();
 export type AgentSpec = z.infer<typeof AgentSpec>;
@@ -59,7 +65,8 @@ export interface LoadedAgent {
   dir: string;
   spec: AgentSpec;
   prompt: string; // CLAUDE.md + lessons
-  version: string; // sha256 of the folder (minus proposed lessons), first 12 hex
+  version: string; // sha256 of the folder and runtime lessons (minus proposed lessons), first 12 hex
+  memory: string; // where runtime writes go: proposed.md, approved lessons
   plugin: boolean; // has skills/ or agents/
 }
 
@@ -73,7 +80,7 @@ function files(dir: string): string[] {
   return out;
 }
 
-export function loadAgent(dir: string): LoadedAgent {
+export function loadAgent(dir: string, memoryRoot?: string): LoadedAgent {
   const spec = AgentSpec.parse(parse(readFileSync(join(dir, 'agent.yaml'), 'utf8')));
   if (spec.name !== basename(dir)) throw new Error(`agent.yaml name "${spec.name}" must match its folder "${basename(dir)}"`);
 
@@ -88,8 +95,13 @@ export function loadAgent(dir: string): LoadedAgent {
 
   const claude = join(dir, 'CLAUDE.md');
   if (!existsSync(claude)) throw new Error(`${spec.name}: CLAUDE.md is required`);
-  const lessonsFile = join(dir, 'memory', 'lessons.md');
-  const lessons = existsSync(lessonsFile) ? readFileSync(lessonsFile, 'utf8').trim() : '';
+  const memory = memoryRoot ? join(memoryRoot, spec.name) : join(dir, 'memory');
+  const lessonFiles = [...new Set([join(dir, 'memory', 'lessons.md'), join(memory, 'lessons.md')])];
+  const lessons = lessonFiles
+    .filter((f) => existsSync(f))
+    .map((f) => readFileSync(f, 'utf8').trim())
+    .filter(Boolean)
+    .join('\n');
   const prompt = readFileSync(claude, 'utf8').trim() + (lessons ? `\n\n# Lessons from past runs (curated by humans)\n\n${lessons}` : '');
 
   const h = createHash('sha256');
@@ -98,14 +110,16 @@ export function loadAgent(dir: string): LoadedAgent {
     if (rel === join('memory', 'proposed.md')) continue;
     h.update(rel).update('\0').update(readFileSync(f)).update('\0');
   }
+  const runtime = join(memory, 'lessons.md');
+  if (memoryRoot && existsSync(runtime)) h.update('runtime-lessons\0').update(readFileSync(runtime));
   const plugin = existsSync(join(dir, 'skills')) || existsSync(join(dir, 'agents'));
-  return { dir, spec, prompt, version: h.digest('hex').slice(0, 12), plugin };
+  return { dir, spec, prompt, version: h.digest('hex').slice(0, 12), plugin, memory };
 }
 
-export function listAgents(root: string): LoadedAgent[] {
+export function listAgents(root: string, memoryRoot?: string): LoadedAgent[] {
   if (!existsSync(root)) return [];
   return readdirSync(root)
     .filter((n) => existsSync(join(root, n, 'agent.yaml')))
     .sort()
-    .map((n) => loadAgent(join(root, n)));
+    .map((n) => loadAgent(join(root, n), memoryRoot));
 }

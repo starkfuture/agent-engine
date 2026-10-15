@@ -21,6 +21,7 @@ export interface Engine {
   dailyCapUsd: number; // across all agents
   monthlyCapUsd?: number; // across all agents, UTC month
   llmAvailable: boolean;
+  build?: string; // engine code version, recorded on every run
   now?: () => Date;
 }
 
@@ -143,6 +144,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     globalCap: engine.dailyCapUsd,
     ...(engine.monthlyCapUsd !== undefined ? { monthlyCap: engine.monthlyCapUsd } : {}),
     concurrency: spec.concurrency,
+    ...(engine.build ? { build: engine.build } : {}),
     ...(input.user ? { user: input.user.name, userCap: input.user.usdPerDay, userMaxRunning: input.user.maxRunning } : {}),
   });
   if (!admitted.ok) return skipped(admitted.reason);
@@ -216,9 +218,13 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
       }
     }
     const where = roots ? `\n\nThe folder${roots.length > 1 ? 's' : ''} you may read (${sources!.map((s) => `${s.path} at ${s.ref}, commit ${s.commit.slice(0, 10)} of ${s.date}`).join('; ')}; committed files only, secret files removed): ${roots.join(', ')}` : '';
-    const task = input.task + where;
-    const prompt = [task, ...(input.data ? ['', fence('context', input.data)] : [])].join('\n');
-    writeFileSync(join(dir, 'input.md'), redact(`# ${spec.name} @ ${agent.version}\n\ntrigger: ${input.trigger}\nchallenge: ${challenge}\n\n${prompt}\n`));
+    // The task and context are redacted before the model sees them: a pasted
+    // token or customer email in a question must not leave the process.
+    const askedTask = redact(input.task);
+    const data = input.data === undefined ? undefined : redact(input.data);
+    const task = askedTask + where;
+    const prompt = [task, ...(data ? ['', fence('context', data)] : [])].join('\n');
+    writeFileSync(join(dir, 'input.md'), redact(`# ${spec.name} @ ${agent.version}\n\nengine: ${engine.build ?? 'unknown'}\ntrigger: ${input.trigger}\nchallenge: ${challenge}\n\n${prompt}\n`));
 
     const Out = z.object(input.output.shape);
     const fail = (msg: string) => ({ content: [{ type: 'text' as const, text: `error: ${msg}` }], isError: true });
@@ -304,8 +310,8 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
         maxTurns: spec.challenge.max_turns,
         usd: spec.challenge.usd,
         about: spec.description || spec.name,
-        task: input.task,
-        ...(input.data ? { data: input.data } : {}),
+        task: askedTask,
+        ...(data ? { data } : {}),
         output: outputs.length === 1 ? outputs[0] : outputs,
         evidence,
         tools: input.tools?.(evidence, 'challenger') ?? [],
@@ -345,8 +351,8 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     const lessons = outputs.flatMap((o) => input.output.lessonsOf?.(o) ?? []);
     if (lessons.length)
       best(() => {
-        mkdirSync(join(agent.dir, 'memory'), { recursive: true });
-        appendFileSync(join(agent.dir, 'memory', 'proposed.md'), redact(`\n## ${runId}\n${lessons.map((l) => `- ${l}`).join('\n')}\n`));
+        mkdirSync(agent.memory, { recursive: true });
+        appendFileSync(join(agent.memory, 'proposed.md'), redact(`\n## ${runId}\n${lessons.map((l) => `- ${l}`).join('\n')}\n`));
       });
     engine.store.settle(runId, {
       status,

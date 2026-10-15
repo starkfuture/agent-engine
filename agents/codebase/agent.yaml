@@ -1,5 +1,6 @@
 name: codebase
 description: Read-only investigation of a local folder (code, docs, configs). No web, no shell.
+visibility: everyone # answers about our code; any developer may read them
 model: claude-sonnet-5-5
 concurrency: 3 # several people may ask at once
 builtin_tools: [Read, Grep, Glob]

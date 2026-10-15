@@ -56,7 +56,9 @@ export interface Config {
     monthlyCapUsd: number;
   };
   agentsDir: string;
+  memoryDir: string | undefined; // runtime lessons and proposals (a persistent volume when hosted); unset = in the agent folders
   runsDir: string;
+  build: string | undefined; // engine code version (image tag or commit), recorded on every run
   slackWebhookUrl: string | undefined;
   mcp: {
     usersFile: string; // hashed tokens, one per person (gitignored)
@@ -64,6 +66,7 @@ export interface Config {
     userDailyCapUsd: number; // per person, across agents
     userMaxRunning: number; // per person, at once
     notifySlack: boolean; // @-mention the requester in Slack when a run ends
+    allowedOrigins: string[]; // browser origins allowed to call the endpoint; MCP clients send none
   };
 }
 
@@ -114,7 +117,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
       monthlyCapUsd: num(env.ENGINE_MONTHLY_CAP_USD, 300, 'ENGINE_MONTHLY_CAP_USD'),
     },
     agentsDir: r(env.ENGINE_AGENTS_DIR ?? 'agents'),
+    memoryDir: env.ENGINE_MEMORY_DIR ? r(env.ENGINE_MEMORY_DIR) : undefined,
     runsDir: r(env.ENGINE_RUNS_DIR ?? 'runs'),
+    build: opt(env.ENGINE_BUILD),
     slackWebhookUrl: opt(env.SLACK_WEBHOOK_URL),
     mcp: {
       usersFile: r(env.ENGINE_USERS_FILE ?? 'config/users.local.json'),
@@ -122,6 +127,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
       userDailyCapUsd: num(env.ENGINE_USER_DAILY_CAP_USD, 10, 'ENGINE_USER_DAILY_CAP_USD'),
       userMaxRunning: num(env.ENGINE_USER_MAX_RUNNING, 2, 'ENGINE_USER_MAX_RUNNING'),
       notifySlack: env.ENGINE_NOTIFY_SLACK === '1',
+      allowedOrigins: (env.ENGINE_ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
     },
   };
 }

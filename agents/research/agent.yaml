@@ -1,5 +1,6 @@
 name: research
 description: Web research on a question; answers with cited findings. No local files, no credentials.
+visibility: everyone # public web sources; any developer may read them
 model: claude-sonnet-5-5
 concurrency: 3 # several people may ask at once
 builtin_tools: [WebSearch, WebFetch]

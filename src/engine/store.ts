@@ -23,6 +23,7 @@ export interface RunRow {
   ended_at: string | null;
   requested_by: string | null;
   heartbeat_at: string | null;
+  build: string | null; // engine code version
 }
 
 export interface Admission {
@@ -40,6 +41,7 @@ export interface Admission {
   user?: string; // who asked (MCP); scheduled runs have none
   userCap?: number; // that person's daily spend, across agents
   userMaxRunning?: number; // that person's runs at once
+  build?: string; // engine code version
 }
 
 // How long past its deadline a "running" row may sit before it is reaped as
@@ -79,6 +81,7 @@ export class Store {
     const cols = new Set((this.db.prepare(`PRAGMA table_info(runs)`).all() as Array<{ name: string }>).map((c) => c.name));
     if (!cols.has('requested_by')) this.db.exec(`ALTER TABLE runs ADD COLUMN requested_by TEXT`);
     if (!cols.has('heartbeat_at')) this.db.exec(`ALTER TABLE runs ADD COLUMN heartbeat_at TEXT`);
+    if (!cols.has('build')) this.db.exec(`ALTER TABLE runs ADD COLUMN build TEXT`);
   }
 
   private tx<T>(fn: () => T): T {
@@ -135,8 +138,8 @@ export class Store {
       if (this.spentIn(day) + a.reserve > a.globalCap) return { ok: false as const, reason: `global daily cap $${a.globalCap} reached` };
       if (a.monthlyCap !== undefined && this.spentIn(day.slice(0, 7)) + a.reserve > a.monthlyCap) return { ok: false as const, reason: `monthly cap $${a.monthlyCap} reached` };
       this.db
-        .prepare(`INSERT INTO runs (id, agent, version, trigger, day, started_at, deadline_at, pid, reserve, status, requested_by, heartbeat_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)`)
-        .run(a.id, a.agent, a.version, a.trigger, day, a.now.toISOString(), new Date(a.now.getTime() + a.deadlineMs).toISOString(), process.pid, a.reserve, a.user ?? null, a.now.toISOString());
+        .prepare(`INSERT INTO runs (id, agent, version, trigger, day, started_at, deadline_at, pid, reserve, status, requested_by, heartbeat_at, build) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)`)
+        .run(a.id, a.agent, a.version, a.trigger, day, a.now.toISOString(), new Date(a.now.getTime() + a.deadlineMs).toISOString(), process.pid, a.reserve, a.user ?? null, a.now.toISOString(), a.build ?? null);
       return { ok: true as const };
     });
   }
@@ -160,11 +163,19 @@ export class Store {
     return this.spentIn(day, agent, user);
   }
 
-  recent(limit = 30, agentOrFilter?: string | { agent?: string; user?: string }): RunRow[] {
+  // visibleTo: only runs that person asked for, or runs of the given agents.
+  recent(limit = 30, agentOrFilter?: string | { agent?: string; user?: string; visibleTo?: { user: string; agents: string[] } }): RunRow[] {
     const f = typeof agentOrFilter === 'string' ? { agent: agentOrFilter } : (agentOrFilter ?? {});
-    const where = [...(f.agent ? ['agent = ?'] : []), ...(f.user ? ['requested_by = ?'] : [])];
+    const where: string[] = [];
+    const args: string[] = [];
+    if (f.agent) where.push('agent = ?'), args.push(f.agent);
+    if (f.user) where.push('requested_by = ?'), args.push(f.user);
+    if (f.visibleTo) {
+      where.push(`(requested_by = ?${f.visibleTo.agents.length ? ` OR agent IN (${f.visibleTo.agents.map(() => '?').join(', ')})` : ''})`);
+      args.push(f.visibleTo.user, ...f.visibleTo.agents);
+    }
     const sql = `SELECT * FROM runs${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY started_at DESC LIMIT ?`;
-    return this.db.prepare(sql).all(...(f.agent ? [f.agent] : []), ...(f.user ? [f.user] : []), limit) as unknown as RunRow[];
+    return this.db.prepare(sql).all(...args, limit) as unknown as RunRow[];
   }
 
   get(id: string): RunRow | undefined {

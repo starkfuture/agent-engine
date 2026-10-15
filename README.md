@@ -174,6 +174,10 @@ Tools: `list_agents`, `list_repos`, `run_agent` (background; `wait_seconds` ≤ 
 for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 `proposed_lessons`; admins add `approve_lesson`, `stop_all`, `resume`.
 
+- Who can read a run: the requester and admins, unless the agent has `visibility: everyone` in agent.yaml (monitor, research and codebase do). Someone else's private run answers like a missing one. Agents that read customer data keep the default.
+- Requests with a browser `Origin` header are refused unless listed in `ENGINE_ALLOWED_ORIGINS`.
+- The task is redacted before the model sees it. Answers keep links (research cites sources) but lose images, which load by themselves.
+- Every run records the engine build (`ENGINE_BUILD`, else the git commit). With `ENGINE_MEMORY_DIR`, lessons approved over MCP and runs' proposals live there (a persistent volume), next to the git-curated `agents/<name>/memory/lessons.md`.
 - Runs are recorded with who asked. Per person: `ENGINE_USER_DAILY_CAP_USD` (default 10)
   and `ENGINE_USER_MAX_RUNNING` (default 2); per agent: `concurrency` in agent.yaml.
 - `ENGINE_NOTIFY_SLACK=1` with `SLACK_WEBHOOK_URL` @-mentions the requester when a run ends. Model text in Slack is escaped, so it can't ping (`<!channel>`) or hide links.

@@ -10,6 +10,7 @@ import { writeAnswer } from '../engine/answer.js';
 import { findingsOutput, type Findings } from '../engine/output.js';
 import { runAgent, type Engine, type Root, type RunResult } from '../engine/run.js';
 import { cleanModelText, redact, safeJson, slackEscape, truncate } from '../engine/text.js';
+import type { RunRow } from '../engine/store.js';
 import type { User, Users } from './users.js';
 
 // The engine over MCP, for several developers. One process holds the engine:
@@ -52,7 +53,14 @@ const today = () => new Date().toISOString().slice(0, 10);
 function agentByName(ctx: McpContext, name: string): LoadedAgent | undefined {
   if (!/^[a-z][a-z0-9-]*$/.test(name)) return undefined;
   const dir = join(ctx.cfg.agentsDir, name);
-  return existsSync(join(dir, 'agent.yaml')) ? loadAgent(dir) : undefined;
+  return existsSync(join(dir, 'agent.yaml')) ? loadAgent(dir, ctx.cfg.memoryDir) : undefined;
+}
+
+// Agents whose runs every user may read (visibility: everyone). The rest are
+// readable by the requester and admins only. An agent that can't be loaded
+// counts as private.
+function sharedAgents(ctx: McpContext): Set<string> {
+  return new Set(listAgents(ctx.cfg.agentsDir, ctx.cfg.memoryDir).filter((a) => a.spec.visibility === 'everyone').map((a) => a.spec.name));
 }
 
 function summary(r: RunResult<Findings>): string {
@@ -72,13 +80,15 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
   const s = new McpServer({ name: 'agent-engine', version: '0.3.0' });
   const admin = user.role === 'admin';
   const runs = active(ctx);
+  // Someone else's private run answers like a missing one: its id reveals nothing.
+  const readable = (row: RunRow | undefined): row is RunRow => !!row && (admin || row.requested_by === user.name || sharedAgents(ctx).has(row.agent));
 
   s.registerTool(
     'list_agents',
     { description: 'Agents you can give tasks to, with their tools, limits and whether they need a repo.', inputSchema: {}, annotations: { readOnlyHint: true } },
     async () =>
       text(
-        listAgents(ctx.cfg.agentsDir)
+        listAgents(ctx.cfg.agentsDir, ctx.cfg.memoryDir)
           .map((a) => {
             const l = a.spec.limits;
             const needsRepo = a.spec.builtin_tools.some((t) => (FILE_TOOLS as readonly string[]).includes(t));
@@ -180,7 +190,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
     async ({ run_id }) => {
       if (!RUN_ID.test(run_id)) return err('not a run id');
       const row = ctx.engine.store.get(run_id);
-      if (!row) return err(`no run ${run_id}`);
+      if (!readable(row)) return err(`no run ${run_id}`);
       const dir = runFolder(ctx, row.agent, row.id);
       const answer = existsSync(join(dir, 'answer.md')) ? readFileSync(join(dir, 'answer.md'), 'utf8') : '';
       let challenge = '';
@@ -190,7 +200,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       }
       const head = [
         `run ${row.id} · ${row.agent}@${row.version} · ${row.status}${row.status === 'running' ? ` (deadline ${row.deadline_at})` : ''}`,
-        `asked by ${row.requested_by ?? row.trigger} at ${row.started_at} · cost $${(row.cost ?? row.reserve).toFixed(3)}${row.status === 'running' ? ' reserved' : ''} · ${row.turns ?? 0} turns`,
+        `asked by ${row.requested_by ?? row.trigger} at ${row.started_at} · engine ${row.build ?? 'unknown'} · cost $${(row.cost ?? row.reserve).toFixed(3)}${row.status === 'running' ? ' reserved' : ''} · ${row.turns ?? 0} turns`,
         ...(row.note ? [`note: ${redact(row.note)}`] : []),
       ].join('\n');
       return text(`${head}\n\n${answer || (row.status === 'running' ? '(still running)' : '(no answer)')}${challenge}`);
@@ -203,7 +213,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
     async ({ run_id, evidence_id }) => {
       if (!RUN_ID.test(run_id) || !EV_ID.test(evidence_id)) return err('bad id');
       const row = ctx.engine.store.get(run_id);
-      if (!row) return err(`no run ${run_id}`);
+      if (!readable(row)) return err(`no run ${run_id}`);
       const file = join(runFolder(ctx, row.agent, row.id), 'evidence.jsonl');
       if (!existsSync(file)) return err('no evidence recorded for this run');
       for (const line of readFileSync(file, 'utf8').split('\n')) {
@@ -218,12 +228,16 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
   s.registerTool(
     'list_runs',
     {
-      description: 'Recent runs, newest first.',
+      description: 'Recent runs you can read, newest first.',
       inputSchema: { limit: z.number().int().min(1).max(100).optional(), agent: z.string().optional(), mine: z.boolean().optional() },
       annotations: { readOnlyHint: true },
     },
     async ({ limit, agent, mine }) => {
-      const rows = ctx.engine.store.recent(limit ?? 20, { ...(agent ? { agent } : {}), ...(mine ? { user: user.name } : {}) });
+      const rows = ctx.engine.store.recent(limit ?? 20, {
+        ...(agent ? { agent } : {}),
+        ...(mine ? { user: user.name } : {}),
+        ...(admin ? {} : { visibleTo: { user: user.name, agents: [...sharedAgents(ctx)] } }),
+      });
       return text(
         rows
           .map(
@@ -254,7 +268,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
     async () => {
       const st = ctx.engine.store;
       const d = today();
-      const agents = listAgents(ctx.cfg.agentsDir).map((a) => `  ${a.spec.name.padEnd(9)} $${st.spent(d, a.spec.name).toFixed(2)} of $${a.spec.limits.usd_per_day}`);
+      const agents = listAgents(ctx.cfg.agentsDir, ctx.cfg.memoryDir).map((a) => `  ${a.spec.name.padEnd(9)} $${st.spent(d, a.spec.name).toFixed(2)} of $${a.spec.limits.usd_per_day}`);
       return text(
         [
           `today: $${st.spent(d).toFixed(2)} of $${ctx.engine.dailyCapUsd} · this month: $${st.spent(d.slice(0, 7)).toFixed(2)} of $${ctx.engine.monthlyCapUsd ?? '∞'}`,
@@ -275,7 +289,8 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
     async ({ agent }) => {
       const a = agentByName(ctx, agent);
       if (!a) return err(`no agent "${agent}"`);
-      const f = join(a.dir, 'memory', 'proposed.md');
+      if (a.spec.visibility !== 'everyone' && !admin) return err(`${agent}'s proposals come from private runs; admins only`);
+      const f = join(a.memory, 'proposed.md');
       return text(existsSync(f) ? readFileSync(f, 'utf8') : 'none');
     },
   );
@@ -288,9 +303,9 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
         const a = agentByName(ctx, agent);
         if (!a) return err(`no agent "${agent}"`);
         const line = redact(lesson.replace(/\s+/g, ' ').trim());
-        mkdirSync(join(a.dir, 'memory'), { recursive: true });
-        appendFileSync(join(a.dir, 'memory', 'lessons.md'), `- ${line} (approved by ${user.name}, ${today()})\n`);
-        return text(`added to ${agent}/memory/lessons.md; the next run uses it`);
+        mkdirSync(a.memory, { recursive: true });
+        appendFileSync(join(a.memory, 'lessons.md'), `- ${line} (approved by ${user.name}, ${today()})\n`);
+        return text(`added to ${agent}'s lessons; the next run uses it`);
       },
     );
     s.registerTool(
@@ -362,6 +377,10 @@ export function startHttp(ctx: McpContext, opts: { host: string; port: number })
       const url = new URL(req.url ?? '/', 'http://x');
       if (url.pathname === '/healthz') return void res.writeHead(200).end('ok');
       if (url.pathname !== '/mcp') return send(404, 'not found');
+      // Browsers send Origin; MCP clients don't. A page in a developer's
+      // browser must not drive the endpoint (MCP spec: validate Origin).
+      const origin = req.headers.origin;
+      if (origin && !(ctx.cfg.mcp.allowedOrigins ?? []).includes(origin)) return send(403, 'origin not allowed');
       if (local && !LOOPBACK.has((req.headers.host ?? '').replace(/:\d+$/, '').replace(/^\[|\]$/g, ''))) return send(403, 'bad host');
       const auth = req.headers.authorization ?? '';
       const user = ctx.users.authenticate(auth.startsWith('Bearer ') ? auth.slice(7).trim() : undefined);

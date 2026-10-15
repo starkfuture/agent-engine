@@ -66,17 +66,22 @@ export function redactDeep(v: unknown, depth = 0): unknown {
   return v;
 }
 
-// Model-written text that a human will view (Slack, markdown). Images load by
-// themselves, so any image syntax goes. Links to hosts we don't know are
-// defanged so a click can't carry data out (EchoLeak/CamoLeak-style).
-const LINK_HOSTS = [/(^|\.)starkfuture\.com$/i, /^github\.com$/i];
-export function cleanModelText(s: string, hosts: RegExp[] = LINK_HOSTS): string {
+// Images load by themselves when markdown is rendered, so a URL in one can
+// carry data out with no click. Any image syntax goes.
+export function stripImages(s: string): string {
   return s
     .replace(/!\[[^\]]*\]\([^)]*\)/g, '[image removed]')
     .replace(/!\[[^\]]*\]\[[^\]]*\]/g, '[image removed]')
     .replace(/^\s*\[[^\]]+\]:\s*\S+.*$/gm, '')
-    .replace(/<img\b[^>]*>/gi, '[image removed]')
-    .replace(/\bhttps?:\/\/([^/\s|>)"'\]]+)[^\s|>)"'\]]*/gi, (url, host: string) => (hosts.some((h) => h.test(host.replace(/:\d+$/, ''))) ? url : `hxxp://${host}/[link removed]`));
+    .replace(/<img\b[^>]*>/gi, '[image removed]');
+}
+
+// Model-written text that people see without asking for it (Slack, cards):
+// no images, and links to hosts we don't know are defanged so a click can't
+// carry data out (EchoLeak/CamoLeak-style).
+const LINK_HOSTS = [/(^|\.)starkfuture\.com$/i, /^github\.com$/i];
+export function cleanModelText(s: string, hosts: RegExp[] = LINK_HOSTS): string {
+  return stripImages(s).replace(/\bhttps?:\/\/([^/\s|>)"'\]]+)[^\s|>)"'\]]*/gi, (url, host: string) => (hosts.some((h) => h.test(host.replace(/:\d+$/, ''))) ? url : `hxxp://${host}/[link removed]`));
 }
 
 // Text that goes into a Slack message. Slack reads <!channel>, <!here>, <@U…>
