@@ -8,8 +8,8 @@ import type { Config } from '../config.js';
 import { FILE_TOOLS, listAgents, loadAgent, type LoadedAgent } from '../engine/agent.js';
 import { writeAnswer } from '../engine/answer.js';
 import { findingsOutput, type Findings } from '../engine/output.js';
-import { runAgent, type Engine, type RunResult } from '../engine/run.js';
-import { cleanModelText, redact, safeJson, truncate } from '../engine/text.js';
+import { runAgent, type Engine, type Root, type RunResult } from '../engine/run.js';
+import { cleanModelText, redact, safeJson, slackEscape, truncate } from '../engine/text.js';
 import type { User, Users } from './users.js';
 
 // The engine over MCP, for several developers. One process holds the engine:
@@ -21,7 +21,7 @@ export interface McpContext {
   cfg: Config;
   engine: Engine;
   users: Users;
-  repos: Map<string, string>;
+  repos: Map<string, Root>;
   notify?: (text: string) => Promise<void>; // Slack; absent = no notifications
   log?: (s: string) => void;
 }
@@ -94,8 +94,8 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
 
   s.registerTool(
     'list_repos',
-    { description: 'Repos the codebase agent can read on the engine host (pass one as `repo` to run_agent).', inputSchema: {}, annotations: { readOnlyHint: true } },
-    async () => text([...ctx.repos.keys()].join('\n') || 'no repos configured on this host'),
+    { description: 'Repos the codebase agent can read on the engine host (pass one as `repo` to run_agent), with the ref each is read at.', inputSchema: {}, annotations: { readOnlyHint: true } },
+    async () => text([...ctx.repos].map(([n, r]) => `${n} (at ${r.ref ?? 'origin/HEAD, else HEAD'})`).join('\n') || 'no repos configured on this host'),
   );
 
   s.registerTool(
@@ -116,11 +116,11 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       if (!agent) return err(`no agent "${name}"; see list_agents`);
       if (agent.spec.code) return err(`${name} runs on its schedule and can't be started here; read its runs with list_runs`);
       const needsRepo = agent.spec.builtin_tools.some((t) => (FILE_TOOLS as readonly string[]).includes(t));
-      let roots: string[] | undefined;
+      let roots: Root[] | undefined;
       if (needsRepo) {
-        const path = repo ? ctx.repos.get(repo) : undefined;
-        if (!path) return err(`${name} needs repo: one of ${[...ctx.repos.keys()].join(', ') || '(none configured)'}`);
-        roots = [path];
+        const root = repo ? ctx.repos.get(repo) : undefined;
+        if (!root) return err(`${name} needs repo: one of ${[...ctx.repos.keys()].join(', ') || '(none configured)'}`);
+        roots = [root];
       } else if (repo) return err(`${name} doesn't read code; drop repo`);
 
       const controller = new AbortController();
@@ -148,9 +148,10 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
             runs.delete(admittedId);
             ctx.log?.(`${admittedId} ${f.result?.status ?? 'error'} for ${user.name}`);
             if (ctx.notify && f.result)
+              // Model text is escaped: <!channel>, <@U…> or <url|label> in a title must not act in Slack.
               await ctx
                 .notify(
-                  `${user.slack_id ? `<@${user.slack_id}> ` : ''}${name} run ${f.result.status}${f.result.challenge ? ` · challenge ${f.result.challenge.verdict}` : ''} · $${f.result.cost.toFixed(2)}${f.result.outputs[0] ? ` · ${truncate(cleanModelText(redact(f.result.outputs[0].title)), 150)}` : ''}\nget_run ${admittedId}`,
+                  `${user.slack_id ? `<@${user.slack_id}> ` : ''}${name} run ${f.result.status}${f.result.challenge ? ` · challenge ${f.result.challenge.verdict}` : ''} · $${f.result.cost.toFixed(2)}${f.result.outputs[0] ? ` · ${slackEscape(truncate(cleanModelText(redact(f.result.outputs[0].title)), 150))}` : ''}\nget_run ${admittedId}`,
                 )
                 .catch((e: Error) => ctx.log?.(`notify failed: ${e.message}`));
           }
@@ -308,6 +309,16 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
     });
   }
   return s;
+}
+
+// Shutdown (SIGTERM on a redeploy): stop every run this server started and
+// wait until each is settled and its requester notified, so no "running" row
+// is left behind.
+export async function shutdown(ctx: McpContext, reason: string, waitMs: number): Promise<number> {
+  const runs = [...active(ctx).values()];
+  for (const r of runs) r.controller.abort(reason);
+  await Promise.race([Promise.all(runs.map((r) => r.done)), sleep(waitMs)]);
+  return runs.length;
 }
 
 // Slack incoming webhook. Text only, no link unfurls.

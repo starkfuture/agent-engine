@@ -1,7 +1,7 @@
 import type { ChallengeResult } from '../engine/challenge.js';
 import type { Report } from '../investigate/report.js';
 import { rowLine, type Summary } from '../patrol/summary.js';
-import { cleanModelText, redact } from '../engine/text.js';
+import { cleanModelText, redact, slackEscape as esc } from '../engine/text.js';
 
 const SEV = { critical: '🔴', major: '🟠', minor: '🟡', noise: '⚪' } as const;
 const clip = (s: string, n = 2900) => (s.length > n ? `${s.slice(0, n - 1)}…` : s); // Slack section text limit is 3000
@@ -59,12 +59,13 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     `_Rows: ${r.rows.join(', ')} · patrol ${patrolAt} · ${footer}_`,
   ].join('\n');
 
-  const section = (label: string, body: string) => ({ type: 'section', text: { type: 'mrkdwn', text: clip(`*${label}*\n${body}`) } });
+  // mrkdwn: model and production text is escaped so <!channel>, <@U…> or <url|label> can't act.
+  const section = (label: string, body: string) => ({ type: 'section', text: { type: 'mrkdwn', text: clip(`*${label}*\n${esc(body)}`) } });
   const blocks = [
     { type: 'header', text: { type: 'plain_text', text: clip(`${SEV[r.severity]} ${r.title}`, 150) } },
     {
       type: 'context',
-      elements: [{ type: 'mrkdwn', text: `*${r.status}* · since ${r.started_at} · severity ${r.severity} (advisory) · confidence ${r.cause.confidence}` }],
+      elements: [{ type: 'mrkdwn', text: `*${r.status}* · ${esc(`since ${r.started_at} · severity ${r.severity} (advisory) · confidence ${r.cause.confidence}`)}` }],
     },
     section('What broke', r.what_broke),
     section('Impact', r.impact),
@@ -73,9 +74,9 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     section('Evidence', r.evidence.map((e) => `• ${e.id}: ${e.claim}`).join('\n')),
     ...(r.not_checked.length ? [section('Not checked', r.not_checked.map((x) => `• ${x}`).join('\n'))] : []),
     ...(ch.length ? [section('Challenge', ch.join('\n'))] : []),
-    { type: 'context', elements: [{ type: 'mrkdwn', text: clip(`patrol ${patrolAt} · ${footer}`, 300) }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(`patrol ${patrolAt} · ${footer}`), 300) }] },
   ];
-  return { text: `${SEV[r.severity]} ${r.title}`, blocks, markdown: md };
+  return { text: esc(`${SEV[r.severity]} ${r.title}`), blocks, markdown: md };
 }
 
 // Without the LLM (no credentials, budget cap hit, or the investigator failed),
@@ -87,10 +88,10 @@ export function patrolCard(s: Summary, why: string): Card {
   const body = `${lines.join('\n')}${more}${down.length ? `\n\nBlind spots: ${down.join(', ')}` : ''}`;
   const title = `Patrol ${s.at}: ${s.send.length} new or worse signal(s), not investigated (${why})`;
   return {
-    text: title,
+    text: esc(title),
     blocks: [
-      { type: 'section', text: { type: 'mrkdwn', text: clip(`*${title}*`) } },
-      { type: 'section', text: { type: 'mrkdwn', text: clip(redact(body)) } },
+      { type: 'section', text: { type: 'mrkdwn', text: clip(`*${esc(title)}*`) } },
+      { type: 'section', text: { type: 'mrkdwn', text: clip(esc(redact(body))) } },
     ],
     markdown: redact(`## ${title}\n\n${body}`),
   };

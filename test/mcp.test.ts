@@ -47,6 +47,7 @@ function gitRepo(): string {
   writeFileSync(join(root, 'a.ts'), 'export const mode = "WAL";');
   execFileSync('git', ['init', '-q', '--template=', root]);
   execFileSync('git', ['-C', root, 'add', '-A']);
+  execFileSync('git', ['-C', root, '-c', 'user.name=t', '-c', 'user.email=t@t.test', 'commit', '-q', '--no-verify', '-m', 'c']);
   return root;
 }
 
@@ -56,7 +57,7 @@ function context(session: Session, over: { userCap?: number; notify?: (t: string
   const users = Users.load(join(tmp('users-'), 'users.json'));
   const tokens = { ana: users.add('ana', { slackId: 'U0ANA12345' }), bo: users.add('bo'), root: users.add('root', { admin: true }) };
   const cfg = { agentsDir: agentsDir(), runsDir, mcp: { usersFile: users.file, reposFile: '', userDailyCapUsd: over.userCap ?? 10, userMaxRunning: 2, notifySlack: false } } as unknown as Config;
-  const ctx: McpContext = { cfg, engine, users, repos: new Map([['app', gitRepo()]]), ...(over.notify ? { notify: over.notify } : {}) };
+  const ctx: McpContext = { cfg, engine, users, repos: new Map([['app', { path: gitRepo() }]]), ...(over.notify ? { notify: over.notify } : {}) };
   const who = (name: string) => users.list().find((u) => u.name === name)!;
   return { ctx, tokens, who };
 }
@@ -184,11 +185,11 @@ test('per-person caps: daily spend and runs at once', async () => {
   assert.equal(ctx.engine.store.recent(10).filter((r) => r.status === 'running').length, 0);
 });
 
-test('the requester is mentioned in Slack when the run ends, with a cleaned title', async () => {
+test('the requester is mentioned in Slack when the run ends, with a cleaned, escaped title', async () => {
   const sent: string[] = [];
   const s = fakeSession(async function* (sim) {
     const page = await sim.builtin('WebFetch', { url: 'https://x.test' }, fetchResponse('https://x.test', 'Feature X is configured in eu-west-1.'));
-    await sim.mcp('submit_findings', answer(lastId(page), 'configured in eu-west-1', 'Done ![x](https://evil.test/?q=1) token=hunter2'));
+    await sim.mcp('submit_findings', answer(lastId(page), 'configured in eu-west-1', 'Done <!channel> <@U0EVIL1234> ![x](https://evil.test/?q=1) token=hunter2'));
     yield ok();
   });
   const { ctx, who } = context(s, { notify: async (t) => void sent.push(t) });
@@ -197,6 +198,8 @@ test('the requester is mentioned in Slack when the run ends, with a cleaned titl
   assert.match(sent[0]!, /^<@U0ANA12345> research run ok/);
   assert.match(sent[0]!, /get_run \d{8}T/);
   assert.ok(!sent[0]!.includes('hunter2') && !sent[0]!.includes('evil.test/?q'), sent[0]);
+  assert.ok(!sent[0]!.includes('<!channel>') && !sent[0]!.includes('<@U0EVIL1234>'), 'model text cannot ping in Slack');
+  assert.match(sent[0]!, /&lt;!channel&gt;/);
 });
 
 test('tokens: only hashes are stored, file is private, removal revokes', () => {

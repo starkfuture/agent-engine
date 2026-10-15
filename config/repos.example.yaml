@@ -1,9 +1,11 @@
 # Repos the codebase agent may read on the engine host. Copy to repos.local.yaml
 # (gitignored) and point at clones on this machine. Callers pick a name; they
-# never pass a path. The agent reads a snapshot of git-tracked files, minus
-# secret files.
+# never pass a path. The agent reads a snapshot of one commit, minus secret
+# files: `ref` if given, else origin/HEAD (the remote's default branch), else
+# HEAD. Uncommitted edits are never read. Keep clones fetched for fresh answers.
 repos:
   sre-agent: ~/Desktop/work/sre-agent
+  # backend-nest: { path: ~/Desktop/work/backend-nest, ref: origin/main }
   backend-nest: ~/Desktop/work/backend-nest
   frontend-next: ~/Desktop/work/frontend-next
   admin-next: ~/Desktop/work/admin-next

@@ -22,6 +22,7 @@ export interface RunRow {
   note: string | null;
   ended_at: string | null;
   requested_by: string | null;
+  heartbeat_at: string | null;
 }
 
 export interface Admission {
@@ -44,6 +45,9 @@ export interface Admission {
 // How long past its deadline a "running" row may sit before it is reaped as
 // crashed, even if its pid is (or was reused as) a live process.
 const GRACE_MS = 5 * 60_000;
+// A running run beats every 30 s. One silent this long is dead even if its pid
+// is alive: in a container a restarted server is pid 1 again.
+const STALE_MS = 2 * 60_000;
 
 // Run admission, single flight and spend live in one SQLite file. Admission is
 // one IMMEDIATE transaction: reap dead runs, refuse a second run of the same
@@ -74,6 +78,7 @@ export class Store {
   private migrate(): void {
     const cols = new Set((this.db.prepare(`PRAGMA table_info(runs)`).all() as Array<{ name: string }>).map((c) => c.name));
     if (!cols.has('requested_by')) this.db.exec(`ALTER TABLE runs ADD COLUMN requested_by TEXT`);
+    if (!cols.has('heartbeat_at')) this.db.exec(`ALTER TABLE runs ADD COLUMN heartbeat_at TEXT`);
   }
 
   private tx<T>(fn: () => T): T {
@@ -88,15 +93,22 @@ export class Store {
     }
   }
 
-  // Running rows whose process is gone, or that are far past their deadline,
-  // are settled as crashed at their full reservation.
+  // Running rows whose process is gone, that stopped beating, or that are far
+  // past their deadline, are settled as crashed at their full reservation.
   private reap(now: Date): void {
-    const rows = this.db.prepare(`SELECT id, pid, deadline_at FROM runs WHERE status = 'running'`).all() as Array<{ id: string; pid: number; deadline_at: string }>;
+    const rows = this.db.prepare(`SELECT id, pid, deadline_at, started_at, heartbeat_at FROM runs WHERE status = 'running'`).all() as Array<{ id: string; pid: number; deadline_at: string; started_at: string; heartbeat_at: string | null }>;
     const crash = this.db.prepare(`UPDATE runs SET status = 'crashed', cost = reserve, ended_at = ?, note = ? WHERE id = ? AND status = 'running'`);
     for (const r of rows) {
       const late = now.getTime() > Date.parse(r.deadline_at) + GRACE_MS;
-      if (late || !alive(r.pid)) crash.run(now.toISOString(), late ? 'past deadline, never settled' : `process ${r.pid} gone`, r.id);
+      const silent = now.getTime() > Date.parse(r.heartbeat_at ?? r.started_at) + STALE_MS;
+      const why = late ? 'past deadline, never settled' : !alive(r.pid) ? `process ${r.pid} gone` : silent ? 'no heartbeat for 2 min (process restarted or hung)' : undefined;
+      if (why) crash.run(now.toISOString(), why, r.id);
     }
+  }
+
+  // Called every 30 s by a running run.
+  beat(id: string, now: Date): void {
+    this.db.prepare(`UPDATE runs SET heartbeat_at = ? WHERE id = ? AND status = 'running'`).run(now.toISOString(), id);
   }
 
   // `day` is a UTC day (2026-10-14) or a month prefix (2026-10).
@@ -123,8 +135,8 @@ export class Store {
       if (this.spentIn(day) + a.reserve > a.globalCap) return { ok: false as const, reason: `global daily cap $${a.globalCap} reached` };
       if (a.monthlyCap !== undefined && this.spentIn(day.slice(0, 7)) + a.reserve > a.monthlyCap) return { ok: false as const, reason: `monthly cap $${a.monthlyCap} reached` };
       this.db
-        .prepare(`INSERT INTO runs (id, agent, version, trigger, day, started_at, deadline_at, pid, reserve, status, requested_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)`)
-        .run(a.id, a.agent, a.version, a.trigger, day, a.now.toISOString(), new Date(a.now.getTime() + a.deadlineMs).toISOString(), process.pid, a.reserve, a.user ?? null);
+        .prepare(`INSERT INTO runs (id, agent, version, trigger, day, started_at, deadline_at, pid, reserve, status, requested_by, heartbeat_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)`)
+        .run(a.id, a.agent, a.version, a.trigger, day, a.now.toISOString(), new Date(a.now.getTime() + a.deadlineMs).toISOString(), process.pid, a.reserve, a.user ?? null, a.now.toISOString());
       return { ok: true as const };
     });
   }

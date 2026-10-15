@@ -79,6 +79,10 @@ export function cleanModelText(s: string, hosts: RegExp[] = LINK_HOSTS): string 
     .replace(/\bhttps?:\/\/([^/\s|>)"'\]]+)[^\s|>)"'\]]*/gi, (url, host: string) => (hosts.some((h) => h.test(host.replace(/:\d+$/, ''))) ? url : `hxxp://${host}/[link removed]`));
 }
 
+// Text that goes into a Slack message. Slack reads <!channel>, <!here>, <@U…>
+// and <url|label> as controls; escaped, they show as plain text.
+export const slackEscape = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 // The one way to serialise anything that leaves the process.
 export const safeJson = (v: unknown, indent?: number): string => JSON.stringify(redactDeep(v), null, indent);
 

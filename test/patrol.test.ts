@@ -218,6 +218,15 @@ test('card survives quotes in model text, and strips images and unknown links', 
   assert.ok(all.includes('https://monitoring.starkfuture.com/d/abc'));
 });
 
+test('card escapes Slack controls in model and production text', () => {
+  const c = reportCard(report({ title: 'Down <!here>', what_broke: 'log says <!channel> see <https://evil.test|grafana>' }), '2026-09-29T12:15:00Z', 'test');
+  // mrkdwn and the notification text parse controls; plain_text (the header) does not.
+  const mrkdwn = JSON.stringify(c.blocks).match(/"type":"mrkdwn","text":"(?:[^"\\]|\\.)*"/g) ?? [];
+  const slack = c.text + mrkdwn.join('');
+  assert.ok(!/<!here>|<!channel>|<https?:/.test(slack), slack);
+  assert.match(slack, /&lt;!channel&gt;/);
+});
+
 test('card redacts what the model wrote', () => {
   const c = reportCard(report({ what_broke: 'reset for jane@example.com returns 400' }), '2026-09-29T12:15:00Z', 'test');
   assert.ok(!c.markdown.includes('jane@example.com'));

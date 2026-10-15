@@ -14,11 +14,11 @@ import { Store } from './engine/store.js';
 import { redact } from './engine/text.js';
 import { findingsOutput } from './engine/output.js';
 import { writeAnswer } from './engine/answer.js';
-import { runAgent, type Engine } from './engine/run.js';
+import { runAgent, stopAllRuns, type Engine } from './engine/run.js';
 import { sdkSession } from './engine/session.js';
 import { patrolOnce, type MonitorAgent } from './runner.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { buildServer, slackNotifier, startHttp, type McpContext } from './mcp/server.js';
+import { buildServer, shutdown, slackNotifier, startHttp, type McpContext } from './mcp/server.js';
 import { loadRepos } from './mcp/repos.js';
 import { Users } from './mcp/users.js';
 
@@ -28,6 +28,7 @@ Agents (folders in agents/):
   agents                      list agents with version, model, tools and limits
   run <agent> --task "<text>" one run of a task agent (research, codebase)
       --path <dir>            folder the codebase agent may read (required for it)
+      --ref <ref>             commit it reads (default origin/HEAD, else HEAD; never uncommitted edits)
       --challenge             have a challenger check the answer
   run monitor                 one patrol with the investigator (same as: patrol --llm)
   runs [--agent <name>]       recent runs with status, cost and challenge verdict
@@ -68,6 +69,7 @@ const { positionals, values: a } = parseArgs({
     replay: { type: 'string' },
     task: { type: 'string' },
     path: { type: 'string' },
+    ref: { type: 'string' },
     agent: { type: 'string' },
     host: { type: 'string' },
     port: { type: 'string' },
@@ -84,6 +86,22 @@ const { positionals, values: a } = parseArgs({
 });
 
 const log = (s: string) => console.error(`[${new Date().toISOString().slice(11, 19)}] ${s}`);
+
+// SIGTERM (a redeploy) or Ctrl-C: stop running runs and wait until they are
+// settled before exiting, so no "running" row is left holding slots and
+// reservations. A second signal exits at once.
+let draining = false;
+let beforeExit: (() => Promise<unknown>) | undefined;
+for (const sig of ['SIGTERM', 'SIGINT'] as const)
+  process.on(sig, () => {
+    const code = sig === 'SIGINT' ? 130 : 143;
+    if (draining) process.exit(code);
+    draining = true;
+    log(`${sig}: stopping running runs`);
+    void Promise.all([beforeExit?.(), stopAllRuns(`${sig}: engine shutting down`, 20_000)])
+      .catch((e: Error) => log(`shutdown: ${e.message}`))
+      .finally(() => process.exit(code));
+  });
 
 function liveTelemetry(cfg: Config): GrafanaTelemetry {
   return new GrafanaTelemetry({ url: cfg.grafanaUrl, token: readToken(cfg.grafanaTokenFile), promUid: cfg.promUid, lokiUid: cfg.lokiUid, tempoUid: cfg.tempoUid });
@@ -215,7 +233,7 @@ async function main() {
       if (!a.task) throw new Error('--task is required');
       const needsPath = agent.spec.builtin_tools.some((t) => t === 'Read' || t === 'Grep' || t === 'Glob');
       if (needsPath && !a.path) throw new Error(`${name} reads local files: --path <dir> is required`);
-      const roots = needsPath ? [resolve(a.path!)] : undefined;
+      const roots = needsPath ? [{ path: resolve(a.path!), ...(a.ref ? { ref: a.ref } : {}) }] : undefined;
       const r = await runAgent(makeEngine(cfg), {
         agent,
         trigger: 'manual',
@@ -285,13 +303,15 @@ async function main() {
       if (cmd === 'mcp-stdio') {
         const user = ctx.users.list().find((u) => u.name === a.as);
         if (!user) throw new Error('--as <user>: a user from `user list`');
+        beforeExit = () => shutdown(ctx, 'engine shutting down', 20_000);
         await buildServer(ctx, user).connect(new StdioServerTransport());
         return;
       }
       const host = a.host ?? '127.0.0.1';
       const port = Number(a.port ?? 8787);
       if (!ctx.users.list().length) throw new Error('no users yet: add one with `user add <name> --admin`');
-      startHttp(ctx, { host, port });
+      const server = startHttp(ctx, { host, port });
+      beforeExit = () => (server.close(), shutdown(ctx, 'engine shutting down', 20_000));
       log(`MCP on http://${host}:${port}/mcp · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
       if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
       await new Promise(() => {}); // until killed

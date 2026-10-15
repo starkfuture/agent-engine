@@ -33,7 +33,8 @@ Code-driven parts (a deterministic gate, credentialed tools, output checks) live
 - **Fresh session per run.** No `settingSources`, so no parent `CLAUDE.md` or settings. A throwaway `HOME`. Skill shell execution is off. The model holds no credentials: credentialed tools run in the engine process.
 - **Rule of Two.** An agent can't have both sensitive reads (local files or credentialed tools, including tools passed in code) and web tools. It's checked at load and again at run time. Agent folders can't carry hooks or settings.
 - **File access is a snapshot, not a filter.**
-  - The codebase agent reads a temp copy of the folder's **git-tracked files**, with secret files (`.env*`, keys, `.npmrc`, `tfstate`, …) and symlinks removed. No search pattern can reach what isn't there.
+  - The codebase agent reads a temp copy of **one commit** (`--ref`, default `origin/HEAD`, else `HEAD`; never uncommitted edits), with secret files (`.env*`, keys, `.npmrc`, `tfstate`, …), symlinks and submodules removed. No search pattern can reach what isn't there. The answer names the commit it read.
+  - The copy is streamed from `git cat-file` asynchronously, so a large repo doesn't stall the server.
   - The CLI's own `blockReadsOutsideWorkingDirectories` and `Read(...)` deny rules check every file a search touches.
   - A small hook catches `~`, `..` and absolute escapes early.
 - **Evidence.**
@@ -175,7 +176,8 @@ for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 
 - Runs are recorded with who asked. Per person: `ENGINE_USER_DAILY_CAP_USD` (default 10)
   and `ENGINE_USER_MAX_RUNNING` (default 2); per agent: `concurrency` in agent.yaml.
-- `ENGINE_NOTIFY_SLACK=1` with `SLACK_WEBHOOK_URL` @-mentions the requester when a run ends.
+- `ENGINE_NOTIFY_SLACK=1` with `SLACK_WEBHOOK_URL` @-mentions the requester when a run ends. Model text in Slack is escaped, so it can't ping (`<!channel>`) or hide links.
+- SIGTERM/Ctrl-C stops running runs and waits (≤ 20 s) until each is settled and its requester notified. A run whose process died stops beating and is reaped within 2 min, even if a restarted server got the same pid.
 - Callers name a repo; they never pass a path. Scheduled agents (monitor) can't be started over MCP.
 - Bind is loopback by default. Anywhere else, put TLS in front (tokens travel in a header).
 - `mcp-stdio --as <user>` serves the same tools over stdio for one local user.

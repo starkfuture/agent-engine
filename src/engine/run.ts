@@ -9,7 +9,7 @@ import { challengeLite, type ChallengeResult } from './challenge.js';
 import { Evidence, evidenceHook } from './evidence.js';
 import { pathGuard } from './guard.js';
 import { pluginCopy, SpendMeter, type Session, type SessionEvent, type SessionRequest } from './session.js';
-import { snapshot } from './snapshot.js';
+import { snapshot, type Snapshot } from './snapshot.js';
 import type { RunStatus, Store } from './store.js';
 import { fence, redact, safeJson } from './text.js';
 
@@ -46,10 +46,16 @@ export interface RunInput<T> {
   tools?: ToolFactory; // in-process tools; these hold credentials, so they count as sensitive reads
   output: OutputSpec<T>;
   challenge?: boolean;
-  roots?: string[]; // git folders the file tools may read; each is snapshotted
+  roots?: Array<string | Root>; // git folders the file tools may read; each is snapshotted at a commit
   user?: { name: string; usdPerDay?: number; maxRunning?: number }; // who asked (MCP)
   signal?: AbortSignal; // cancel this run (status 'stopped')
   onAdmitted?: (runId: string) => void; // called once the run is admitted, before the model starts
+}
+
+// A repo to read and the ref to read it at (default: origin/HEAD, else HEAD).
+export interface Root {
+  path: string;
+  ref?: string;
 }
 
 export interface RunResult<T> {
@@ -62,9 +68,26 @@ export interface RunResult<T> {
   dir?: string;
   challenge?: ChallengeResult;
   note?: string;
+  sources?: Array<Omit<Snapshot, 'dir' | 'files' | 'skipped'> & { path: string }>; // the commits file tools read
 }
 
 const LOOP_REPEATS = 3;
+const HEARTBEAT_MS = 30_000;
+
+// Admitted runs in this process, so a shutdown can stop and settle them
+// instead of leaving "running" rows behind.
+const INFLIGHT = new Map<string, { stop: (note: string) => void; settled: Promise<void> }>();
+let closing: string | undefined;
+
+// Stop every run in this process, wait (up to waitMs) until each is settled,
+// and refuse new runs from now on. Returns how many runs were stopped.
+export async function stopAllRuns(reason: string, waitMs: number): Promise<number> {
+  closing = reason;
+  const runs = [...INFLIGHT.values()];
+  for (const r of runs) r.stop(reason);
+  await Promise.race([Promise.all(runs.map((r) => r.settled)), new Promise((res) => setTimeout(res, waitMs).unref())]);
+  return runs.length;
+}
 const stamp = (d: Date) => d.toISOString().replace(/[-:.]/g, '').slice(0, 15) + 'Z';
 const hasAny = (tools: string[], set: readonly string[]) => tools.some((t) => set.includes(t));
 
@@ -103,6 +126,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     return { runId, status: 'stopped', outputs: [], evidence, cost: 0, turns: 0, note };
   };
   if (!engine.llmAvailable) return skipped('no LLM credentials configured');
+  if (closing) return skipped(`engine is shutting down (${closing})`);
   if (existsSync(engine.stopFile)) return skipped(`stop file present: ${engine.stopFile}`);
 
   const challenge = input.challenge ?? spec.challenge.when === 'always';
@@ -134,6 +158,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
   let dir: string | undefined;
   let challengeResult: ChallengeResult | undefined;
   let modelStarted = false;
+  let sources: RunResult<T>['sources'];
   const abort = new AbortController();
   let stopped: 'deadline' | 'stopped' | 'loop' | undefined;
   const stop = (why: 'deadline' | 'stopped' | 'loop', n: string) => {
@@ -146,7 +171,19 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
   // The kill switch acts within seconds, also while the model is mid-turn.
   const stopPoll = setInterval(() => existsSync(engine.stopFile) && stop('stopped', 'stop file'), 2000);
   stopPoll.unref();
+  // A run whose process died (OOM, SIGKILL) stops beating and is reaped by the
+  // next admission, even if a new process got the same pid.
+  const heartbeat = setInterval(() => {
+    try {
+      engine.store.beat(runId, clock());
+    } catch {
+      /* a missed beat is retried; settlement does not depend on it */
+    }
+  }, HEARTBEAT_MS);
+  heartbeat.unref();
   input.signal?.addEventListener('abort', () => stop('stopped', String(input.signal?.reason ?? 'cancelled')));
+  let markSettled!: () => void;
+  INFLIGHT.set(runId, { stop: (n) => stop('stopped', n), settled: new Promise<void>((res) => (markSettled = res)) });
   try {
     input.onAdmitted?.(runId);
   } catch {
@@ -166,13 +203,19 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
       }
     };
 
-    // File tools read snapshots: git-tracked files without secret files.
-    const roots = input.roots?.map((r) => {
-      const s = snapshot(r);
-      temps.push(s.dir);
-      return s.dir;
-    });
-    const where = roots ? `\n\nThe folder${roots.length > 1 ? 's' : ''} you may read (a copy of ${input.roots!.join(', ')}, git-tracked files only, secret files removed): ${roots.join(', ')}` : '';
+    // File tools read snapshots: one commit's files without secret files.
+    let roots: string[] | undefined;
+    if (input.roots) {
+      roots = [];
+      sources = [];
+      for (const r of input.roots.map((x) => (typeof x === 'string' ? { path: x } : x))) {
+        const s = await snapshot(r.path, r.ref);
+        temps.push(s.dir);
+        roots.push(s.dir);
+        sources.push({ path: r.path, ref: s.ref, commit: s.commit, date: s.date });
+      }
+    }
+    const where = roots ? `\n\nThe folder${roots.length > 1 ? 's' : ''} you may read (${sources!.map((s) => `${s.path} at ${s.ref}, commit ${s.commit.slice(0, 10)} of ${s.date}`).join('; ')}; committed files only, secret files removed): ${roots.join(', ')}` : '';
     const task = input.task + where;
     const prompt = [task, ...(input.data ? ['', fence('context', input.data)] : [])].join('\n');
     writeFileSync(join(dir, 'input.md'), redact(`# ${spec.name} @ ${agent.version}\n\ntrigger: ${input.trigger}\nchallenge: ${challenge}\n\n${prompt}\n`));
@@ -204,6 +247,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     let gotResult = false;
     const meter = new SpendMeter();
     const watchAuthor = watcher(engine.stopFile, stop);
+    if (stopped) throw new Error('stopped before the model started'); // cancel or STOP while snapshotting
     modelStarted = true;
     try {
       for await (const e of engine.session({
@@ -285,6 +329,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
   } finally {
     clearTimeout(timer);
     clearInterval(stopPoll);
+    clearInterval(heartbeat);
     if (stopped) status = stopped; // also when the deadline or STOP hit during the challenge
     const best = (f: () => void) => {
       try {
@@ -313,6 +358,8 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
       ...(note ? { note } : {}),
     });
     for (const t of temps) best(() => rmSync(t, { recursive: true, force: true }));
+    INFLIGHT.delete(runId);
+    markSettled();
   }
-  return { runId, status, outputs, evidence, cost, turns, ...(dir ? { dir } : {}), ...(challengeResult ? { challenge: challengeResult } : {}), ...(note ? { note } : {}) };
+  return { runId, status, outputs, evidence, cost, turns, ...(dir ? { dir } : {}), ...(challengeResult ? { challenge: challengeResult } : {}), ...(note ? { note } : {}), ...(sources ? { sources } : {}) };
 }

@@ -1,5 +1,5 @@
 import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import type { LoadedAgent } from './agent.js';
 import { renderFindings, type Findings } from './output.js';
 import type { RunResult } from './run.js';
@@ -12,7 +12,8 @@ export function writeAnswer(agent: LoadedAgent, r: RunResult<Findings>): string 
   if (!f) return undefined;
   const dissent = (r.challenge?.blocking ?? []).map((o) => `- ${o.claim}\n  - if acted on: ${o.failure_scenario}\n  - check: ${o.settling_check} (${o.evidence.join(', ')})`);
   const verdict = r.challenge ? ` · challenge ${r.challenge.verdict}${r.challenge.note ? ` (${r.challenge.note})` : ''}` : '';
-  const md = redact(renderFindings(f, `${agent.spec.name}@${agent.version} · run ${r.runId} · $${r.cost.toFixed(2)}${verdict}`, dissent));
+  const read = (r.sources ?? []).map((s) => ` · read ${basename(s.path)} at ${s.ref} ${s.commit.slice(0, 10)} (${s.date.slice(0, 10)})`).join('');
+  const md = redact(renderFindings(f, `${agent.spec.name}@${agent.version} · run ${r.runId} · $${r.cost.toFixed(2)}${verdict}${read}`, dissent));
   if (r.dir) writeFileSync(join(r.dir, 'answer.md'), md + '\n');
   return md;
 }

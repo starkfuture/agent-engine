@@ -56,8 +56,10 @@ function gitRepo(files: Record<string, string>, ignore = ''): string {
   if (ignore) writeFileSync(join(root, '.gitignore'), ignore);
   execFileSync('git', ['init', '-q', '--template=', root]);
   execFileSync('git', ['-C', root, 'add', '-A']);
+  commit(root);
   return root;
 }
+const commit = (root: string, msg = 'c') => execFileSync('git', ['-C', root, '-c', 'user.name=t', '-c', 'user.email=t@t.test', 'commit', '-q', '--no-verify', '--allow-empty', '-m', msg]);
 
 // ---------- agent folders and configuration ----------
 
@@ -191,19 +193,62 @@ test('secrets inside structured tool output never reach the model', async () => 
 
 // ---------- file access ----------
 
-test('the codebase agent reads a snapshot: git-tracked files only, secret files and symlinks removed', () => {
+test('the codebase agent reads a snapshot: committed files only, secret files and symlinks removed', async () => {
   const root = gitRepo({ 'src/token.service.ts': 'export const t = 1;', '.env.example': 'X=', 'certs/server.pem': 'KEY', 'build/out.js': 'x', '.env': 'PASSWORD=hunter2' }, 'build/\n.env\n');
   execFileSync('git', ['-C', root, 'add', '-f', 'certs/server.pem']);
   symlinkSync('/etc/hosts', join(root, 'hosts-link'));
   execFileSync('git', ['-C', root, 'add', 'hosts-link']);
-  const s = snapshot(root);
+  commit(root);
+  const s = await snapshot(root);
   assert.ok(existsSync(join(s.dir, 'src/token.service.ts')), 'ordinary code named *token* is kept');
   assert.ok(existsSync(join(s.dir, '.env.example')));
   assert.ok(!existsSync(join(s.dir, '.env')), 'gitignored .env never copied');
   assert.ok(!existsSync(join(s.dir, 'build/out.js')));
   assert.ok(!existsSync(join(s.dir, 'certs/server.pem')), 'tracked key file dropped by name');
   assert.ok(!existsSync(join(s.dir, 'hosts-link')), 'symlinks dropped');
-  assert.throws(() => snapshot(tmp('not-git-')), /not a git folder/);
+  await assert.rejects(snapshot(tmp('not-git-')), /not a git folder/);
+});
+
+test('a snapshot reads one commit, never the working tree, and says which', async () => {
+  const root = gitRepo({ 'a.ts': 'v1' });
+  execFileSync('git', ['-C', root, 'branch', 'base']);
+  writeFileSync(join(root, 'a.ts'), 'v2');
+  execFileSync('git', ['-C', root, 'add', '-A']);
+  commit(root);
+  writeFileSync(join(root, 'a.ts'), 'v3 uncommitted');
+  writeFileSync(join(root, 'new.ts'), 'untracked');
+
+  const head = await snapshot(root);
+  assert.equal(readFileSync(join(head.dir, 'a.ts'), 'utf8'), 'v2', 'HEAD when the clone has no origin');
+  assert.equal(head.ref, 'HEAD');
+  assert.match(head.commit, /^[0-9a-f]{40}$/);
+  assert.ok(!existsSync(join(head.dir, 'new.ts')));
+  const base = await snapshot(root, 'base');
+  assert.equal(readFileSync(join(base.dir, 'a.ts'), 'utf8'), 'v1');
+  await assert.rejects(snapshot(root, '--upload-pack=touch /tmp/x'), /bad git ref/);
+  await assert.rejects(snapshot(root, 'no-such-branch'), /can't read ref/);
+
+  // The run names the commit it read, in its input and its result.
+  const d = agentDir('builtin_tools: [Read]');
+  const e = engine(fakeSession(async function* () {
+    yield ok();
+  }));
+  const r = await runAgent(e, { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput, roots: [{ path: root, ref: 'base' }] });
+  assert.equal(r.sources?.[0]?.ref, 'base');
+  assert.equal(r.sources?.[0]?.commit, base.commit);
+  assert.match(readFileSync(join(r.dir!, 'input.md'), 'utf8'), new RegExp(`at base, commit ${base.commit.slice(0, 10)}`));
+});
+
+test('a snapshot does not stall the process while it copies', async () => {
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 400; i++) files[`src/f${i}.ts`] = `export const v${i} = ${i};\n`.repeat(50);
+  const root = gitRepo(files);
+  let ticks = 0;
+  const t = setInterval(() => ticks++, 1);
+  const s = await snapshot(root);
+  clearInterval(t);
+  assert.equal(s.files, 400);
+  assert.ok(ticks >= 5, `timers ran ${ticks} times during the snapshot`);
 });
 
 test('the path guard catches obvious escapes: outside, home-relative, parent, credential names', async () => {
@@ -264,6 +309,19 @@ test('a run whose process died, or that is long past its deadline, is reaped at 
   assert.equal(s.get('dead')?.status, 'crashed');
   assert.equal(s.get('late')?.status, 'crashed', 'own live pid, but past deadline + grace');
   assert.equal(s.get('dead')?.cost, 2);
+});
+
+test('a run that stopped beating is reaped even if its pid is alive (a restarted server reuses pid 1)', () => {
+  const s = new Store(':memory:');
+  const t0 = new Date('2026-10-14T10:00:00Z');
+  const at = (sec: number) => new Date(t0.getTime() + sec * 1000);
+  const adm = (id: string, now: Date) => s.admit({ id, agent: 'x', version: 'v', trigger: 't', now, deadlineMs: 20 * 60_000, reserve: 2, agentCap: 10, globalCap: 10 });
+  adm('ghost', t0); // pid = this process: alive
+  s.beat('ghost', at(60));
+  assert.equal(adm('a', at(150)).ok, false, 'beat 90 s ago: still alive');
+  assert.equal(adm('b', at(200)).ok, true, 'silent for 140 s: reaped');
+  assert.equal(s.get('ghost')?.status, 'crashed');
+  assert.match(s.get('ghost')?.note ?? '', /no heartbeat/);
 });
 
 test('spend counts on the day the run started, even if it ends after midnight', () => {
