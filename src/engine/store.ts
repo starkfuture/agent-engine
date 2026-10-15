@@ -178,6 +178,11 @@ export class Store {
     return this.db.prepare(sql).all(...args, limit) as unknown as RunRow[];
   }
 
+  // Runs started on a UTC day, by agent and status (metrics).
+  counts(day: string): Array<{ agent: string; status: string; n: number }> {
+    return this.db.prepare(`SELECT agent, status, COUNT(*) AS n FROM runs WHERE day = ? GROUP BY agent, status ORDER BY agent, status`).all(day) as unknown as Array<{ agent: string; status: string; n: number }>;
+  }
+
   get(id: string): RunRow | undefined {
     return this.db.prepare(`SELECT * FROM runs WHERE id = ?`).get(id) as unknown as RunRow | undefined;
   }

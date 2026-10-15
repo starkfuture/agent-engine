@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { loadConfig, loadDotEnv, type Config } from './config.js';
-import { GrafanaTelemetry, readToken, RecordingTelemetry, ReplayTelemetry, type Telemetry } from './clients/telemetry.js';
+import { DirectTelemetry, GrafanaTelemetry, readToken, RecordingTelemetry, ReplayTelemetry, type Telemetry } from './clients/telemetry.js';
 import { httpQuery } from './patrol/collectors.js';
 import { Noise } from './patrol/noise.js';
 import { State } from './patrol/state.js';
@@ -22,6 +22,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { buildServer, shutdown, slackNotifier, startHttp, type McpContext } from './mcp/server.js';
 import { loadRepos } from './mcp/repos.js';
 import { Users } from './mcp/users.js';
+import { Metrics, startMetrics } from './metrics.js';
 
 const USAGE = `engine <command> [options]
 
@@ -38,6 +39,8 @@ Agents (folders in agents/):
 MCP server (several developers, one engine):
   serve [--host 127.0.0.1] [--port 8787]
                               Streamable HTTP MCP at /mcp; each person uses their own bearer token
+      --patrol [--llm] [--post]  also run the monitor's patrol loop in this process
+      --metrics-port <n>      Prometheus metrics at /metrics on their own port (heartbeat)
   mcp-stdio --as <user>       the same tools over stdio, for one local user
   user add <name> [--admin] [--slack <U…>] [--usd <per day>]
                               issue a token (printed once; only its hash is stored)
@@ -51,7 +54,7 @@ Monitor:
       --post                  post cards to SLACK_WEBHOOK_URL
       --replay <dir>          read telemetry from an export instead of Grafana
       --fresh                 in-memory state (don't read or write .state/)
-  loop                        patrol every window (default 15 min) until stopped; same flags
+  loop                        patrol every window (default 15 min) until stopped; same flags, plus --metrics-port
   export --from <ISO> --to <ISO> [--out <dir>] [--step <min>]
                               record every patrol query in the range (no LLM), for offline replay
   replay --from <ISO> --to <ISO> [--step <min>] [--replay <dir>] [--llm]
@@ -82,6 +85,8 @@ const { positionals, values: a } = parseArgs({
     llm: { type: 'boolean', default: false },
     post: { type: 'boolean', default: false },
     fresh: { type: 'boolean', default: false },
+    patrol: { type: 'boolean', default: false },
+    'metrics-port': { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
   },
 });
@@ -104,7 +109,11 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const)
       .finally(() => process.exit(code));
   });
 
-function liveTelemetry(cfg: Config): GrafanaTelemetry {
+function liveTelemetry(cfg: Config): Telemetry {
+  if (cfg.direct) return new DirectTelemetry(cfg.direct);
+  return grafanaTelemetry(cfg);
+}
+function grafanaTelemetry(cfg: Config): GrafanaTelemetry {
   return new GrafanaTelemetry({ url: cfg.grafanaUrl, token: readToken(cfg.grafanaTokenFile), promUid: cfg.promUid, lokiUid: cfg.lokiUid, tempoUid: cfg.tempoUid });
 }
 function telemetry(cfg: Config): Telemetry {
@@ -148,15 +157,45 @@ function monitorAgent(cfg: Config): MonitorAgent {
 // Patrol times sit on window boundaries so recordings and replays line up.
 const align = (d: Date, min: number) => new Date(Math.floor(d.getTime() / (min * 60_000)) * min * 60_000);
 
+// The patrol every window until the process ends; each pass lands in metrics.
+async function patrolLoop(cfg: Config, noise: Noise, sink: CardSink, w: number, metrics?: Metrics): Promise<never> {
+  const tel = telemetry(cfg);
+  const state = State.load(cfg.stateFile);
+  const monitor = a.llm ? monitorAgent(cfg) : undefined;
+  for (;;) {
+    const at = align(new Date(), w);
+    try {
+      metrics?.patrol(at, await patrolOnce(tel, cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log }, monitor));
+    } catch (e) {
+      metrics?.patrol(at);
+      log(`patrol failed: ${(e as Error).message}`);
+    }
+    const next = at.getTime() + w * 60_000 + 30_000; // 30 s after the boundary, so the last scrape is in
+    await new Promise((r) => setTimeout(r, Math.max(5_000, next - Date.now())));
+  }
+}
+
+function metricsServer(cfg: Config): Metrics | undefined {
+  if (!a['metrics-port']) return undefined;
+  const metrics = new Metrics();
+  const port = Number(a['metrics-port']);
+  startMetrics(metrics, makeEngine(cfg), { host: a.host ?? '127.0.0.1', port });
+  log(`metrics on :${port}/metrics`);
+  return metrics;
+}
+
 async function doctor(cfg: Config) {
   const tel = liveTelemetry(cfg);
-  console.log(`Grafana ${cfg.grafanaUrl}, token file ${cfg.grafanaTokenFile}: present`);
-  try {
-    const ds = await tel.datasources();
-    console.log('\nDatasources (set LOKI_DATASOURCE_UID / TEMPO_DATASOURCE_UID from these):');
-    for (const d of ds) console.log(`  ${d.type.padEnd(12)} uid=${d.uid}  ${d.name}`);
-  } catch (e) {
-    console.log(`  could not list datasources: ${(e as Error).message}`);
+  if (cfg.direct) console.log(`In-cluster: Prometheus ${cfg.direct.prometheusUrl}, Loki ${cfg.direct.lokiUrl ?? '-'}, Tempo ${cfg.direct.tempoUrl ?? '-'}`);
+  else {
+    console.log(`Grafana ${cfg.grafanaUrl}, token file ${cfg.grafanaTokenFile}: present`);
+    try {
+      const ds = await grafanaTelemetry(cfg).datasources();
+      console.log('\nDatasources (set LOKI_DATASOURCE_UID / TEMPO_DATASOURCE_UID from these):');
+      for (const d of ds) console.log(`  ${d.type.padEnd(12)} uid=${d.uid}  ${d.name}`);
+    } catch (e) {
+      console.log(`  could not list datasources: ${(e as Error).message}`);
+    }
   }
   const now = new Date();
   console.log('\nHTTP families (labels on a real series; check route/status/service labels match sources.yaml):');
@@ -328,6 +367,11 @@ async function main() {
       beforeExit = () => (server.close(), shutdown(ctx, 'engine shutting down', 20_000));
       log(`MCP on http://${host}:${port}/mcp · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
       if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
+      const metrics = metricsServer(cfg);
+      if (a.patrol) {
+        log(`patrol every ${w} min in this process${a.llm ? ' with the investigator' : ''}`);
+        void patrolLoop(cfg, noise, sink, w, metrics);
+      }
       await new Promise(() => {}); // until killed
       return;
     }
@@ -351,21 +395,8 @@ async function main() {
       return;
     }
 
-    case 'loop': {
-      const tel = telemetry(cfg);
-      const state = State.load(cfg.stateFile);
-      const monitor = a.llm ? monitorAgent(cfg) : undefined;
-      for (;;) {
-        const at = align(new Date(), w);
-        try {
-          await patrolOnce(tel, cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log }, monitor);
-        } catch (e) {
-          log(`patrol failed: ${(e as Error).message}`);
-        }
-        const next = at.getTime() + w * 60_000 + 30_000; // 30 s after the boundary, so the last scrape is in
-        await new Promise((r) => setTimeout(r, Math.max(5_000, next - Date.now())));
-      }
-    }
+    case 'loop':
+      return void (await patrolLoop(cfg, noise, sink, w, metricsServer(cfg)));
 
     case 'export': {
       const from = align(date(a.from, 'from'), w);

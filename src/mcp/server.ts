@@ -50,8 +50,12 @@ const err = (t: string) => ({ content: [{ type: 'text' as const, text: `error: $
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const today = () => new Date().toISOString().slice(0, 10);
 
+// Agents this server offers: all, or the ENGINE_AGENTS list.
+const served = (ctx: McpContext, name: string) => !ctx.cfg.mcp.agents || ctx.cfg.mcp.agents.includes(name);
+const agentsHere = (ctx: McpContext) => listAgents(ctx.cfg.agentsDir, ctx.cfg.memoryDir).filter((a) => served(ctx, a.spec.name));
+
 function agentByName(ctx: McpContext, name: string): LoadedAgent | undefined {
-  if (!/^[a-z][a-z0-9-]*$/.test(name)) return undefined;
+  if (!/^[a-z][a-z0-9-]*$/.test(name) || !served(ctx, name)) return undefined;
   const dir = join(ctx.cfg.agentsDir, name);
   return existsSync(join(dir, 'agent.yaml')) ? loadAgent(dir, ctx.cfg.memoryDir) : undefined;
 }
@@ -60,7 +64,7 @@ function agentByName(ctx: McpContext, name: string): LoadedAgent | undefined {
 // readable by the requester and admins only. An agent that can't be loaded
 // counts as private.
 function sharedAgents(ctx: McpContext): Set<string> {
-  return new Set(listAgents(ctx.cfg.agentsDir, ctx.cfg.memoryDir).filter((a) => a.spec.visibility === 'everyone').map((a) => a.spec.name));
+  return new Set(agentsHere(ctx).filter((a) => a.spec.visibility === 'everyone').map((a) => a.spec.name));
 }
 
 function summary(r: RunResult<Findings>): string {
@@ -88,7 +92,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
     { description: 'Agents you can give tasks to, with their tools, limits and whether they need a repo.', inputSchema: {}, annotations: { readOnlyHint: true } },
     async () =>
       text(
-        listAgents(ctx.cfg.agentsDir, ctx.cfg.memoryDir)
+        agentsHere(ctx)
           .map((a) => {
             const l = a.spec.limits;
             const needsRepo = a.spec.builtin_tools.some((t) => (FILE_TOOLS as readonly string[]).includes(t));
@@ -268,7 +272,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
     async () => {
       const st = ctx.engine.store;
       const d = today();
-      const agents = listAgents(ctx.cfg.agentsDir, ctx.cfg.memoryDir).map((a) => `  ${a.spec.name.padEnd(9)} $${st.spent(d, a.spec.name).toFixed(2)} of $${a.spec.limits.usd_per_day}`);
+      const agents = agentsHere(ctx).map((a) => `  ${a.spec.name.padEnd(9)} $${st.spent(d, a.spec.name).toFixed(2)} of $${a.spec.limits.usd_per_day}`);
       return text(
         [
           `today: $${st.spent(d).toFixed(2)} of $${ctx.engine.dailyCapUsd} · this month: $${st.spent(d.slice(0, 7)).toFixed(2)} of $${ctx.engine.monthlyCapUsd ?? '∞'}`,

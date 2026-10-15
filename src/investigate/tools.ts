@@ -1,7 +1,7 @@
 import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Config, HttpFamily } from '../config.js';
-import type { Telemetry } from '../clients/telemetry.js';
+import { TEMPO_MAX_MINUTES, type Telemetry } from '../clients/telemetry.js';
 import type { Evidence } from '../engine/evidence.js';
 import type { ToolFactory } from '../engine/run.js';
 import { workloadOf } from '../patrol/collectors.js';
@@ -214,8 +214,8 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
     ),
     tool(
       'trace_search',
-      'Search traces (Tempo, TraceQL) in the last N minutes; returns root service, operation, duration and trace ids.',
-      { traceql: z.string().max(500).default('{ status = error }'), minutes: z.number().int().min(5).max(360).default(30), limit: z.number().int().min(1).max(200).default(50) },
+      `Search traces (Tempo, TraceQL) in the last N minutes (at most ${TEMPO_MAX_MINUTES}: Tempo is shared); returns root service, operation, duration and trace ids. Match exact values; regexes starting with .* are refused.`,
+      { traceql: z.string().max(500).default('{ status = error }'), minutes: z.number().int().min(5).max(TEMPO_MAX_MINUTES).default(15), limit: z.number().int().min(1).max(200).default(50) },
       guard('trace_search', async ({ traceql, minutes, limit }) => {
         if (!tel.has.tempo) throw new Error('Tempo is not configured in this run');
         const hits = await tel.tempoSearch(traceql, new Date(at.getTime() - minutes * 60_000), at, limit);

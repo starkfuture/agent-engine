@@ -51,12 +51,12 @@ function gitRepo(): string {
   return root;
 }
 
-function context(session: Session, over: { userCap?: number; notify?: (t: string) => Promise<void>; memoryDir?: string } = {}) {
+function context(session: Session, over: { userCap?: number; notify?: (t: string) => Promise<void>; memoryDir?: string; agents?: string[] } = {}) {
   const runsDir = tmp('runs-');
   const engine: Engine = { store: new Store(join(runsDir, 'engine.db')), runsDir, stopFile: join(runsDir, 'STOP'), session, dailyCapUsd: 20, monthlyCapUsd: 100, llmAvailable: true };
   const users = Users.load(join(tmp('users-'), 'users.json'));
   const tokens = { ana: users.add('ana', { slackId: 'U0ANA12345' }), bo: users.add('bo'), root: users.add('root', { admin: true }) };
-  const cfg = { agentsDir: agentsDir(), runsDir, memoryDir: over.memoryDir, mcp: { usersFile: users.file, reposFile: '', userDailyCapUsd: over.userCap ?? 10, userMaxRunning: 2, notifySlack: false } } as unknown as Config;
+  const cfg = { agentsDir: agentsDir(), runsDir, memoryDir: over.memoryDir, mcp: { usersFile: users.file, reposFile: '', userDailyCapUsd: over.userCap ?? 10, userMaxRunning: 2, notifySlack: false, agents: over.agents } } as unknown as Config;
   const ctx: McpContext = { cfg, engine, users, repos: new Map([['app', { path: gitRepo() }]]), ...(over.notify ? { notify: over.notify } : {}) };
   const who = (name: string) => users.list().find((u) => u.name === name)!;
   return { ctx, tokens, who };
@@ -138,6 +138,15 @@ test('a private agent’s runs are readable by the requester and admins only', a
   appendFileSync(join(ctx.cfg.agentsDir, 'research', 'agent.yaml'), '\nvisibility: everyone\n');
   assert.match((await bo.call('get_run', { run_id: runId })).text, /asked by ana/);
   assert.ok((await bo.call('list_runs')).text.includes(runId));
+});
+
+test('a deployment offers only its ENGINE_AGENTS (web agents run apart from prod data)', async () => {
+  const { ctx, who } = context(fakeSession(), { agents: ['codebase', 'monitor'] });
+  const { call } = await connect(ctx, who('ana'));
+  const list = (await call('list_agents')).text;
+  assert.match(list, /^codebase @/m);
+  assert.doesNotMatch(list, /research/);
+  assert.match((await call('run_agent', { agent: 'research', task: 'Where is feature X configured?' })).text, /error: no agent "research"/);
 });
 
 test('with a memory dir, approved lessons live there (a persistent volume), not in the image', async () => {

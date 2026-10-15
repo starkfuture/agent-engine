@@ -38,6 +38,9 @@ const Sources = z.object({
 export type Sources = z.infer<typeof Sources>;
 
 export interface Config {
+  // In-cluster backends (hosted). When PROMETHEUS_URL is set these are used
+  // directly and Grafana is not; locally, Grafana's proxy with a token.
+  direct: { prometheusUrl: string; lokiUrl: string | undefined; lokiOrgId: string | undefined; tempoUrl: string | undefined } | undefined;
   grafanaUrl: string;
   grafanaTokenFile: string;
   promUid: string;
@@ -67,6 +70,9 @@ export interface Config {
     userMaxRunning: number; // per person, at once
     notifySlack: boolean; // @-mention the requester in Slack when a run ends
     allowedOrigins: string[]; // browser origins allowed to call the endpoint; MCP clients send none
+    // Agents this server offers (ENGINE_AGENTS=monitor,codebase); unset = all.
+    // Hosted, web-reading agents run in their own deployment, away from prod data.
+    agents: string[] | undefined;
   };
 }
 
@@ -101,6 +107,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
   const legacy = ['SRE_MODEL', 'SRE_MAX_USD_PER_INVESTIGATION', 'SRE_DAILY_CAP_USD', 'SRE_MAX_TURNS'].filter((k) => env[k] !== undefined);
   if (legacy.length) throw new Error(`${legacy.join(', ')} no longer apply: set model and limits in agents/monitor/agent.yaml and the global cap in ENGINE_DAILY_CAP_USD`);
   return {
+    direct: env.PROMETHEUS_URL
+      ? { prometheusUrl: env.PROMETHEUS_URL, lokiUrl: opt(env.LOKI_URL), lokiOrgId: opt(env.LOKI_ORG_ID), tempoUrl: opt(env.TEMPO_URL) }
+      : undefined,
     grafanaUrl: (env.GRAFANA_URL ?? 'https://monitoring.starkfuture.com').replace(/\/$/, ''),
     grafanaTokenFile: expandHome(env.GRAFANA_TOKEN_FILE ?? '~/.config/golive/grafana-token'),
     promUid: env.PROM_DATASOURCE_UID || 'prometheus',
@@ -128,6 +137,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
       userMaxRunning: num(env.ENGINE_USER_MAX_RUNNING, 2, 'ENGINE_USER_MAX_RUNNING'),
       notifySlack: env.ENGINE_NOTIFY_SLACK === '1',
       allowedOrigins: (env.ENGINE_ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+      agents: env.ENGINE_AGENTS ? env.ENGINE_AGENTS.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
     },
   };
 }
