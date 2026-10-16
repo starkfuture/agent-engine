@@ -94,6 +94,8 @@ test('repo sync clones, fetches, keeps origin/HEAD, and never puts the token in 
   await sync.syncAll();
   assert.equal(sync.state.get('app')?.commit, c2, 'fetch picks up the new commit');
 
+  // Older git (and git with followRemoteHEAD=never) doesn't recreate it on fetch.
+  git('-C', dir, 'config', 'remote.origin.followRemoteHEAD', 'never');
   git('-C', dir, 'symbolic-ref', '--delete', 'refs/remotes/origin/HEAD');
   await sync.syncAll();
   assert.equal(git('-C', dir, 'rev-parse', 'refs/remotes/origin/HEAD'), c2, 'origin/HEAD restored');
