@@ -181,6 +181,8 @@ for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 - Hosted: `serve --patrol --llm --metrics-port 9464` runs the MCP endpoint and the monitor's patrol in one process. Telemetry goes straight to the in-cluster backends (`PROMETHEUS_URL`, `LOKI_URL` + `LOKI_ORG_ID`, `TEMPO_URL`); locally it goes through Grafana with a token. Tempo searches are capped at 30 minutes, and regexes starting with `.*` are refused (Tempo is shared).
 - `/metrics` (own port) for the heartbeat alert: `engine_up`, `engine_patrol_last_success_timestamp_seconds`, `engine_patrol_source_up{source}` (blind spots), `engine_runs_today`, `engine_spend_usd` and the caps.
 - `ENGINE_AGENTS` limits which agents a deployment offers. Web-reading agents (research, later ticket triage) run in their own deployment with no access to prod telemetry or the cluster.
+- Tokens expire after at most 90 days (`user add --days`). Hosted, people get their own at `<ENGINE_PUBLIC_URL>/login`: a Google login that must be a verified Workspace account on `ENGINE_LOGIN_DOMAIN` (the `hd` claim, not just the email address). Signing in again rotates the token. Admins are still made with the CLI.
+- CI: `agent-engine-ci.yml` gates PRs; a push to `main` builds one image and deploys both apps through argo-cd. Changes go through PRs.
 - Runs are recorded with who asked. Per person: `ENGINE_USER_DAILY_CAP_USD` (default 10)
   and `ENGINE_USER_MAX_RUNNING` (default 2); per agent: `concurrency` in agent.yaml.
 - `ENGINE_NOTIFY_SLACK=1` with `SLACK_WEBHOOK_URL` @-mentions the requester when a run ends. Model text in Slack is escaped, so it can't ping (`<!channel>`) or hide links.

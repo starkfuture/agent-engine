@@ -11,6 +11,7 @@ import { findingsOutput, type Findings } from '../engine/output.js';
 import { runAgent, type Engine, type Root, type RunResult } from '../engine/run.js';
 import { cleanModelText, redact, safeJson, slackEscape, truncate } from '../engine/text.js';
 import type { RunRow } from '../engine/store.js';
+import type { Login } from './login.js';
 import type { User, Users } from './users.js';
 
 // The engine over MCP, for several developers. One process holds the engine:
@@ -24,6 +25,7 @@ export interface McpContext {
   users: Users;
   repos: Map<string, Root>;
   notify?: (text: string) => Promise<void>; // Slack; absent = no notifications
+  login?: Login; // Google login that issues tokens; absent = tokens only from the CLI
   log?: (s: string) => void;
 }
 
@@ -380,12 +382,18 @@ export function startHttp(ctx: McpContext, opts: { host: string; port: number })
     try {
       const url = new URL(req.url ?? '/', 'http://x');
       if (url.pathname === '/healthz') return void res.writeHead(200).end('ok');
-      if (url.pathname !== '/mcp') return send(404, 'not found');
+      const isLogin = url.pathname === '/login' || url.pathname === '/login/callback';
+      if (url.pathname !== '/mcp' && !(isLogin && ctx.login)) return send(404, 'not found');
+      if (local && !LOOPBACK.has((req.headers.host ?? '').replace(/:\d+$/, '').replace(/^\[|\]$/g, ''))) return send(403, 'bad host');
+      if (isLogin) {
+        if (req.method !== 'GET') return send(405, 'GET only', { allow: 'GET' });
+        const r = await ctx.login!.handle(url);
+        return void res.writeHead(r.status, r.headers).end(r.body);
+      }
       // Browsers send Origin; MCP clients don't. A page in a developer's
       // browser must not drive the endpoint (MCP spec: validate Origin).
       const origin = req.headers.origin;
       if (origin && !(ctx.cfg.mcp.allowedOrigins ?? []).includes(origin)) return send(403, 'origin not allowed');
-      if (local && !LOOPBACK.has((req.headers.host ?? '').replace(/:\d+$/, '').replace(/^\[|\]$/g, ''))) return send(403, 'bad host');
       const auth = req.headers.authorization ?? '';
       const user = ctx.users.authenticate(auth.startsWith('Bearer ') ? auth.slice(7).trim() : undefined);
       if (!user) return send(401, 'missing or unknown token', { 'www-authenticate': 'Bearer' });

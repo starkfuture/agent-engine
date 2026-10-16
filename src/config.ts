@@ -73,6 +73,8 @@ export interface Config {
     // Agents this server offers (ENGINE_AGENTS=monitor,codebase); unset = all.
     // Hosted, web-reading agents run in their own deployment, away from prod data.
     agents: string[] | undefined;
+    // Google login that issues tokens (GOOGLE_CLIENT_ID/SECRET, ENGINE_PUBLIC_URL).
+    login: { clientId: string; clientSecret: string; publicUrl: string; domain: string } | undefined;
   };
 }
 
@@ -96,6 +98,15 @@ export function loadDotEnv(file = resolve('.env'), env: NodeJS.ProcessEnv = proc
     const [, k, v] = m as unknown as [string, string, string];
     if (env[k] === undefined) env[k] = v.replace(/^(['"])(.*)\1$/, '$2');
   }
+}
+
+// All three or none: a half-configured login must stop the server, not run open.
+function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
+  const [clientId, clientSecret, publicUrl] = [opt(env.GOOGLE_CLIENT_ID), opt(env.GOOGLE_CLIENT_SECRET), opt(env.ENGINE_PUBLIC_URL)];
+  if (!clientId && !clientSecret) return undefined;
+  if (!clientId || !clientSecret || !publicUrl) throw new Error('Google login needs GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and ENGINE_PUBLIC_URL');
+  if (!/^https:\/\//.test(publicUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(publicUrl)) throw new Error('ENGINE_PUBLIC_URL must be https (or localhost for testing)');
+  return { clientId, clientSecret, publicUrl, domain: env.ENGINE_LOGIN_DOMAIN || 'starkfuture.com' };
 }
 
 export function loadSources(file: string): Sources {
@@ -138,6 +149,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
       notifySlack: env.ENGINE_NOTIFY_SLACK === '1',
       allowedOrigins: (env.ENGINE_ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
       agents: env.ENGINE_AGENTS ? env.ENGINE_AGENTS.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+      login: loginConfig(env),
     },
   };
 }

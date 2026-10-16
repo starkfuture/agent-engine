@@ -1,0 +1,26 @@
+name: agent-engine - CI
+
+# Typecheck and the full test suite. Gates every PR, and the deploy workflow
+# re-runs it so a push to main that skipped a PR still can't ship a red build.
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: kubernetes-runner-custom
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit -p .
+      - run: npm test

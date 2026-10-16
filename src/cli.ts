@@ -21,7 +21,8 @@ import { patrolOnce, type MonitorAgent } from './runner.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { buildServer, shutdown, slackNotifier, startHttp, type McpContext } from './mcp/server.js';
 import { loadRepos } from './mcp/repos.js';
-import { Users } from './mcp/users.js';
+import { expiresAt, MAX_TOKEN_DAYS, Users } from './mcp/users.js';
+import { Login } from './mcp/login.js';
 import { Metrics, startMetrics } from './metrics.js';
 
 const USAGE = `engine <command> [options]
@@ -42,8 +43,9 @@ MCP server (several developers, one engine):
       --patrol [--llm] [--post]  also run the monitor's patrol loop in this process
       --metrics-port <n>      Prometheus metrics at /metrics on their own port (heartbeat)
   mcp-stdio --as <user>       the same tools over stdio, for one local user
-  user add <name> [--admin] [--slack <U…>] [--usd <per day>]
-                              issue a token (printed once; only its hash is stored)
+  user add <name> [--admin] [--slack <U…>] [--usd <per day>] [--days <n ≤ 90>]
+                              issue a token (printed once; only its hash is stored; expires, default 90 days).
+                              Hosted, people get theirs at <ENGINE_PUBLIC_URL>/login (Google, @starkfuture.com)
   user list | user remove <name>
 
 Monitor:
@@ -81,6 +83,7 @@ const { positionals, values: a } = parseArgs({
     admin: { type: 'boolean', default: false },
     slack: { type: 'string' },
     usd: { type: 'string' },
+    days: { type: 'string' },
     challenge: { type: 'boolean', default: false },
     llm: { type: 'boolean', default: false },
     post: { type: 'boolean', default: false },
@@ -325,7 +328,10 @@ async function main() {
       const users = Users.load(cfg.mcp.usersFile);
       const sub = positionals[1];
       if (sub === 'list') {
-        for (const u of users.list()) console.log(`${u.name.padEnd(16)} ${u.role.padEnd(6)} ${u.slack_id ?? '-'}  $${u.usd_per_day ?? cfg.mcp.userDailyCapUsd}/day  added ${u.added_at.slice(0, 10)}`);
+        for (const u of users.list()) {
+          const exp = expiresAt(u);
+          console.log(`${u.name.padEnd(16)} ${u.role.padEnd(6)} ${u.slack_id ?? '-'}  $${u.usd_per_day ?? cfg.mcp.userDailyCapUsd}/day  ${exp > Date.now() ? `expires ${new Date(exp).toISOString().slice(0, 10)}` : 'EXPIRED'}  ${u.email ?? ''}`);
+        }
         return;
       }
       const name = positionals[2];
@@ -337,19 +343,22 @@ async function main() {
       if (sub !== 'add') throw new Error('usage: user add|list|remove');
       const usd = a.usd ? Number(a.usd) : undefined;
       if (usd !== undefined && !(usd > 0)) throw new Error('--usd must be a positive number');
-      const token = users.add(name, { admin: a.admin, ...(a.slack ? { slackId: a.slack } : {}), ...(usd ? { usdPerDay: usd } : {}) });
-      console.error(`${name} added (${a.admin ? 'admin' : 'member'}). Give them this token; it is not stored and won't be shown again:`);
+      const days = a.days ? Number(a.days) : undefined;
+      const token = users.add(name, { admin: a.admin, ...(a.slack ? { slackId: a.slack } : {}), ...(usd ? { usdPerDay: usd } : {}), ...(days ? { days } : {}) });
+      console.error(`${name} added (${a.admin ? 'admin' : 'member'}, expires in ${days ?? MAX_TOKEN_DAYS} days). Give them this token; it is not stored and won't be shown again:`);
       console.log(token);
       return;
     }
 
     case 'serve':
     case 'mcp-stdio': {
+      const users = Users.load(cfg.mcp.usersFile);
       const ctx: McpContext = {
         cfg,
         engine: makeEngine(cfg),
-        users: Users.load(cfg.mcp.usersFile),
+        users,
         repos: loadRepos(cfg.mcp.reposFile),
+        ...(cfg.mcp.login ? { login: new Login(cfg.mcp.login, users) } : {}),
         ...(cfg.mcp.notifySlack && cfg.slackWebhookUrl ? { notify: slackNotifier(cfg.slackWebhookUrl) } : {}),
         log,
       };
@@ -362,10 +371,10 @@ async function main() {
       }
       const host = a.host ?? '127.0.0.1';
       const port = Number(a.port ?? 8787);
-      if (!ctx.users.list().length) throw new Error('no users yet: add one with `user add <name> --admin`');
+      if (!ctx.users.list().length && !ctx.login) throw new Error('no users yet: add one with `user add <name> --admin`, or configure the Google login');
       const server = startHttp(ctx, { host, port });
       beforeExit = () => (server.close(), shutdown(ctx, 'engine shutting down', 20_000));
-      log(`MCP on http://${host}:${port}/mcp · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
+      log(`MCP on http://${host}:${port}/mcp · login ${ctx.login ? `at ${cfg.mcp.login!.publicUrl}/login` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
       if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
       const metrics = metricsServer(cfg);
       if (a.patrol) {
