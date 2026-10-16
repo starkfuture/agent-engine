@@ -184,6 +184,9 @@ for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 - Tokens expire after at most 90 days (`user add --days`). Hosted, people get their own at `<ENGINE_PUBLIC_URL>/login`: a Google login that must be a verified Workspace account on `ENGINE_LOGIN_DOMAIN` (the `hd` claim, not just the email address). Signing in again rotates the token. Admins are still made with the CLI.
 - CI: `agent-engine-ci.yml` gates PRs; a push to `main` builds one image and deploys both apps through argo-cd. Changes go through PRs.
 - Hosted repos: an entry in the repos file may be `name: { github: owner/repo, ref?: … }`. With `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY_FILE` (a GitHub App with contents: read), `serve` clones each into `ENGINE_REPOS_DIR/<name>` and fetches every 10 min. Clones are full with no checkout, so snapshots never need the network. The installation token reaches git through `GIT_CONFIG_*` environment variables, never argv or a stored config. Freshness per repo: `engine_repo_last_fetch_timestamp_seconds` and `engine_repo_sync_ok`.
+- A Google login renews only a user bound to the same email; it never adopts a CLI-made user (`user add --email` binds one). Each sign-in page names the MCP server after its deployment (`agent-engine`, `agent-engine-web`).
+- Retention (`serve`): run folders and cards older than `ENGINE_RETENTION_DAYS` (default 30) are deleted hourly; the SQLite ledger stays. New runs are refused below 200 MB free; `engine_data_free_bytes` feeds an alert.
+- Tempo: regex matches (`=~`, `!~`) are refused; exact matches only.
 - Runs are recorded with who asked. Per person: `ENGINE_USER_DAILY_CAP_USD` (default 10)
   and `ENGINE_USER_MAX_RUNNING` (default 2); per agent: `concurrency` in agent.yaml.
 - `ENGINE_NOTIFY_SLACK=1` with `SLACK_WEBHOOK_URL` @-mentions the requester when a run ends. Model text in Slack is escaped, so it can't ping (`<!channel>`) or hide links.

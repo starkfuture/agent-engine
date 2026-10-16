@@ -133,12 +133,14 @@ export class Login {
       return page(409, 'Ask an admin', `<p>${html((e as Error).message)}</p>`);
     }
     const mcp = `${this.cfg.publicUrl.replace(/\/$/, '')}/mcp`;
+    // One MCP name per deployment (agent-engine, agent-engine-web), so adding both doesn't collide.
+    const server = new URL(this.cfg.publicUrl).hostname.split('.')[0]!.replace(/[^a-z0-9-]/gi, '') || 'engine';
     return page(
       200,
       'Your agent-engine token',
       `<p>Signed in as <b>${html(email)}</b> (user <code>${html(issued.user.name)}</code>). This token is shown once and expires on <b>${html(issued.user.expires_at!.slice(0, 10))}</b>. Any older token of yours stopped working just now.</p>
 <p>Add the engine to Claude Code:</p>
-<pre>claude mcp add --transport http engine ${html(mcp)} --header "Authorization: Bearer ${html(issued.token)}"</pre>
+<pre>claude mcp add --transport http ${html(server)} ${html(mcp)} --header "Authorization: Bearer ${html(issued.token)}"</pre>
 <p>Keep it like a password. To renew it or after losing it, sign in here again.</p>`,
     );
   }

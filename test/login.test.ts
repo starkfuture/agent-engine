@@ -86,6 +86,25 @@ test('a login never takes over a user tied to another email; unknown state is re
   assert.equal(s.sent.length, 1, 'no code exchange for a forged state');
 });
 
+test('a login never adopts a CLI-made user, even an admin whose name matches the email', async (t) => {
+  const s = setup(good({ email: 'lead@starkfuture.com' }));
+  t.after(s.restore);
+  const admin = s.users.add('lead', { admin: true }); // an admin token handed out by name
+  const r = await s.back((await s.begin()).searchParams.get('state')!);
+  assert.equal(r.status, 409);
+  assert.equal(s.users.authenticate(admin)?.role, 'admin', 'the admin token still works');
+  assert.equal(s.users.list().length, 1);
+});
+
+test('the token page names the MCP server after the deployment', async (t) => {
+  const s = setup(good());
+  t.after(s.restore);
+  const login = new Login({ ...cfg, publicUrl: 'https://agent-engine-web.starkfuture.com' }, s.users);
+  const to = new URL((await login.handle(new URL('https://x/login'))).headers.location!);
+  const r = await login.handle(new URL(`https://x/login/callback?state=${to.searchParams.get('state')}&code=c`));
+  assert.match(r.body, /claude mcp add --transport http agent-engine-web https:\/\/agent-engine-web\.starkfuture\.com\/mcp/);
+});
+
 test('tokens expire: 90 days at most, an expired token is unknown', () => {
   const users = Users.load(join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json'));
   assert.throws(() => users.add('long', { days: 91 }), /1 to 90 days/);

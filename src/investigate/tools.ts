@@ -214,7 +214,7 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
     ),
     tool(
       'trace_search',
-      `Search traces (Tempo, TraceQL) in the last N minutes (at most ${TEMPO_MAX_MINUTES}: Tempo is shared); returns root service, operation, duration and trace ids. Match exact values; regexes starting with .* are refused.`,
+      `Search traces (Tempo, TraceQL) in the last N minutes (at most ${TEMPO_MAX_MINUTES}: Tempo is shared); returns root service, operation, duration and trace ids. Match exact values (=, !=); regex matches (=~, !~) are refused.`,
       { traceql: z.string().max(500).default('{ status = error }'), minutes: z.number().int().min(5).max(TEMPO_MAX_MINUTES).default(15), limit: z.number().int().min(1).max(200).default(50) },
       guard('trace_search', async ({ traceql, minutes, limit }) => {
         if (!tel.has.tempo) throw new Error('Tempo is not configured in this run');

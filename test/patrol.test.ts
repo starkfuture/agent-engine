@@ -14,7 +14,7 @@ import { loadAgent } from '../src/engine/agent.js';
 import { Store } from '../src/engine/store.js';
 import type { Session } from '../src/engine/session.js';
 import type { FlaggedRow } from '../src/patrol/summary.js';
-import { needsChallenge, patrolOnce, type MonitorAgent } from '../src/runner.js';
+import { needsChallenge, patrolOnce, type MonitorAgent, patrolLoop } from '../src/runner.js';
 import { fakeSession, ok } from './fake-session.js';
 import { DAY, FakeTelemetry, H, INCIDENT_START, world } from './fake.js';
 
@@ -41,7 +41,11 @@ const cfg = (): Config => ({
   agentsDir: join(import.meta.dirname, '..', 'agents'),
   runsDir: mkdtempSync(join(tmpdir(), 'sre-runs-')),
   slackWebhookUrl: undefined,
-  mcp: { usersFile: '/nonexistent', reposFile: '/nonexistent', userDailyCapUsd: 10, userMaxRunning: 2, notifySlack: false },
+  direct: undefined,
+  memoryDir: undefined,
+  build: undefined,
+  retentionDays: 30,
+  mcp: { usersFile: '/nonexistent', reposFile: '/nonexistent', userDailyCapUsd: 10, userMaxRunning: 2, notifySlack: false, allowedOrigins: [], agents: undefined, login: undefined, reposDir: undefined, reposGithub: undefined, githubApp: undefined },
 });
 
 test('incident rows are flagged, steady noise is not', async () => {
@@ -231,4 +235,32 @@ test('card redacts what the model wrote', () => {
   const c = reportCard(report({ what_broke: 'reset for jane@example.com returns 400' }), '2026-09-29T12:15:00Z', 'test');
   assert.ok(!c.markdown.includes('jane@example.com'));
   assert.ok(!JSON.stringify(c.blocks).includes('jane@example.com'));
+});
+
+test('the patrol loop runs with or without a metrics listener', async () => {
+  for (const listen of [false, true]) {
+    let queries = 0;
+    const counted = new Proxy(new FakeTelemetry(world), {
+      get(t, k, r) {
+        const v = Reflect.get(t, k, r);
+        return typeof v === 'function' ? (...args: unknown[]) => (queries++, v.apply(t, args)) : v;
+      },
+    });
+    const passes: Array<Date> = [];
+    await patrolLoop({
+      tel: counted,
+      cfg: cfg(),
+      noise: new Noise({}),
+      state: State.memory(),
+      sink: new CardSink(cfg().outDir),
+      windowMin: 15,
+      opts: { llm: false, post: false },
+      passes: 2,
+      now: () => new Date('2026-09-29T12:16:00Z'),
+      sleep: async () => {},
+      onPass: listen ? (at) => void passes.push(at) : undefined,
+    });
+    assert.ok(queries > 0, `patrol queried telemetry (listener: ${listen})`);
+    if (listen) assert.deepEqual(passes.map((d) => d.toISOString()), ['2026-09-29T12:15:00.000Z', '2026-09-29T12:15:00.000Z']);
+  }
 });

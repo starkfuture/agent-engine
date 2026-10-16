@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
+import { freeBytes } from './engine/retention.js';
 import type { Engine } from './engine/run.js';
 import type { SyncState } from './mcp/reposync.js';
 import type { PatrolResult } from './runner.js';
@@ -38,6 +39,8 @@ export class Metrics {
       }
     };
     gauge('engine_up', 'The engine process is serving.', [[{}, 1]]);
+    const free = freeBytes(engine.runsDir);
+    if (free !== undefined) gauge('engine_data_free_bytes', 'Free space on the runs volume.', [[{}, free]]);
     gauge('engine_stop_switch', '1 while the kill switch is set (new runs are skipped).', [[{}, existsSync(engine.stopFile) ? 1 : 0]]);
     if (this.lastRun) gauge('engine_patrol_last_run_timestamp_seconds', 'When the patrol last ran.', [[{}, Math.floor(this.lastRun.getTime() / 1000)]]);
     if (this.lastOk) gauge('engine_patrol_last_success_timestamp_seconds', 'When the patrol last finished without failing.', [[{}, Math.floor(this.lastOk.getTime() / 1000)]]);

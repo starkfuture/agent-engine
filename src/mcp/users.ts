@@ -101,12 +101,13 @@ export class Users {
   }
 
   // After a verified Google login: a new token for that person, replacing any
-  // old one. New people become members; an existing user keeps their role and
-  // caps. A name already tied to a different email is refused.
+  // old one. New people become members. An existing user is renewed only if
+  // bound to this same email: a login must never adopt a CLI-made user (an
+  // admin named `lead` would otherwise go to whoever owns lead@<domain>).
   issue(name: string, email: string, now = new Date()): { token: string; user: User } {
     this.refresh();
     const existing = this.users.find((u) => u.name === name);
-    if (existing?.email && existing.email !== email) throw new Error(`user ${name} belongs to another account`);
+    if (existing && existing.email !== email) throw new Error(`the name ${name} is taken by another account; ask an admin`);
     const { token, fields } = Users.fresh(undefined, now);
     const user = User.parse({ ...(existing ?? { name, role: 'member' }), ...fields, email, ...(existing ? { added_at: existing.added_at } : {}) });
     this.users = [...this.users.filter((u) => u.name !== name), user];

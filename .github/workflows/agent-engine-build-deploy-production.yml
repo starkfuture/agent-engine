@@ -4,7 +4,7 @@ run-name: agent-engine production deployment by @${{ github.actor }} from branch
 
 # One image, two apps: agent-engine (monitor + codebase; reads prod telemetry)
 # and agent-engine-web (research; internet only). A push to main deploys both,
-# so changes go through PRs. Production directly: the engine is read-only over
+# so changes go through PRs. Every push to main runs (no path filter). Production directly: the engine is read-only over
 # the platform.
 
 on:
@@ -17,22 +17,12 @@ on:
   push:
     branches:
       - main
-    paths:
-      - "src/**"
-      - "agents/**"
-      - "config/sources.yaml"
-      - "config/noise.yaml"
-      - "package.json"
-      - "package-lock.json"
-      - "tsconfig.json"
-      - "Dockerfile"
-      - ".github/workflows/agent-engine-build-deploy-production.yml"
-      - ".github/workflows/agent-engine-ci.yml"
 
 permissions: {}
 
+# One production deploy at a time, whatever the ref.
 concurrency:
-  group: deploy-${{ github.workflow }}-${{ github.ref }}
+  group: deploy-agent-engine-production
   cancel-in-progress: false
 
 jobs:
@@ -62,6 +52,8 @@ jobs:
           context: .
           sbom-service: agent-engine
           sbom-channel: production
+          build-args: |
+            ENGINE_BUILD=${{ github.sha }}
           dependency-track-api-key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
 
     outputs:
@@ -69,7 +61,8 @@ jobs:
 
   deploy-to-prod:
     needs: [build]
-    if: ${{ !inputs.skip-deploy }}
+    # Only main deploys; a manual run from another branch builds an image and stops.
+    if: ${{ github.ref == 'refs/heads/main' && !inputs.skip-deploy }}
     runs-on: kubernetes-runner-light-production
     timeout-minutes: 10
     strategy:

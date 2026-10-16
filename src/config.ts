@@ -62,6 +62,7 @@ export interface Config {
   memoryDir: string | undefined; // runtime lessons and proposals (a persistent volume when hosted); unset = in the agent folders
   runsDir: string;
   build: string | undefined; // engine code version (image tag or commit), recorded on every run
+  retentionDays: number; // run folders and cards older than this are deleted (serve)
   slackWebhookUrl: string | undefined;
   mcp: {
     usersFile: string; // hashed tokens, one per person (gitignored)
@@ -143,7 +144,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     agentsDir: r(env.ENGINE_AGENTS_DIR ?? 'agents'),
     memoryDir: env.ENGINE_MEMORY_DIR ? r(env.ENGINE_MEMORY_DIR) : undefined,
     runsDir: r(env.ENGINE_RUNS_DIR ?? 'runs'),
-    build: opt(env.ENGINE_BUILD),
+    build: opt(env.ENGINE_BUILD) === 'unknown' ? undefined : opt(env.ENGINE_BUILD),
+    retentionDays: num(env.ENGINE_RETENTION_DAYS, 30, 'ENGINE_RETENTION_DAYS'),
     slackWebhookUrl: opt(env.SLACK_WEBHOOK_URL),
     mcp: {
       usersFile: r(env.ENGINE_USERS_FILE ?? 'config/users.local.json'),

@@ -17,7 +17,7 @@ import { findingsOutput } from './engine/output.js';
 import { writeAnswer } from './engine/answer.js';
 import { runAgent, stopAllRuns, type Engine } from './engine/run.js';
 import { sdkSession } from './engine/session.js';
-import { patrolOnce, type MonitorAgent } from './runner.js';
+import { patrolLoop, patrolOnce, type MonitorAgent } from './runner.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { buildServer, shutdown, slackNotifier, startHttp, type McpContext } from './mcp/server.js';
 import { loadRepos } from './mcp/repos.js';
@@ -26,6 +26,7 @@ import { Login } from './mcp/login.js';
 import { InstallationTokens } from './mcp/github-app.js';
 import { RepoSync } from './mcp/reposync.js';
 import { Metrics, startMetrics } from './metrics.js';
+import { sweep } from './engine/retention.js';
 
 const USAGE = `engine <command> [options]
 
@@ -45,7 +46,7 @@ MCP server (several developers, one engine):
       --patrol [--llm] [--post]  also run the monitor's patrol loop in this process
       --metrics-port <n>      Prometheus metrics at /metrics on their own port (heartbeat)
   mcp-stdio --as <user>       the same tools over stdio, for one local user
-  user add <name> [--admin] [--slack <U…>] [--usd <per day>] [--days <n ≤ 90>]
+  user add <name> [--admin] [--email <google email>] [--slack <U…>] [--usd <per day>] [--days <n ≤ 90>]
                               issue a token (printed once; only its hash is stored; expires, default 90 days).
                               Hosted, people get theirs at <ENGINE_PUBLIC_URL>/login (Google, @starkfuture.com)
   user list | user remove <name>
@@ -86,6 +87,7 @@ const { positionals, values: a } = parseArgs({
     slack: { type: 'string' },
     usd: { type: 'string' },
     days: { type: 'string' },
+    email: { type: 'string' },
     challenge: { type: 'boolean', default: false },
     llm: { type: 'boolean', default: false },
     post: { type: 'boolean', default: false },
@@ -146,6 +148,7 @@ function makeEngine(cfg: Config, runsDir = cfg.runsDir): Engine {
   const build = engineBuild(cfg);
   return {
     ...(build ? { build } : {}),
+    minFreeBytes: 200e6, // keep room for logins, settlement and the ledger
     store: new Store(join(cfg.runsDir, 'engine.db')),
     runsDir,
     stopFile: join(cfg.runsDir, 'STOP'),
@@ -163,21 +166,18 @@ function monitorAgent(cfg: Config): MonitorAgent {
 const align = (d: Date, min: number) => new Date(Math.floor(d.getTime() / (min * 60_000)) * min * 60_000);
 
 // The patrol every window until the process ends; each pass lands in metrics.
-async function patrolLoop(cfg: Config, noise: Noise, sink: CardSink, w: number, metrics?: Metrics): Promise<never> {
-  const tel = telemetry(cfg);
-  const state = State.load(cfg.stateFile);
-  const monitor = a.llm ? monitorAgent(cfg) : undefined;
-  for (;;) {
-    const at = align(new Date(), w);
-    try {
-      metrics?.patrol(at, await patrolOnce(tel, cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log }, monitor));
-    } catch (e) {
-      metrics?.patrol(at);
-      log(`patrol failed: ${(e as Error).message}`);
-    }
-    const next = at.getTime() + w * 60_000 + 30_000; // 30 s after the boundary, so the last scrape is in
-    await new Promise((r) => setTimeout(r, Math.max(5_000, next - Date.now())));
-  }
+async function patrolEvery(cfg: Config, noise: Noise, sink: CardSink, w: number, metrics?: Metrics): Promise<void> {
+  await patrolLoop({
+    tel: telemetry(cfg),
+    cfg,
+    noise,
+    state: State.load(cfg.stateFile),
+    sink,
+    windowMin: w,
+    opts: { llm: a.llm, post: a.post, log },
+    monitor: a.llm ? monitorAgent(cfg) : undefined,
+    onPass: metrics ? (at, r) => metrics.patrol(at, r) : undefined,
+  });
 }
 
 function metricsServer(cfg: Config): Metrics | undefined {
@@ -346,7 +346,7 @@ async function main() {
       const usd = a.usd ? Number(a.usd) : undefined;
       if (usd !== undefined && !(usd > 0)) throw new Error('--usd must be a positive number');
       const days = a.days ? Number(a.days) : undefined;
-      const token = users.add(name, { admin: a.admin, ...(a.slack ? { slackId: a.slack } : {}), ...(usd ? { usdPerDay: usd } : {}), ...(days ? { days } : {}) });
+      const token = users.add(name, { admin: a.admin, ...(a.slack ? { slackId: a.slack } : {}), ...(usd ? { usdPerDay: usd } : {}), ...(days ? { days } : {}), ...(a.email ? { email: a.email.toLowerCase() } : {}) });
       console.error(`${name} added (${a.admin ? 'admin' : 'member'}, expires in ${days ?? MAX_TOKEN_DAYS} days). Give them this token; it is not stored and won't be shown again:`);
       console.log(token);
       return;
@@ -379,6 +379,17 @@ async function main() {
       log(`MCP on http://${host}:${port}/mcp · login ${ctx.login ? `at ${cfg.mcp.login!.publicUrl}/login` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
       if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
       const metrics = metricsServer(cfg);
+      // Retention: hourly, and once at start.
+      const clean = () => {
+        try {
+          const r = sweep({ runsDir: cfg.runsDir, outDir: cfg.outDir, days: cfg.retentionDays });
+          if (r.runs || r.cards) log(`retention: deleted ${r.runs} run folder(s) and ${r.cards} card(s) older than ${cfg.retentionDays} days`);
+        } catch (e) {
+          log(`retention failed: ${(e as Error).message}`);
+        }
+      };
+      clean();
+      setInterval(clean, 3600_000).unref();
       if (cfg.mcp.githubApp) {
         // Clone/fetch the `github:` repos as the GitHub App, now and every 10 min.
         const app = cfg.mcp.githubApp;
@@ -390,7 +401,7 @@ async function main() {
       }
       if (a.patrol) {
         log(`patrol every ${w} min in this process${a.llm ? ' with the investigator' : ''}`);
-        void patrolLoop(cfg, noise, sink, w, metrics);
+        void patrolEvery(cfg, noise, sink, w, metrics);
       }
       await new Promise(() => {}); // until killed
       return;
@@ -416,7 +427,7 @@ async function main() {
     }
 
     case 'loop':
-      return void (await patrolLoop(cfg, noise, sink, w, metricsServer(cfg)));
+      return void (await patrolEvery(cfg, noise, sink, w, metricsServer(cfg)));
 
     case 'export': {
       const from = align(date(a.from, 'from'), w);
