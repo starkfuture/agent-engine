@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { Engine } from './engine/run.js';
+import type { SyncState } from './mcp/reposync.js';
 import type { PatrolResult } from './runner.js';
 
 // Prometheus metrics for the heartbeat alert: is the engine up, is the patrol
@@ -11,6 +12,12 @@ export class Metrics {
   private lastRun?: Date;
   private lastOk?: Date;
   private sources: Array<{ source: string; ok: boolean }> = [];
+  private repos?: Map<string, SyncState>;
+
+  // The codebase agent's synced repos: how fresh each clone is.
+  repoSync(state: Map<string, SyncState>): void {
+    this.repos = state;
+  }
 
   patrol(at: Date, r?: PatrolResult): void {
     this.lastRun = at;
@@ -35,6 +42,11 @@ export class Metrics {
     if (this.lastRun) gauge('engine_patrol_last_run_timestamp_seconds', 'When the patrol last ran.', [[{}, Math.floor(this.lastRun.getTime() / 1000)]]);
     if (this.lastOk) gauge('engine_patrol_last_success_timestamp_seconds', 'When the patrol last finished without failing.', [[{}, Math.floor(this.lastOk.getTime() / 1000)]]);
     if (this.sources.length) gauge('engine_patrol_source_up', '0 when the last patrol could not read this source (a blind spot).', this.sources.map((s) => [{ source: s.source }, s.ok ? 1 : 0]));
+    if (this.repos?.size) {
+      const rows = [...this.repos];
+      gauge('engine_repo_last_fetch_timestamp_seconds', 'When each synced repo was last cloned or fetched (absent: never).', rows.filter(([, s]) => s.lastFetch).map(([repo, s]) => [{ repo }, Math.floor(s.lastFetch!.getTime() / 1000)]));
+      gauge('engine_repo_sync_ok', '0 when the last sync of this repo failed.', rows.map(([repo, s]) => [{ repo }, s.lastError ? 0 : 1]));
+    }
     gauge('engine_runs_today', 'Runs started today (UTC), by agent and status.', engine.store.counts(day).map((c) => [{ agent: c.agent, status: c.status }, c.n]));
     gauge('engine_spend_usd', 'Spend booked so far (running runs count their reservation).', [
       [{ period: 'day' }, engine.store.spent(day)],

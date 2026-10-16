@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { loadConfig, loadDotEnv, type Config } from './config.js';
@@ -23,6 +23,8 @@ import { buildServer, shutdown, slackNotifier, startHttp, type McpContext } from
 import { loadRepos } from './mcp/repos.js';
 import { expiresAt, MAX_TOKEN_DAYS, Users } from './mcp/users.js';
 import { Login } from './mcp/login.js';
+import { InstallationTokens } from './mcp/github-app.js';
+import { RepoSync } from './mcp/reposync.js';
 import { Metrics, startMetrics } from './metrics.js';
 
 const USAGE = `engine <command> [options]
@@ -357,7 +359,7 @@ async function main() {
         cfg,
         engine: makeEngine(cfg),
         users,
-        repos: loadRepos(cfg.mcp.reposFile),
+        repos: loadRepos(cfg.mcp.reposFile, cfg.mcp.reposDir),
         ...(cfg.mcp.login ? { login: new Login(cfg.mcp.login, users) } : {}),
         ...(cfg.mcp.notifySlack && cfg.slackWebhookUrl ? { notify: slackNotifier(cfg.slackWebhookUrl) } : {}),
         log,
@@ -377,6 +379,15 @@ async function main() {
       log(`MCP on http://${host}:${port}/mcp · login ${ctx.login ? `at ${cfg.mcp.login!.publicUrl}/login` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
       if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
       const metrics = metricsServer(cfg);
+      if (cfg.mcp.githubApp) {
+        // Clone/fetch the `github:` repos as the GitHub App, now and every 10 min.
+        const app = cfg.mcp.githubApp;
+        const tokens = new InstallationTokens({ appId: app.appId, installationId: app.installationId, privateKey: readFileSync(app.privateKeyFile, 'utf8') });
+        const sync = new RepoSync(ctx.repos, { token: () => tokens.token(), log });
+        sync.start();
+        metrics?.repoSync(sync.state);
+        log(`repo sync every 10 min: ${[...sync.state.keys()].join(', ') || 'no github repos'}`);
+      }
       if (a.patrol) {
         log(`patrol every ${w} min in this process${a.llm ? ' with the investigator' : ''}`);
         void patrolLoop(cfg, noise, sink, w, metrics);
