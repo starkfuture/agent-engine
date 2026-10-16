@@ -29,9 +29,23 @@ export interface RepoEntry extends Root {
   github?: string; // owner/name, synced by the engine
 }
 
-export function loadRepos(file: string, reposDir?: string): Map<string, RepoEntry> {
-  if (!existsSync(file)) return new Map();
-  const { repos } = ReposFile.parse(parse(readFileSync(file, 'utf8')) ?? { repos: {} });
+// ENGINE_REPOS_GITHUB, for hosts that only take env (the Helm chart):
+// "backend-nest=starkfuture/backend-nest,admin-next=starkfuture/admin-next@main".
+export function parseGithubRepos(spec: string): Record<string, { github: string; ref?: string }> {
+  const out: Record<string, { github: string; ref?: string }> = {};
+  for (const item of spec.split(',').map((s) => s.trim()).filter(Boolean)) {
+    const m = /^([^=]+)=([^@]+)(?:@(.+))?$/.exec(item);
+    if (!m) throw new Error(`ENGINE_REPOS_GITHUB: "${item}" is not name=owner/repo[@ref]`);
+    out[m[1]!.trim()] = { github: m[2]!.trim(), ...(m[3] ? { ref: m[3].trim() } : {}) };
+  }
+  return out;
+}
+
+export function loadRepos(file: string, reposDir?: string, githubSpec?: string): Map<string, RepoEntry> {
+  const fromFile = existsSync(file) ? (parse(readFileSync(file, 'utf8')) ?? { repos: {} }) : { repos: {} };
+  const fromEnv = githubSpec ? parseGithubRepos(githubSpec) : {};
+  for (const name of Object.keys(fromEnv)) if (name in (fromFile.repos ?? {})) throw new Error(`repo ${name} is in both the repos file and ENGINE_REPOS_GITHUB`);
+  const { repos } = ReposFile.parse({ repos: { ...(fromFile.repos ?? {}), ...fromEnv } });
   return new Map(
     Object.entries(repos).map(([name, e]) => {
       const { path: p, ref, github } = typeof e === 'string' ? { path: e, ref: undefined, github: undefined } : e;

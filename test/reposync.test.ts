@@ -148,6 +148,13 @@ test('repos file: github entries clone into the repos dir', () => {
   assert.deepEqual(m.get('pinned'), { path: '/data/repos/pinned', github: 'starkfuture/admin-next', ref: 'origin/main' });
   assert.deepEqual(m.get('local'), { path: '/abs/here' });
   assert.throws(() => loadRepos(f), /ENGINE_REPOS_DIR/);
+
+  // Env form, for the Helm chart (env only).
+  const env = loadRepos('/nonexistent', '/data/repos', 'backend-nest=starkfuture/backend-nest, admin-next=starkfuture/admin-next@main');
+  assert.deepEqual(env.get('backend-nest'), { path: '/data/repos/backend-nest', github: 'starkfuture/backend-nest' });
+  assert.deepEqual(env.get('admin-next'), { path: '/data/repos/admin-next', ref: 'main', github: 'starkfuture/admin-next' });
+  assert.throws(() => loadRepos('/nonexistent', '/data/repos', 'oops'), /name=owner\/repo/);
+  assert.throws(() => loadRepos('/nonexistent', '/data/repos', 'x=a/b@--upload-pack=evil'));
   writeFileSync(f, 'repos:\n  bad: { ref: main }\n');
   assert.throws(() => loadRepos(f), /path or github/);
 });

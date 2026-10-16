@@ -359,7 +359,7 @@ async function main() {
         cfg,
         engine: makeEngine(cfg),
         users,
-        repos: loadRepos(cfg.mcp.reposFile, cfg.mcp.reposDir),
+        repos: loadRepos(cfg.mcp.reposFile, cfg.mcp.reposDir, cfg.mcp.reposGithub),
         ...(cfg.mcp.login ? { login: new Login(cfg.mcp.login, users) } : {}),
         ...(cfg.mcp.notifySlack && cfg.slackWebhookUrl ? { notify: slackNotifier(cfg.slackWebhookUrl) } : {}),
         log,

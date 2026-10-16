@@ -76,6 +76,7 @@ export interface Config {
     // Google login that issues tokens (GOOGLE_CLIENT_ID/SECRET, ENGINE_PUBLIC_URL).
     login: { clientId: string; clientSecret: string; publicUrl: string; domain: string } | undefined;
     reposDir: string | undefined; // where the engine clones `github:` repos (a persistent volume when hosted)
+    reposGithub: string | undefined; // ENGINE_REPOS_GITHUB: name=owner/repo[@ref],… (env-only hosts)
     // GitHub App (contents: read) the engine fetches those repos as.
     githubApp: { appId: string; installationId: string; privateKeyFile: string } | undefined;
   };
@@ -154,6 +155,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
       agents: env.ENGINE_AGENTS ? env.ENGINE_AGENTS.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
       login: loginConfig(env),
       reposDir: env.ENGINE_REPOS_DIR ? r(env.ENGINE_REPOS_DIR) : undefined,
+      reposGithub: opt(env.ENGINE_REPOS_GITHUB),
       githubApp:
         env.GITHUB_APP_ID && env.GITHUB_APP_INSTALLATION_ID && env.GITHUB_APP_PRIVATE_KEY_FILE
           ? { appId: env.GITHUB_APP_ID, installationId: env.GITHUB_APP_INSTALLATION_ID, privateKeyFile: expandHome(env.GITHUB_APP_PRIVATE_KEY_FILE) }
