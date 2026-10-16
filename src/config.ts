@@ -73,6 +73,9 @@ export interface Config {
     // Agents this server offers (ENGINE_AGENTS=monitor,codebase); unset = all.
     // Hosted, web-reading agents run in their own deployment, away from prod data.
     agents: string[] | undefined;
+    reposDir: string | undefined; // where the engine clones `github:` repos (a persistent volume when hosted)
+    // GitHub App (contents: read) the engine fetches those repos as.
+    githubApp: { appId: string; installationId: string; privateKeyFile: string } | undefined;
   };
 }
 
@@ -138,6 +141,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
       notifySlack: env.ENGINE_NOTIFY_SLACK === '1',
       allowedOrigins: (env.ENGINE_ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
       agents: env.ENGINE_AGENTS ? env.ENGINE_AGENTS.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+      reposDir: env.ENGINE_REPOS_DIR ? r(env.ENGINE_REPOS_DIR) : undefined,
+      githubApp:
+        env.GITHUB_APP_ID && env.GITHUB_APP_INSTALLATION_ID && env.GITHUB_APP_PRIVATE_KEY_FILE
+          ? { appId: env.GITHUB_APP_ID, installationId: env.GITHUB_APP_INSTALLATION_ID, privateKeyFile: expandHome(env.GITHUB_APP_PRIVATE_KEY_FILE) }
+          : undefined,
     },
   };
 }
