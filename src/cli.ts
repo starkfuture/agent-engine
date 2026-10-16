@@ -50,6 +50,9 @@ MCP server (several developers, one engine):
                               issue a token (printed once; only its hash is stored; expires, default 90 days).
                               Hosted, people get theirs at <ENGINE_PUBLIC_URL>/login (Google, @starkfuture.com)
   user list | user remove <name>
+  user promote | demote <name>  make a user admin or member (no token is issued).
+                              With the Google login on, \`user add\` is off: everyone,
+                              admins too, gets a token by signing in; then promote them
 
 Monitor:
   doctor                      check access, list datasources, show real metric labels
@@ -342,7 +345,14 @@ async function main() {
         console.log(users.remove(name) ? `${name} removed; their token no longer works` : `no user ${name}`);
         return;
       }
-      if (sub !== 'add') throw new Error('usage: user add|list|remove');
+      if (sub === 'promote' || sub === 'demote') {
+        const role = sub === 'promote' ? 'admin' : 'member';
+        console.log(users.setRole(name, role) ? `${name} is now ${role}` : `no user ${name} (they sign in first)`);
+        return;
+      }
+      if (sub !== 'add') throw new Error('usage: user add|list|remove|promote|demote');
+      // DevOps: tokens only after a company Google login. Hosted, the CLI can't mint one.
+      if (cfg.mcp.login) throw new Error(`the Google login is on: people get their token at ${cfg.mcp.login.publicUrl}/login; then \`user promote <name>\` for admins`);
       const usd = a.usd ? Number(a.usd) : undefined;
       if (usd !== undefined && !(usd > 0)) throw new Error('--usd must be a positive number');
       const days = a.days ? Number(a.days) : undefined;

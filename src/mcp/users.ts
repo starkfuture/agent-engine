@@ -121,6 +121,16 @@ export class Users {
     return { token, fields: { token_sha256: sha(token).toString('hex'), added_at: now.toISOString(), expires_at: new Date(now.getTime() + days * DAY).toISOString() } };
   }
 
+  // Change what an existing user may do; never issues a token.
+  setRole(name: string, role: User['role']): boolean {
+    this.refresh();
+    const u = this.users.find((x) => x.name === name);
+    if (!u) return false;
+    this.users = this.users.map((x) => (x.name === name ? { ...x, role } : x));
+    this.save();
+    return true;
+  }
+
   remove(name: string): boolean {
     this.refresh();
     const before = this.users.length;

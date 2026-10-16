@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -116,4 +117,23 @@ test('tokens expire: 90 days at most, an expired token is unknown', () => {
 test('login names come from the email local part', () => {
   assert.equal(nameFromEmail('Ana.Lopez@starkfuture.com'), 'ana.lopez');
   assert.equal(nameFromEmail('1st+x@starkfuture.com'), 'u1st-x');
+});
+
+test('with the Google login on, the CLI cannot mint tokens; admins are promoted after signing in', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cli-'));
+  const file = join(dir, 'users.json');
+  const env = { ...process.env, ENGINE_USERS_FILE: file, GOOGLE_CLIENT_ID: 'cid', GOOGLE_CLIENT_SECRET: 'shh', ENGINE_PUBLIC_URL: 'https://agent-engine.starkfuture.com', ANTHROPIC_API_KEY: '' };
+  const cli = (...args: string[]) => spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--import', 'tsx', 'src/cli.ts', ...args], { cwd: join(import.meta.dirname, '..'), env, encoding: 'utf8' });
+
+  const add = cli('user', 'add', 'lead', '--admin');
+  assert.notEqual(add.status, 0);
+  assert.match(add.stderr, /people get their token at https:\/\/agent-engine\.starkfuture\.com\/login/);
+  assert.ok(!/eng_/.test(add.stdout), 'no token printed');
+
+  // Someone signs in (a login-issued user), then an admin promotes them.
+  const users = Users.load(file);
+  const { token } = users.issue('ana', 'ana@starkfuture.com');
+  assert.match(cli('user', 'promote', 'ana').stdout, /ana is now admin/);
+  assert.equal(Users.load(file).authenticate(token)?.role, 'admin');
+  assert.match(cli('user', 'promote', 'nobody').stdout, /no user nobody/);
 });
