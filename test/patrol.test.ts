@@ -112,6 +112,20 @@ test('a failing source is a blind spot, not a crash, and does not mute other sou
   assert.deepEqual(s.sources.find((x) => x.source === 'http:broken'), { source: 'http:broken', ok: false, error: 'timeout' });
 });
 
+test('a source that answers with no series is blind, not healthy', async () => {
+  // kube-state-metrics stopped being scraped, and an HTTP family whose counter is gone:
+  // Prometheus answers 200 with empty vectors, which looks exactly like a quiet system.
+  const c = cfg();
+  c.sources.http_families.push({ id: 'gone', selector: 'gone_requests_total', service: 'x', route_label: 'route', status_label: 'code' });
+  const tel = new FakeTelemetry((q, at) => (q.startsWith('count(kube_') ? [] : world(q, at)));
+  const s = await buildSummary(tel, c, new Noise({}), State.memory(), new Date('2026-09-29T12:15:00Z'));
+  const blind = Object.fromEntries(s.sources.filter((x) => !x.ok).map((x) => [x.source, x.error]));
+  assert.match(blind.workloads ?? '', /no kube-state-metrics series/);
+  assert.match(blind['http:gone'] ?? '', /no HTTP request series for gone_requests_total/);
+  assert.equal(s.sources.find((x) => x.source === 'http:v3' || x.source.startsWith('http:') && x.source !== 'http:gone')?.ok, true, 'a family with data stays healthy');
+  assert.equal(s.send.length, 2, 'the incident is still reported');
+});
+
 test('quiet patrol costs nothing and writes no card', async () => {
   const c = cfg();
   const r = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-28T12:15:00Z'), { llm: true, post: false });

@@ -33,6 +33,15 @@ async function fourWay(
   return out;
 }
 
+// A source that answers with no series at all is blind, not healthy: an empty
+// result is also what a stopped scrape looks like once its series age out, and
+// the patrol would report "nothing wrong" for as long as it lasts. Not used for
+// error counters: a labelled counter has no series until its first error.
+export async function requireSeries(tel: Telemetry, selector: string, at: Date, what: string): Promise<void> {
+  const r = await tel.promInstant(`count(${selector})`, at);
+  if (!r.length || !(r[0]!.value > 0)) throw new Error(`no ${what} series for ${selector} (missing data, not a quiet system)`);
+}
+
 const round = (c: Counts): Counts => ({
   now: Math.round(c.now),
   h1: Math.round(c.h1),
@@ -52,7 +61,10 @@ export async function collectHttp(tel: Telemetry, f: HttpFamily, at: Date, windo
   const routeOf = (l: Record<string, string>) => (f.route_label ? (l[f.route_label] ?? '?') : '*');
   const statusOf = (l: Record<string, string>) => l[f.status_label] ?? '?';
 
-  const cells = await fourWay(tel, query, at, (s) => `${svcOf(s.labels)}\u0000${routeOf(s.labels)}\u0000${statusOf(s.labels)}`);
+  const [cells] = await Promise.all([
+    fourWay(tel, query, at, (s) => `${svcOf(s.labels)}\u0000${routeOf(s.labels)}\u0000${statusOf(s.labels)}`),
+    requireSeries(tel, f.selector, at, 'HTTP request'),
+  ]);
   const routeTotals = new Map<string, Counts>();
   const svcTotals = new Map<string, Counts>();
   for (const [k, { counts }] of cells) {
@@ -145,6 +157,8 @@ export async function collectWorkloads(tel: Telemetry, nsRegex: string, at: Date
     tel.promInstant(reasonsQ, at),
     fourWay(tel, waitingQ, at, (s) => `${s.labels.namespace}/${workloadOf(s.labels.pod ?? '?')}/${s.labels.container}/${s.labels.reason}`),
     fourWay(tel, unavailQ, at, (s) => `${s.labels.namespace}/${s.labels.deployment}`),
+    // kube-state-metrics: every query above reads its series.
+    requireSeries(tel, `kube_pod_container_status_restarts_total{${ns}}`, at, 'kube-state-metrics'),
   ]);
 
   const lastReason = new Map<string, string>();

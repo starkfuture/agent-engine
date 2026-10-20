@@ -187,6 +187,7 @@ for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 - A Google login renews only a user bound to the same email; it never adopts a CLI-made user. With the login on, `user add` is refused: everyone, admins included, gets a token by signing in, then `user promote <name>` makes an admin (no token is minted). Each sign-in page names the MCP server after its deployment (`agent-engine`, `agent-engine-web`).
 - Retention (`serve`): run folders and cards older than `ENGINE_RETENTION_DAYS` (default 30) are deleted hourly; the SQLite ledger stays. New runs are refused below 200 MB free; `engine_data_free_bytes` feeds an alert.
 - Tempo: regex matches (`=~`, `!~`) are refused; exact matches only.
+- A source that answers with no series at all is reported blind, not healthy: each HTTP family and the workloads source (kube-state-metrics) run a `count(...)` presence check, so a stopped scrape fires the blind-spot alert instead of looking like a quiet system. Error counters are exempt: a labelled counter has no series until its first error.
 - Runs are recorded with who asked. Per person: `ENGINE_USER_DAILY_CAP_USD` (default 10)
   and `ENGINE_USER_MAX_RUNNING` (default 2); per agent: `concurrency` in agent.yaml.
 - `ENGINE_NOTIFY_SLACK=1` with `SLACK_WEBHOOK_URL` @-mentions the requester when a run ends. Model text in Slack is escaped, so it can't ping (`<!channel>`) or hide links.
