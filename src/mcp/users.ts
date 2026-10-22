@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 
@@ -98,58 +98,89 @@ export class Users {
     return found && expiresAt(found) > now.getTime() ? found : undefined;
   }
 
+  // Every change re-reads the file under a lock, changes it and saves it, so a
+  // CLI command and the server can't undo each other's edits (a removal
+  // racing an invite must not come back).
+  private mutate<T>(fn: (users: User[]) => { users: User[]; result: T }): T {
+    return withLock(`${this.file}.lock`, () => {
+      const current = existsSync(this.file) ? Users.read(this.file) : []; // unparseable: throws, never clobbers
+      const { users, result } = fn(current);
+      this.users = users;
+      this.save();
+      return result;
+    });
+  }
+
   add(name: string, opts: { admin?: boolean; slackId?: string; usdPerDay?: number; days?: number; email?: string } = {}): string {
-    this.refresh();
-    if (this.users.some((u) => u.name === name)) throw new Error(`user ${name} exists; remove it first to issue a new token`);
-    const { token, fields } = Users.fresh(opts.days);
-    this.users.push(
-      User.parse({
+    return this.mutate((users) => {
+      if (users.some((u) => u.name === name)) throw new Error(`user ${name} exists; remove it first to issue a new token`);
+      const { token, fields } = Users.fresh(opts.days);
+      const user = User.parse({
         name,
         role: opts.admin ? 'admin' : 'member',
         ...fields,
         ...(opts.slackId ? { slack_id: opts.slackId } : {}),
         ...(opts.usdPerDay ? { usd_per_day: opts.usdPerDay } : {}),
         ...(opts.email ? { email: opts.email } : {}),
-      }),
-    );
-    this.save();
-    return token;
+      });
+      return { users: [...users, user], result: token };
+    });
   }
 
   // An admin lets an email in: a user bound to that email, with no token until
   // they sign in. Inviting an existing email only changes its role when asked.
   invite(email: string, opts: { admin?: boolean } = {}, now = new Date()): User {
-    this.refresh();
     const e = email.toLowerCase();
-    const existing = this.users.find((u) => u.email === e);
-    if (existing) {
-      if (opts.admin && existing.role !== 'admin') this.setRole(existing.name, 'admin');
-      return this.users.find((u) => u.email === e)!;
-    }
-    const name = nameFromEmail(e);
-    if (this.users.some((u) => u.name === name)) throw new Error(`the name ${name} is taken by another user; remove it first`);
-    const user = User.parse({ name, role: opts.admin ? 'admin' : 'member', email: e, added_at: now.toISOString() });
-    this.users.push(user);
-    this.save();
-    return user;
+    return this.mutate((users) => {
+      const existing = users.find((u) => u.email === e);
+      if (existing) {
+        const user = opts.admin ? { ...existing, role: 'admin' as const } : existing;
+        return { users: users.map((u) => (u === existing ? user : u)), result: user };
+      }
+      const name = nameFromEmail(e);
+      if (users.some((u) => u.name === name)) throw new Error(`the name ${name} is taken by another user; remove it first`);
+      const user = User.parse({ name, role: opts.admin ? 'admin' : 'member', email: e, added_at: now.toISOString() });
+      return { users: [...users, user], result: user };
+    });
+  }
+
+  // ENGINE_ADMINS seeds the first admins, as invites, only while the file has
+  // no admin at all. After that the file alone decides: removing or demoting a
+  // listed person sticks. (Removing every admin and restarting reseeds: the
+  // way back in for whoever controls the secret.)
+  seedAdmins(emails: readonly string[], now = new Date()): string[] {
+    if (!emails.length) return [];
+    return this.mutate((users) => {
+      if (users.some((u) => u.role === 'admin')) return { users, result: [] };
+      const seeded: string[] = [];
+      for (const raw of emails) {
+        const e = raw.toLowerCase();
+        const i = users.findIndex((u) => u.email === e);
+        if (i >= 0) users = users.map((u, j) => (j === i ? { ...u, role: 'admin' as const } : u));
+        else {
+          const name = nameFromEmail(e);
+          if (users.some((u) => u.name === name)) throw new Error(`ENGINE_ADMINS: the name ${name} is taken by another user`);
+          users = [...users, User.parse({ name, role: 'admin', email: e, added_at: now.toISOString() })];
+        }
+        seeded.push(e);
+      }
+      return { users, result: seeded };
+    });
   }
 
   // After a verified Google login: a new token for that person, replacing any
-  // old one, but only for an email an admin invited (or one listed as an admin
-  // in ENGINE_ADMINS, so the first admin can get in). A login never adopts a
-  // user bound to another email, nor one made without an email.
-  issue(email: string, now = new Date(), admins: readonly string[] = []): { token: string; user: User } {
-    this.refresh();
+  // old one, but only for an email in the users file (invited by an admin, or
+  // seeded from ENGINE_ADMINS). A login never adopts a user bound to another
+  // email, nor one made without an email, and never changes a role.
+  issue(email: string, now = new Date()): { token: string; user: User } {
     const e = email.toLowerCase();
-    const bootstrap = admins.map((a) => a.toLowerCase()).includes(e);
-    let existing = this.users.find((u) => u.email === e);
-    if (!existing && !bootstrap) throw new NotInvited(e);
-    if (!existing) existing = this.invite(e, { admin: true }, now);
-    const { token, fields } = Users.fresh(undefined, now);
-    const user = User.parse({ ...existing, ...fields, added_at: existing.added_at, ...(bootstrap ? { role: 'admin' } : {}) });
-    this.users = [...this.users.filter((u) => u.name !== existing.name), user];
-    this.save();
-    return { token, user };
+    return this.mutate((users) => {
+      const existing = users.find((u) => u.email === e);
+      if (!existing) throw new NotInvited(e);
+      const { token, fields } = Users.fresh(undefined, now);
+      const user = User.parse({ ...existing, ...fields, added_at: existing.added_at });
+      return { users: users.map((u) => (u === existing ? user : u)), result: { token, user } };
+    });
   }
 
   private static fresh(days = MAX_TOKEN_DAYS, now = new Date()): { token: string; fields: { token_sha256: string; added_at: string; expires_at: string } } {
@@ -160,29 +191,62 @@ export class Users {
 
   // Change what an existing user may do; never issues a token.
   setRole(name: string, role: User['role']): boolean {
-    this.refresh();
-    const u = this.users.find((x) => x.name === name);
-    if (!u) return false;
-    this.users = this.users.map((x) => (x.name === name ? { ...x, role } : x));
-    this.save();
-    return true;
+    return this.mutate((users) => {
+      if (!users.some((u) => u.name === name)) return { users, result: false };
+      return { users: users.map((u) => (u.name === name ? { ...u, role } : u)), result: true };
+    });
   }
 
   remove(name: string): boolean {
-    this.refresh();
-    const before = this.users.length;
-    this.users = this.users.filter((u) => u.name !== name);
-    if (this.users.length === before) return false;
-    this.save();
-    return true;
+    return this.mutate((users) => {
+      const left = users.filter((u) => u.name !== name);
+      return { users: left, result: left.length !== users.length };
+    });
   }
 
   private save(): void {
     mkdirSync(dirname(this.file), { recursive: true });
-    const tmp = `${this.file}.tmp`;
+    const tmp = `${this.file}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify({ users: this.users }, null, 1) + '\n', { mode: 0o600 });
     renameSync(tmp, this.file);
     chmodSync(this.file, 0o600);
     this.stamp = Users.stampOf(this.file);
+  }
+}
+
+// A lock file shared by every process writing the users file (the server and
+// a CLI run in the same pod). Writes are rare and short, so wait briefly; a
+// lock older than LOCK_STALE_MS is left over from a crash and is taken over.
+export const LOCK_WAIT_MS = 3000;
+const LOCK_STALE_MS = 30_000;
+function withLock<T>(lock: string, fn: () => T): T {
+  mkdirSync(dirname(lock), { recursive: true });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      closeSync(openSync(lock, 'wx', 0o600));
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) {
+          unlinkSync(lock);
+          continue;
+        }
+      } catch {
+        continue; // released meanwhile
+      }
+      if (Date.now() > deadline) throw new Error('the users file is busy (locked by another process); try again');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      unlinkSync(lock);
+    } catch {
+      /* already gone */
+    }
   }
 }

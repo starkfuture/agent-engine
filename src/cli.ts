@@ -391,7 +391,12 @@ async function main() {
       const host = a.host ?? '127.0.0.1';
       const port = Number(a.port ?? 8787);
       if (!ctx.users.list().length && !ctx.login) throw new Error('no users yet: add one with `user add <name> --admin`, or configure the Google login');
-      if (ctx.login && !ctx.users.list().length && !cfg.mcp.login!.admins.length) throw new Error('the Google login is on but nobody may sign in: set ENGINE_ADMINS (first admins) or `user invite <email> --admin`');
+      if (ctx.login) {
+        // ENGINE_ADMINS seeds the first admins (as invites) only while the file has none.
+        const seeded = ctx.users.seedAdmins(cfg.mcp.login!.admins);
+        if (seeded.length) log(`seeded admins from ENGINE_ADMINS: ${seeded.join(', ')}`);
+        if (!ctx.users.list().some((u) => u.role === 'admin')) throw new Error('the Google login is on but there is no admin to invite anyone: set ENGINE_ADMINS or `user invite <email> --admin`');
+      }
       const server = startHttp(ctx, { host, port });
       beforeExit = () => (server.close(), shutdown(ctx, 'engine shutting down', 20_000));
       log(`MCP on http://${host}:${port}/mcp · login ${ctx.login ? `at ${cfg.mcp.login!.publicUrl}/login` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);

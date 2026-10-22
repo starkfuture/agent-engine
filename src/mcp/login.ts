@@ -13,7 +13,6 @@ export interface LoginConfig {
   clientSecret: string;
   publicUrl: string; // https://agent-engine.<internal domain>, the address people open
   domain: string; // starkfuture.com
-  admins?: string[]; // ENGINE_ADMINS: emails that may sign in before anyone invited them, as admins
 }
 
 export interface LoginResponse {
@@ -123,7 +122,7 @@ export class Login {
 
     let issued;
     try {
-      issued = this.users.issue(email, new Date(this.now()), this.cfg.admins ?? []);
+      issued = this.users.issue(email, new Date(this.now()));
     } catch (e) {
       if (e instanceof NotInvited) return page(403, 'Not on the list yet', `<p>Signed in as <b>${html(email)}</b>, but an engine admin hasn't added you. Ask one to invite you, then sign in again.</p>`);
       return page(409, 'Ask an admin', `<p>${html((e as Error).message)}</p>`);

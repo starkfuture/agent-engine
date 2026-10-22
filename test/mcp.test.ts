@@ -116,6 +116,12 @@ test('only admins manage users; invites never mint a token and stay on the compa
   assert.match((await call('list_users')).text, /^cy +member invited +cy@starkfuture\.com$/m);
   assert.match((await call('remove_user', { name: 'root' })).text, /cannot remove yourself/);
   assert.match((await call('remove_user', { name: 'cy' })).text, /cy removed/);
+
+  // Removed (or demoted) after its request was authenticated: no admin action completes.
+  ctx.users.setRole('root', 'member');
+  assert.match((await call('invite_user', { email: 'root2@starkfuture.com', admin: true })).text, /no longer an admin/);
+  assert.match((await call('stop_all', { reason: 'testing' })).text, /no longer an admin/);
+  assert.equal(ctx.users.list().some((u) => u.email === 'root2@starkfuture.com'), false);
 });
 
 test('only admins get the kill switch and lesson approval', async () => {

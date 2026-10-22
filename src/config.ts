@@ -75,7 +75,8 @@ export interface Config {
     // Hosted, web-reading agents run in their own deployment, away from prod data.
     agents: string[] | undefined;
     // Google login that issues tokens (GOOGLE_CLIENT_ID/SECRET, ENGINE_PUBLIC_URL).
-    // admins: ENGINE_ADMINS, emails that may sign in before anyone invited them (as admins).
+    // admins: ENGINE_ADMINS, the first admins: seeded into the users file (as invites)
+    // at startup while it has no admin. Sign-in is decided by the file alone.
     login: { clientId: string; clientSecret: string; publicUrl: string; domain: string; admins: string[] } | undefined;
     reposDir: string | undefined; // where the engine clones `github:` repos (a persistent volume when hosted)
     reposGithub: string | undefined; // ENGINE_REPOS_GITHUB: name=owner/repo[@ref],… (env-only hosts)

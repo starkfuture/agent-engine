@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { Login, nameFromEmail } from '../src/mcp/login.js';
-import { Users } from '../src/mcp/users.js';
+import { LOCK_WAIT_MS, Users } from '../src/mcp/users.js';
 
 const cfg = { clientId: 'cid.apps.googleusercontent.com', clientSecret: 'shh', publicUrl: 'https://agent-engine.internal.test', domain: 'starkfuture.com' };
 const jwt = (claims: Record<string, unknown>) => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.sig`;
@@ -20,7 +20,8 @@ function setup(idClaims: Record<string, unknown>, opts: { invite?: string; admin
     return new Response(JSON.stringify({ id_token: jwt(idClaims) }), { status: 200 });
   }) as typeof fetch;
   if (opts.invite) users.invite(opts.invite);
-  const login = new Login({ ...cfg, admins: opts.admins ?? [] }, users);
+  if (opts.admins) users.seedAdmins(opts.admins);
+  const login = new Login(cfg, users);
   const begin = async () => {
     const r = await login.handle(new URL('https://x/login'));
     assert.equal(r.status, 302);
@@ -108,7 +109,7 @@ test('the token page names the MCP server after the deployment', async (t) => {
   assert.match(r.body, /claude mcp add --transport http agent-engine-web https:\/\/agent-engine-web\.starkfuture\.com\/mcp/);
 });
 
-test('a company account that was not invited gets no token; ENGINE_ADMINS can bootstrap the first admin', async (t) => {
+test('a company account that was not invited gets no token; ENGINE_ADMINS seeds the first admin', async (t) => {
   const s = setup(good({ email: 'stranger@starkfuture.com' }));
   t.after(s.restore);
   const r = await s.back((await s.begin()).searchParams.get('state')!);
@@ -136,6 +137,36 @@ test('invited users renew by signing in; once removed, they can neither use nor 
   assert.ok(s.users.remove('bo'));
   assert.equal(s.users.authenticate(first), undefined);
   assert.equal((await s.back((await s.begin()).searchParams.get('state')!)).status, 403);
+});
+
+test('ENGINE_ADMINS only seeds an empty file: a removed or demoted admin stays out', () => {
+  const users = Users.load(join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json'));
+  assert.deepEqual(users.seedAdmins(['Lead@starkfuture.com', 'ops@starkfuture.com']), ['lead@starkfuture.com', 'ops@starkfuture.com']);
+  users.issue('lead@starkfuture.com');
+  assert.ok(users.remove('ops'));
+  assert.ok(users.setRole('lead', 'member') === true && users.invite('boss@starkfuture.com', { admin: true }));
+  assert.deepEqual(users.seedAdmins(['lead@starkfuture.com', 'ops@starkfuture.com']), [], 'an admin exists: nothing reseeded');
+  assert.throws(() => users.issue('ops@starkfuture.com'), /has not been added/, 'removed stays removed');
+  assert.equal(users.issue('lead@starkfuture.com').user.role, 'member', 'a sign-in never restores a role');
+});
+
+test('two writers (server and CLI) never undo each other, and a held lock is respected', () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json');
+  const server = Users.load(file);
+  server.invite('ana@starkfuture.com');
+  server.invite('bo@starkfuture.com');
+  const cli = Users.load(file); // a second process with its own copy
+  assert.ok(cli.remove('bo'));
+  server.invite('cy@starkfuture.com'); // the server's copy still has bo
+  assert.deepEqual(Users.load(file).list().map((u) => u.name).sort(), ['ana', 'cy'], 'the removal sticks');
+
+  writeFileSync(`${file}.lock`, ''); // another process mid-write
+  const t0 = Date.now();
+  assert.throws(() => server.invite('dee@starkfuture.com'), /busy/);
+  assert.ok(Date.now() - t0 >= LOCK_WAIT_MS - 50, 'it waited before giving up');
+  const old = new Date(Date.now() - 60_000);
+  utimesSync(`${file}.lock`, old, old); // left over from a crash
+  assert.equal(server.invite('dee@starkfuture.com').name, 'dee');
 });
 
 test('tokens expire: 90 days at most, an expired token is unknown', () => {
