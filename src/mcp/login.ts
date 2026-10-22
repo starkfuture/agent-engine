@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
-import type { Users } from './users.js';
+import { NotInvited, type Users } from './users.js';
+export { nameFromEmail } from './users.js';
 
 // Tokens are issued only after a Google login on the company domain (DevOps,
 // 2026-10-16): /login sends the browser to Google, /login/callback checks the
@@ -12,6 +13,7 @@ export interface LoginConfig {
   clientSecret: string;
   publicUrl: string; // https://agent-engine.<internal domain>, the address people open
   domain: string; // starkfuture.com
+  admins?: string[]; // ENGINE_ADMINS: emails that may sign in before anyone invited them, as admins
 }
 
 export interface LoginResponse {
@@ -38,13 +40,6 @@ const page = (status: number, title: string, body: string): LoginResponse => ({
   headers: PAGE_HEADERS,
   body: `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${html(title)}</title><style>body{font:15px/1.5 system-ui,sans-serif;max-width:46rem;margin:3rem auto;padding:0 1rem;color:#111;background:#fff}code,pre{background:#f3f3f3;padding:.2rem .4rem;border-radius:4px;word-break:break-all;white-space:pre-wrap}</style><h1>${html(title)}</h1>${body}`,
 });
-
-// The user name a login maps to: the email's local part, made valid.
-export function nameFromEmail(email: string): string {
-  let n = email.split('@')[0]!.toLowerCase().replace(/[^a-z0-9._-]/g, '-').slice(0, 41);
-  if (!/^[a-z]/.test(n)) n = `u${n}`.slice(0, 41);
-  return n.length < 2 ? `${n}-` : n;
-}
 
 export class Login {
   private readonly pending = new Map<string, { verifier: string; at: number }>();
@@ -128,8 +123,9 @@ export class Login {
 
     let issued;
     try {
-      issued = this.users.issue(nameFromEmail(email), email, new Date(this.now()));
+      issued = this.users.issue(email, new Date(this.now()), this.cfg.admins ?? []);
     } catch (e) {
+      if (e instanceof NotInvited) return page(403, 'Not on the list yet', `<p>Signed in as <b>${html(email)}</b>, but an engine admin hasn't added you. Ask one to invite you, then sign in again.</p>`);
       return page(409, 'Ask an admin', `<p>${html((e as Error).message)}</p>`);
     }
     const mcp = `${this.cfg.publicUrl.replace(/\/$/, '')}/mcp`;

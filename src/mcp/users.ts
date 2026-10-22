@@ -5,12 +5,15 @@ import { z } from 'zod';
 
 // People who may use the engine over MCP. Only a SHA-256 of each token is
 // stored; the token itself is shown once, when it is issued. Tokens expire
-// (90 days at most); a Google login issues or renews a member's token.
+// (90 days at most). Hosted, a Google login issues or renews a token, but only
+// for an email an admin has invited (invite() adds it without a token): a
+// company account alone is not enough, since the engine reads prod telemetry
+// and the repos.
 const User = z
   .object({
     name: z.string().regex(/^[a-z][a-z0-9._-]{1,40}$/),
     role: z.enum(['member', 'admin']), // admin: stop/resume and approving lessons
-    token_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    token_sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(), // absent: invited, not signed in yet
     slack_id: z.string().regex(/^[UW][A-Z0-9]{5,20}$/).optional(), // for the "run finished" mention
     usd_per_day: z.number().positive().max(200).optional(), // overrides ENGINE_USER_DAILY_CAP_USD
     email: z.string().optional(), // set when the token came from a Google login
@@ -22,6 +25,19 @@ export type User = z.infer<typeof User>;
 const UsersFile = z.object({ users: z.array(User) }).strict();
 
 const sha = (s: string) => createHash('sha256').update(s).digest();
+
+export class NotInvited extends Error {
+  constructor(readonly email: string) {
+    super(`${email} has not been added; ask an engine admin to invite you`);
+  }
+}
+
+// The user name for an email: its local part, made valid.
+export function nameFromEmail(email: string): string {
+  let n = email.split('@')[0]!.toLowerCase().replace(/[^a-z0-9._-]/g, '-').slice(0, 41);
+  if (!/^[a-z]/.test(n)) n = `u${n}`.slice(0, 41);
+  return n.length < 2 ? `${n}-` : n;
+}
 export const MAX_TOKEN_DAYS = 90;
 const DAY = 86_400_000;
 export const expiresAt = (u: User): number => (u.expires_at ? Date.parse(u.expires_at) : Date.parse(u.added_at) + MAX_TOKEN_DAYS * DAY);
@@ -78,7 +94,7 @@ export class Users {
     this.refresh();
     const h = sha(token);
     let found: User | undefined;
-    for (const u of this.users) if (timingSafeEqual(h, Buffer.from(u.token_sha256, 'hex')) && !found) found = u;
+    for (const u of this.users) if (u.token_sha256 && timingSafeEqual(h, Buffer.from(u.token_sha256, 'hex')) && !found) found = u;
     return found && expiresAt(found) > now.getTime() ? found : undefined;
   }
 
@@ -100,17 +116,38 @@ export class Users {
     return token;
   }
 
-  // After a verified Google login: a new token for that person, replacing any
-  // old one. New people become members. An existing user is renewed only if
-  // bound to this same email: a login must never adopt a CLI-made user (an
-  // admin named `lead` would otherwise go to whoever owns lead@<domain>).
-  issue(name: string, email: string, now = new Date()): { token: string; user: User } {
+  // An admin lets an email in: a user bound to that email, with no token until
+  // they sign in. Inviting an existing email only changes its role when asked.
+  invite(email: string, opts: { admin?: boolean } = {}, now = new Date()): User {
     this.refresh();
-    const existing = this.users.find((u) => u.name === name);
-    if (existing && existing.email !== email) throw new Error(`the name ${name} is taken by another account; ask an admin`);
+    const e = email.toLowerCase();
+    const existing = this.users.find((u) => u.email === e);
+    if (existing) {
+      if (opts.admin && existing.role !== 'admin') this.setRole(existing.name, 'admin');
+      return this.users.find((u) => u.email === e)!;
+    }
+    const name = nameFromEmail(e);
+    if (this.users.some((u) => u.name === name)) throw new Error(`the name ${name} is taken by another user; remove it first`);
+    const user = User.parse({ name, role: opts.admin ? 'admin' : 'member', email: e, added_at: now.toISOString() });
+    this.users.push(user);
+    this.save();
+    return user;
+  }
+
+  // After a verified Google login: a new token for that person, replacing any
+  // old one, but only for an email an admin invited (or one listed as an admin
+  // in ENGINE_ADMINS, so the first admin can get in). A login never adopts a
+  // user bound to another email, nor one made without an email.
+  issue(email: string, now = new Date(), admins: readonly string[] = []): { token: string; user: User } {
+    this.refresh();
+    const e = email.toLowerCase();
+    const bootstrap = admins.map((a) => a.toLowerCase()).includes(e);
+    let existing = this.users.find((u) => u.email === e);
+    if (!existing && !bootstrap) throw new NotInvited(e);
+    if (!existing) existing = this.invite(e, { admin: true }, now);
     const { token, fields } = Users.fresh(undefined, now);
-    const user = User.parse({ ...(existing ?? { name, role: 'member' }), ...fields, email, ...(existing ? { added_at: existing.added_at } : {}) });
-    this.users = [...this.users.filter((u) => u.name !== name), user];
+    const user = User.parse({ ...existing, ...fields, added_at: existing.added_at, ...(bootstrap ? { role: 'admin' } : {}) });
+    this.users = [...this.users.filter((u) => u.name !== existing.name), user];
     this.save();
     return { token, user };
   }

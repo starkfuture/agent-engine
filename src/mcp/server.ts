@@ -12,7 +12,7 @@ import { runAgent, type Engine, type Root, type RunResult } from '../engine/run.
 import { cleanModelText, redact, safeJson, slackEscape, truncate } from '../engine/text.js';
 import type { RunRow } from '../engine/store.js';
 import type { Login } from './login.js';
-import type { User, Users } from './users.js';
+import { expiresAt, type User, type Users } from './users.js';
 
 // The engine over MCP, for several developers. One process holds the engine:
 // budgets, run history and the kill switch stay in one place; people connect
@@ -327,6 +327,30 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
     s.registerTool('resume', { description: 'Admin: clear the kill switch.', inputSchema: {} }, async () => {
       if (existsSync(ctx.engine.stopFile)) unlinkSync(ctx.engine.stopFile);
       return text('STOP cleared');
+    });
+    // Who may use the engine. Tokens are issued only at /login, and only to
+    // invited emails; nothing here mints one.
+    s.registerTool(
+      'invite_user',
+      { description: 'Admin: let someone sign in at /login and get a token. Nobody else can.', inputSchema: { email: z.string().email().max(200), admin: z.boolean().default(false) } },
+      async ({ email, admin: asAdmin }) => {
+        const domain = ctx.cfg.mcp.login?.domain;
+        if (domain && !email.toLowerCase().endsWith(`@${domain}`)) return err(`only @${domain} addresses`);
+        try {
+          const u = ctx.users.invite(email, { admin: asAdmin });
+          return text(`${u.email} can sign in as ${u.role} (user ${u.name})${ctx.login ? ` at ${ctx.cfg.mcp.login!.publicUrl}/login` : ''}`);
+        } catch (e) {
+          return err((e as Error).message);
+        }
+      },
+    );
+    s.registerTool('remove_user', { description: 'Admin: remove a user; their token stops working now.', inputSchema: { name: z.string().max(60) } }, async ({ name }) => {
+      if (name === user.name) return err('you cannot remove yourself');
+      return ctx.users.remove(name) ? text(`${name} removed`) : err(`no user ${name}`);
+    });
+    s.registerTool('list_users', { description: 'Admin: users, roles and token state.', inputSchema: {} }, async () => {
+      const rows = ctx.users.list().map((u) => `${u.name.padEnd(16)} ${u.role.padEnd(6)} ${!u.token_sha256 ? 'invited' : new Date(expiresAt(u)).getTime() > Date.now() ? `token until ${new Date(expiresAt(u)).toISOString().slice(0, 10)}` : 'expired'}  ${u.email ?? ''}`);
+      return text(rows.join('\n') || 'no users');
     });
   }
   return s;

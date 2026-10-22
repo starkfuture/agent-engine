@@ -75,7 +75,8 @@ export interface Config {
     // Hosted, web-reading agents run in their own deployment, away from prod data.
     agents: string[] | undefined;
     // Google login that issues tokens (GOOGLE_CLIENT_ID/SECRET, ENGINE_PUBLIC_URL).
-    login: { clientId: string; clientSecret: string; publicUrl: string; domain: string } | undefined;
+    // admins: ENGINE_ADMINS, emails that may sign in before anyone invited them (as admins).
+    login: { clientId: string; clientSecret: string; publicUrl: string; domain: string; admins: string[] } | undefined;
     reposDir: string | undefined; // where the engine clones `github:` repos (a persistent volume when hosted)
     reposGithub: string | undefined; // ENGINE_REPOS_GITHUB: name=owner/repo[@ref],… (env-only hosts)
     // GitHub App (contents: read) the engine fetches those repos as.
@@ -111,7 +112,10 @@ function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   if (!clientId && !clientSecret) return undefined;
   if (!clientId || !clientSecret || !publicUrl) throw new Error('Google login needs GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and ENGINE_PUBLIC_URL');
   if (!/^https:\/\//.test(publicUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(publicUrl)) throw new Error('ENGINE_PUBLIC_URL must be https (or localhost for testing)');
-  return { clientId, clientSecret, publicUrl, domain: env.ENGINE_LOGIN_DOMAIN || 'starkfuture.com' };
+  const domain = env.ENGINE_LOGIN_DOMAIN || 'starkfuture.com';
+  const admins = (env.ENGINE_ADMINS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  for (const a of admins) if (!a.endsWith(`@${domain}`)) throw new Error(`ENGINE_ADMINS: ${a} is not an @${domain} address`);
+  return { clientId, clientSecret, publicUrl, domain, admins };
 }
 
 export function loadSources(file: string): Sources {

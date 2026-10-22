@@ -50,6 +50,7 @@ MCP server (several developers, one engine):
                               issue a token (printed once; only its hash is stored; expires, default 90 days).
                               Hosted, people get theirs at <ENGINE_PUBLIC_URL>/login (Google, @starkfuture.com)
   user list | user remove <name>
+  user invite <email> [--admin]  let someone sign in at /login (no token until they do)
   user promote | demote <name>  make a user admin or member (no token is issued).
                               With the Google login on, \`user add\` is off: everyone,
                               admins too, gets a token by signing in; then promote them
@@ -335,14 +336,20 @@ async function main() {
       if (sub === 'list') {
         for (const u of users.list()) {
           const exp = expiresAt(u);
-          console.log(`${u.name.padEnd(16)} ${u.role.padEnd(6)} ${u.slack_id ?? '-'}  $${u.usd_per_day ?? cfg.mcp.userDailyCapUsd}/day  ${exp > Date.now() ? `expires ${new Date(exp).toISOString().slice(0, 10)}` : 'EXPIRED'}  ${u.email ?? ''}`);
+          const state = !u.token_sha256 ? 'invited' : exp > Date.now() ? `expires ${new Date(exp).toISOString().slice(0, 10)}` : 'EXPIRED';
+          console.log(`${u.name.padEnd(16)} ${u.role.padEnd(6)} ${u.slack_id ?? '-'}  $${u.usd_per_day ?? cfg.mcp.userDailyCapUsd}/day  ${state}  ${u.email ?? ''}`);
         }
         return;
       }
       const name = positionals[2];
-      if (!name) throw new Error('usage: user add|remove <name>');
+      if (!name) throw new Error('usage: user add|remove|promote|demote <name>, user invite <email>');
       if (sub === 'remove') {
         console.log(users.remove(name) ? `${name} removed; their token no longer works` : `no user ${name}`);
+        return;
+      }
+      if (sub === 'invite') {
+        const u = users.invite(name, { admin: a.admin });
+        console.log(`${u.email} invited as ${u.role} (user ${u.name}); they get a token by signing in at /login`);
         return;
       }
       if (sub === 'promote' || sub === 'demote') {
@@ -350,7 +357,7 @@ async function main() {
         console.log(users.setRole(name, role) ? `${name} is now ${role}` : `no user ${name} (they sign in first)`);
         return;
       }
-      if (sub !== 'add') throw new Error('usage: user add|list|remove|promote|demote');
+      if (sub !== 'add') throw new Error('usage: user add|list|remove|invite|promote|demote');
       // DevOps: tokens only after a company Google login. Hosted, the CLI can't mint one.
       if (cfg.mcp.login) throw new Error(`the Google login is on: people get their token at ${cfg.mcp.login.publicUrl}/login; then \`user promote <name>\` for admins`);
       const usd = a.usd ? Number(a.usd) : undefined;
@@ -384,6 +391,7 @@ async function main() {
       const host = a.host ?? '127.0.0.1';
       const port = Number(a.port ?? 8787);
       if (!ctx.users.list().length && !ctx.login) throw new Error('no users yet: add one with `user add <name> --admin`, or configure the Google login');
+      if (ctx.login && !ctx.users.list().length && !cfg.mcp.login!.admins.length) throw new Error('the Google login is on but nobody may sign in: set ENGINE_ADMINS (first admins) or `user invite <email> --admin`');
       const server = startHttp(ctx, { host, port });
       beforeExit = () => (server.close(), shutdown(ctx, 'engine shutting down', 20_000));
       log(`MCP on http://${host}:${port}/mcp · login ${ctx.login ? `at ${cfg.mcp.login!.publicUrl}/login` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);

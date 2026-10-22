@@ -62,7 +62,10 @@ jobs:
   deploy-to-prod:
     needs: [build]
     # Only main deploys; a manual run from another branch builds an image and stops.
-    if: ${{ github.ref == 'refs/heads/main' && !inputs.skip-deploy }}
+    # Nothing deploys until the repo variable PROD_DEPLOY is "true": set it once
+    # argo-cd has apps/agent-engine*/prod/values.yaml and the deploy secrets
+    # exist. Until then every run is build-only and its tag goes into argo-cd by PR.
+    if: ${{ github.ref == 'refs/heads/main' && !inputs.skip-deploy && vars.PROD_DEPLOY == 'true' }}
     runs-on: kubernetes-runner-light-production
     timeout-minutes: 10
     strategy:

@@ -11,7 +11,7 @@ const cfg = { clientId: 'cid.apps.googleusercontent.com', clientSecret: 'shh', p
 const jwt = (claims: Record<string, unknown>) => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.sig`;
 const good = (over: Record<string, unknown> = {}) => ({ iss: 'https://accounts.google.com', aud: cfg.clientId, exp: Math.floor(Date.now() / 1000) + 600, email: 'ana.lopez@starkfuture.com', email_verified: true, hd: 'starkfuture.com', ...over });
 
-function setup(idClaims: Record<string, unknown>) {
+function setup(idClaims: Record<string, unknown>, opts: { invite?: string; admins?: string[] } = {}) {
   const users = Users.load(join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json'));
   const sent: URLSearchParams[] = [];
   const real = globalThis.fetch;
@@ -19,7 +19,8 @@ function setup(idClaims: Record<string, unknown>) {
     sent.push(new URLSearchParams(String(init?.body)));
     return new Response(JSON.stringify({ id_token: jwt(idClaims) }), { status: 200 });
   }) as typeof fetch;
-  const login = new Login(cfg, users);
+  if (opts.invite) users.invite(opts.invite);
+  const login = new Login({ ...cfg, admins: opts.admins ?? [] }, users);
   const begin = async () => {
     const r = await login.handle(new URL('https://x/login'));
     assert.equal(r.status, 302);
@@ -29,8 +30,8 @@ function setup(idClaims: Record<string, unknown>) {
   return { users, sent, begin, back, restore: () => (globalThis.fetch = real) };
 }
 
-test('Google login issues a 90-day token to a verified company account, once', async (t) => {
-  const s = setup(good());
+test('Google login issues a 90-day token to an invited company account, once', async (t) => {
+  const s = setup(good(), { invite: 'ana.lopez@starkfuture.com' });
   t.after(s.restore);
   const to = await s.begin();
   assert.equal(to.origin + to.pathname, 'https://accounts.google.com/o/oauth2/v2/auth');
@@ -82,7 +83,8 @@ test('a login never takes over a user tied to another email; unknown state is re
   t.after(s.restore);
   s.users.add('ana', { email: 'someone.else@starkfuture.com' });
   const r = await s.back((await s.begin()).searchParams.get('state')!);
-  assert.equal(r.status, 409);
+  assert.equal(r.status, 403);
+  assert.throws(() => s.users.invite('ana@starkfuture.com'), /name ana is taken/);
   assert.equal((await s.back('forged-state')).status, 400);
   assert.equal(s.sent.length, 1, 'no code exchange for a forged state');
 });
@@ -92,18 +94,48 @@ test('a login never adopts a CLI-made user, even an admin whose name matches the
   t.after(s.restore);
   const admin = s.users.add('lead', { admin: true }); // an admin token handed out by name
   const r = await s.back((await s.begin()).searchParams.get('state')!);
-  assert.equal(r.status, 409);
+  assert.equal(r.status, 403);
   assert.equal(s.users.authenticate(admin)?.role, 'admin', 'the admin token still works');
   assert.equal(s.users.list().length, 1);
 });
 
 test('the token page names the MCP server after the deployment', async (t) => {
-  const s = setup(good());
+  const s = setup(good(), { invite: 'ana.lopez@starkfuture.com' });
   t.after(s.restore);
   const login = new Login({ ...cfg, publicUrl: 'https://agent-engine-web.starkfuture.com' }, s.users);
   const to = new URL((await login.handle(new URL('https://x/login'))).headers.location!);
   const r = await login.handle(new URL(`https://x/login/callback?state=${to.searchParams.get('state')}&code=c`));
   assert.match(r.body, /claude mcp add --transport http agent-engine-web https:\/\/agent-engine-web\.starkfuture\.com\/mcp/);
+});
+
+test('a company account that was not invited gets no token; ENGINE_ADMINS can bootstrap the first admin', async (t) => {
+  const s = setup(good({ email: 'stranger@starkfuture.com' }));
+  t.after(s.restore);
+  const r = await s.back((await s.begin()).searchParams.get('state')!);
+  assert.equal(r.status, 403);
+  assert.match(r.body, /admin hasn't added you/);
+  assert.ok(!/eng_/.test(r.body));
+  assert.equal(s.users.list().length, 0, 'nothing is recorded for an uninvited login');
+
+  const boot = setup(good({ email: 'Lead@starkfuture.com' }), { admins: ['lead@starkfuture.com'] });
+  const ok = await boot.back((await boot.begin()).searchParams.get('state')!);
+  boot.restore();
+  assert.equal(ok.status, 200, ok.body);
+  const token = /Bearer (eng_[A-Za-z0-9_-]+)/.exec(ok.body)![1]!;
+  assert.equal(boot.users.authenticate(token)?.role, 'admin');
+});
+
+test('invited users renew by signing in; once removed, they can neither use nor renew a token', async (t) => {
+  const s = setup(good({ email: 'bo@starkfuture.com' }), { invite: 'bo@starkfuture.com' });
+  t.after(s.restore);
+  const invited = s.users.list()[0]!;
+  assert.equal(invited.token_sha256, undefined, 'an invite carries no token');
+  assert.equal(s.users.authenticate('eng_' + 'x'.repeat(43)), undefined);
+  const first = /Bearer (eng_[A-Za-z0-9_-]+)/.exec((await s.back((await s.begin()).searchParams.get('state')!)).body)![1]!;
+  assert.equal(s.users.authenticate(first)?.role, 'member');
+  assert.ok(s.users.remove('bo'));
+  assert.equal(s.users.authenticate(first), undefined);
+  assert.equal((await s.back((await s.begin()).searchParams.get('state')!)).status, 403);
 });
 
 test('tokens expire: 90 days at most, an expired token is unknown', () => {
@@ -132,7 +164,8 @@ test('with the Google login on, the CLI cannot mint tokens; admins are promoted 
 
   // Someone signs in (a login-issued user), then an admin promotes them.
   const users = Users.load(file);
-  const { token } = users.issue('ana', 'ana@starkfuture.com');
+  users.invite('ana@starkfuture.com');
+  const { token } = users.issue('ana@starkfuture.com');
   assert.match(cli('user', 'promote', 'ana').stdout, /ana is now admin/);
   assert.equal(Users.load(file).authenticate(token)?.role, 'admin');
   assert.match(cli('user', 'promote', 'nobody').stdout, /no user nobody/);
