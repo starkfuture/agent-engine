@@ -53,15 +53,16 @@ test('locally, the same queries go through Grafana\'s datasource proxy with the 
   assert.equal(tel.has.tempo, false);
 });
 
-test('Tempo refuses regexes that scan every span, before any request', async (t) => {
+test('Tempo refuses every regex match, before any request; exact matches go through', async (t) => {
   const f = stubFetch(() => ({ traces: [] }));
   t.after(f.restore);
   const tel = new DirectTelemetry({ prometheusUrl: 'http://p:9090', tempoUrl: 'http://tempo:3100' });
   const now = new Date();
-  for (const q of ['{ name =~ ".*" }', '{ resource.service.name =~ ".+checkout" }', '{ span.http.url !~ ".*health" }'])
+  for (const q of ['{ name =~ ".*" }', '{ name =~ "^.*" }', '{ name =~ "(.*)" }', '{ resource.service.name =~ "checkout.*" }', '{ span.http.url !~ ".*health" }', '{ name=~"x" }'])
     await assert.rejects(tel.tempoSearch(q, now, now, 10), (e: Error) => e instanceof SourceError && /regex/.test(e.message), q);
-  await tel.tempoSearch('{ resource.service.name =~ "checkout.*" }', now, now, 10); // a fixed prefix is fine
-  assert.equal(f.calls.length, 1);
+  await tel.tempoSearch('{ resource.service.name = "checkout" && status = error }', now, now, 10);
+  await tel.tempoSearch('{ name = "a=~b" }', now, now, 10); // "=~" inside a value is just text
+  assert.equal(f.calls.length, 2);
 });
 
 test('metrics: heartbeat, blind spots, runs and spend in Prometheus text format', () => {

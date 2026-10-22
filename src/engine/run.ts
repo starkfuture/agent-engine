@@ -9,6 +9,7 @@ import { challengeLite, type ChallengeResult } from './challenge.js';
 import { Evidence, evidenceHook } from './evidence.js';
 import { pathGuard } from './guard.js';
 import { pluginCopy, SpendMeter, type Session, type SessionEvent, type SessionRequest } from './session.js';
+import { freeBytes } from './retention.js';
 import { snapshot, type Snapshot } from './snapshot.js';
 import type { RunStatus, Store } from './store.js';
 import { fence, redact, safeJson } from './text.js';
@@ -22,6 +23,7 @@ export interface Engine {
   monthlyCapUsd?: number; // across all agents, UTC month
   llmAvailable: boolean;
   build?: string; // engine code version, recorded on every run
+  minFreeBytes?: number; // refuse new runs below this much free space on the runs volume
   now?: () => Date;
 }
 
@@ -128,6 +130,10 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
   };
   if (!engine.llmAvailable) return skipped('no LLM credentials configured');
   if (closing) return skipped(`engine is shutting down (${closing})`);
+  if (engine.minFreeBytes !== undefined) {
+    const free = freeBytes(engine.runsDir);
+    if (free !== undefined && free < engine.minFreeBytes) return skipped(`runs volume nearly full (${Math.round(free / 1e6)} MB free)`);
+  }
   if (existsSync(engine.stopFile)) return skipped(`stop file present: ${engine.stopFile}`);
 
   const challenge = input.challenge ?? spec.challenge.when === 'always';

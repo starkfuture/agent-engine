@@ -70,10 +70,11 @@ interface Route {
 }
 
 // Tempo is shared and was overloaded by long-range TraceQL from agents: every
-// search is at most this long, and regexes that match everything are refused.
+// search is at most this long, and regex matches are refused outright (a guard
+// on regex shapes is easy to get round: "^.*", "(.*)").
 export const TEMPO_MAX_MINUTES = 30;
 export function traceqlProblem(q: string): string | undefined {
-  if (/[=!]~\s*"\s*\.[*+]/.test(q)) return 'regex starting with .* or .+ scans every span; match an exact value or a fixed prefix instead';
+  if (/[=!]~/.test(q.replace(/"(?:[^"\\]|\\.)*"/g, '""'))) return 'regex matches (=~, !~) are not allowed on the shared Tempo; match exact values (=, !=)';
   return undefined;
 }
 

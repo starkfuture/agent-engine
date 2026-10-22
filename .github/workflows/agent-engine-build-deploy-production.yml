@@ -1,0 +1,89 @@
+name: agent-engine - ArgoCD Production
+
+run-name: agent-engine production deployment by @${{ github.actor }} from branch ${{ github.ref_name }}
+
+# One image, two apps: agent-engine (monitor + codebase; reads prod telemetry)
+# and agent-engine-web (research; internet only). A push to main deploys both,
+# so changes go through PRs. Every push to main runs (no path filter). Production directly: the engine is read-only over
+# the platform.
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip-deploy:
+        description: "Build & push only (gives a real tag without touching argo-cd values)"
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+# One production deploy at a time, whatever the ref.
+concurrency:
+  group: deploy-agent-engine-production
+  cancel-in-progress: false
+
+jobs:
+  check:
+    uses: ./.github/workflows/agent-engine-ci.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: [check]
+    runs-on: kubernetes-runner-custom
+    timeout-minutes: 15
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Build & push agent-engine to ECR
+        id: build
+        uses: starkfuture/argo-cd/.github/actions/build-push-ecr@main
+        with:
+          aws-role: arn:aws:iam::952414816681:role/GithubActionsData
+          image-name: agent-engine
+          tag: ${{ github.run_id }}
+          dockerfile: Dockerfile
+          context: .
+          sbom-service: agent-engine
+          sbom-channel: production
+          build-args: |
+            ENGINE_BUILD=${{ github.sha }}
+          dependency-track-api-key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
+
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+
+  deploy-to-prod:
+    needs: [build]
+    # Only main deploys; a manual run from another branch builds an image and stops.
+    # Nothing deploys until the repo variable PROD_DEPLOY is "true": set it once
+    # argo-cd has apps/agent-engine*/prod/values.yaml and the deploy secrets
+    # exist. Until then every run is build-only and its tag goes into argo-cd by PR.
+    if: ${{ github.ref == 'refs/heads/main' && !inputs.skip-deploy && vars.PROD_DEPLOY == 'true' }}
+    runs-on: kubernetes-runner-light-production
+    timeout-minutes: 10
+    strategy:
+      # Both deploys commit to argo-cd: one at a time.
+      max-parallel: 1
+      matrix:
+        app: [agent-engine, agent-engine-web]
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Deploy ${{ matrix.app }} via ArgoCD
+        uses: starkfuture/argo-cd/.github/actions/deploy-argocd@main
+        with:
+          image: ${{ needs.build.outputs.image }}
+          values-path: apps/${{ matrix.app }}/prod/values.yaml
+          argocd-app: ${{ matrix.app }}-production
+          branch: ${{ github.ref_name }}
+          app-private-key: ${{ secrets.GH_ARGOCD_APP_PK }}
+          argocd-token: ${{ secrets.ARGOCD_PROD_TKN }}

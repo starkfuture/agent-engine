@@ -62,6 +62,7 @@ export interface Config {
   memoryDir: string | undefined; // runtime lessons and proposals (a persistent volume when hosted); unset = in the agent folders
   runsDir: string;
   build: string | undefined; // engine code version (image tag or commit), recorded on every run
+  retentionDays: number; // run folders and cards older than this are deleted (serve)
   slackWebhookUrl: string | undefined;
   mcp: {
     usersFile: string; // hashed tokens, one per person (gitignored)
@@ -73,6 +74,14 @@ export interface Config {
     // Agents this server offers (ENGINE_AGENTS=monitor,codebase); unset = all.
     // Hosted, web-reading agents run in their own deployment, away from prod data.
     agents: string[] | undefined;
+    // Google login that issues tokens (GOOGLE_CLIENT_ID/SECRET, ENGINE_PUBLIC_URL).
+    // admins: ENGINE_ADMINS, the first admins: seeded into the users file (as invites)
+    // at startup while it has no admin. Sign-in is decided by the file alone.
+    login: { clientId: string; clientSecret: string; publicUrl: string; domain: string; admins: string[] } | undefined;
+    reposDir: string | undefined; // where the engine clones `github:` repos (a persistent volume when hosted)
+    reposGithub: string | undefined; // ENGINE_REPOS_GITHUB: name=owner/repo[@ref],… (env-only hosts)
+    // GitHub App (contents: read) the engine fetches those repos as.
+    githubApp: { appId: string; installationId: string; privateKeyFile: string } | undefined;
   };
 }
 
@@ -96,6 +105,18 @@ export function loadDotEnv(file = resolve('.env'), env: NodeJS.ProcessEnv = proc
     const [, k, v] = m as unknown as [string, string, string];
     if (env[k] === undefined) env[k] = v.replace(/^(['"])(.*)\1$/, '$2');
   }
+}
+
+// All three or none: a half-configured login must stop the server, not run open.
+function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
+  const [clientId, clientSecret, publicUrl] = [opt(env.GOOGLE_CLIENT_ID), opt(env.GOOGLE_CLIENT_SECRET), opt(env.ENGINE_PUBLIC_URL)];
+  if (!clientId && !clientSecret) return undefined;
+  if (!clientId || !clientSecret || !publicUrl) throw new Error('Google login needs GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and ENGINE_PUBLIC_URL');
+  if (!/^https:\/\//.test(publicUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(publicUrl)) throw new Error('ENGINE_PUBLIC_URL must be https (or localhost for testing)');
+  const domain = env.ENGINE_LOGIN_DOMAIN || 'starkfuture.com';
+  const admins = (env.ENGINE_ADMINS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  for (const a of admins) if (!a.endsWith(`@${domain}`)) throw new Error(`ENGINE_ADMINS: ${a} is not an @${domain} address`);
+  return { clientId, clientSecret, publicUrl, domain, admins };
 }
 
 export function loadSources(file: string): Sources {
@@ -128,7 +149,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     agentsDir: r(env.ENGINE_AGENTS_DIR ?? 'agents'),
     memoryDir: env.ENGINE_MEMORY_DIR ? r(env.ENGINE_MEMORY_DIR) : undefined,
     runsDir: r(env.ENGINE_RUNS_DIR ?? 'runs'),
-    build: opt(env.ENGINE_BUILD),
+    build: opt(env.ENGINE_BUILD) === 'unknown' ? undefined : opt(env.ENGINE_BUILD),
+    retentionDays: num(env.ENGINE_RETENTION_DAYS, 30, 'ENGINE_RETENTION_DAYS'),
     slackWebhookUrl: opt(env.SLACK_WEBHOOK_URL),
     mcp: {
       usersFile: r(env.ENGINE_USERS_FILE ?? 'config/users.local.json'),
@@ -138,6 +160,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
       notifySlack: env.ENGINE_NOTIFY_SLACK === '1',
       allowedOrigins: (env.ENGINE_ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
       agents: env.ENGINE_AGENTS ? env.ENGINE_AGENTS.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+      login: loginConfig(env),
+      reposDir: env.ENGINE_REPOS_DIR ? r(env.ENGINE_REPOS_DIR) : undefined,
+      reposGithub: opt(env.ENGINE_REPOS_GITHUB),
+      githubApp:
+        env.GITHUB_APP_ID && env.GITHUB_APP_INSTALLATION_ID && env.GITHUB_APP_PRIVATE_KEY_FILE
+          ? { appId: env.GITHUB_APP_ID, installationId: env.GITHUB_APP_INSTALLATION_ID, privateKeyFile: expandHome(env.GITHUB_APP_PRIVATE_KEY_FILE) }
+          : undefined,
     },
   };
 }

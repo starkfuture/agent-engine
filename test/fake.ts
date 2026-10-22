@@ -28,6 +28,8 @@ export const DAY = 24 * H;
 // Everything else is normal traffic with a steady trickle of 404s.
 export const INCIDENT_START = Date.parse('2026-09-29T12:00:00Z');
 export function world(query: string, at: Date): Sample[] {
+  // kube-state-metrics is being scraped: the workloads presence check finds series.
+  if (query.startsWith('count(kube_pod_container_status_restarts_total')) return [{ labels: {}, value: 120 }];
   if (!query.includes('backend_be_production_http_requests_total')) return [];
   const t = at.getTime();
   const broken = t >= INCIDENT_START && t < INCIDENT_START + 30 * H;

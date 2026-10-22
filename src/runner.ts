@@ -106,3 +106,39 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   state.save();
   return result;
 }
+
+// One patrol per window, 30 s after each boundary (so the last scrape is in),
+// until the process ends, or after `passes` passes (tests). Each pass is
+// reported to `onPass` whether or not anything records it.
+export async function patrolLoop(o: {
+  tel: Telemetry;
+  cfg: Config;
+  noise: Noise;
+  state: State;
+  sink: CardSink;
+  windowMin: number;
+  opts: PatrolOptions;
+  monitor?: MonitorAgent | undefined;
+  onPass?: ((at: Date, r?: PatrolResult) => void) | undefined;
+  passes?: number;
+  now?: () => Date;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<void> {
+  const now = o.now ?? (() => new Date());
+  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const w = o.windowMin * 60_000;
+  for (let i = 0; o.passes === undefined || i < o.passes; i++) {
+    const at = new Date(Math.floor(now().getTime() / w) * w);
+    // Not `onPass?.(at, await patrolOnce(…))`: optional chaining skips
+    // evaluating the arguments, so without a listener there'd be no patrol.
+    let r: PatrolResult | undefined;
+    try {
+      r = await patrolOnce(o.tel, o.cfg, o.noise, o.state, o.sink, at, o.opts, o.monitor);
+    } catch (e) {
+      o.opts.log?.(`patrol failed: ${(e as Error).message}`);
+    }
+    o.onPass?.(at, r);
+    if (o.passes !== undefined && i + 1 >= o.passes) break;
+    await sleep(Math.max(5_000, at.getTime() + w + 30_000 - now().getTime()));
+  }
+}

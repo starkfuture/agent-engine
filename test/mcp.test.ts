@@ -101,6 +101,29 @@ test('a developer gives a task, reads the answer, the evidence behind it, and th
   assert.equal(ctx.engine.store.get(runId)!.requested_by, 'ana');
 });
 
+test('only admins manage users; invites never mint a token and stay on the company domain', async () => {
+  const { ctx, who } = context(fakeSession());
+  (ctx.cfg.mcp as { login?: unknown }).login = { domain: 'starkfuture.com', publicUrl: 'https://agent-engine.test', admins: [] };
+  const names = async (u: string) => (await (await connect(ctx, who(u))).client.listTools()).tools.map((t) => t.name);
+  for (const t of ['invite_user', 'remove_user', 'list_users']) {
+    assert.ok(!(await names('ana')).includes(t), `member must not see ${t}`);
+    assert.ok((await names('root')).includes(t), `admin sees ${t}`);
+  }
+  const { call } = await connect(ctx, who('root'));
+  assert.match((await call('invite_user', { email: 'Cy@starkfuture.com' })).text, /cy@starkfuture\.com can sign in as member \(user cy\)/);
+  assert.equal(ctx.users.list().find((u) => u.name === 'cy')?.token_sha256, undefined);
+  assert.match((await call('invite_user', { email: 'eve@gmail.com' })).text, /error: only @starkfuture\.com/);
+  assert.match((await call('list_users')).text, /^cy +member invited +cy@starkfuture\.com$/m);
+  assert.match((await call('remove_user', { name: 'root' })).text, /cannot remove yourself/);
+  assert.match((await call('remove_user', { name: 'cy' })).text, /cy removed/);
+
+  // Removed (or demoted) after its request was authenticated: no admin action completes.
+  ctx.users.setRole('root', 'member');
+  assert.match((await call('invite_user', { email: 'root2@starkfuture.com', admin: true })).text, /no longer an admin/);
+  assert.match((await call('stop_all', { reason: 'testing' })).text, /no longer an admin/);
+  assert.equal(ctx.users.list().some((u) => u.email === 'root2@starkfuture.com'), false);
+});
+
 test('only admins get the kill switch and lesson approval', async () => {
   const { ctx, who } = context(fakeSession());
   const names = async (u: string) => (await (await connect(ctx, who(u))).client.listTools()).tools.map((t) => t.name);

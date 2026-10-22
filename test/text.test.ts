@@ -4,6 +4,12 @@ import { fence, redact, templateOf } from '../src/engine/text.js';
 import { workloadOf } from '../src/patrol/collectors.js';
 import { withMatcher } from '../src/investigate/tools.js';
 
+test('engine and GitHub App tokens are redacted', () => {
+  const t = 'debug this eng_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 and ghs_AbCdEfGhIjKlMnOpQrStUvWx01';
+  const out = redact(t);
+  assert.ok(!out.includes('eng_AbCd') && !out.includes('ghs_AbCd'), out);
+});
+
 test('redacts PII and secrets', () => {
   const s = redact(
     'user jane.doe+x@example.com from 10.1.2.3 called +44 20 7946 0958 with Bearer abcdefghijkl12345 token=s3cr3tvalue ' +

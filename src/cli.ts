@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { loadConfig, loadDotEnv, type Config } from './config.js';
@@ -17,12 +17,16 @@ import { findingsOutput } from './engine/output.js';
 import { writeAnswer } from './engine/answer.js';
 import { runAgent, stopAllRuns, type Engine } from './engine/run.js';
 import { sdkSession } from './engine/session.js';
-import { patrolOnce, type MonitorAgent } from './runner.js';
+import { patrolLoop, patrolOnce, type MonitorAgent } from './runner.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { buildServer, shutdown, slackNotifier, startHttp, type McpContext } from './mcp/server.js';
 import { loadRepos } from './mcp/repos.js';
-import { Users } from './mcp/users.js';
-import { Metrics, startMetrics } from './metrics.js';
+import { expiresAt, MAX_TOKEN_DAYS, Users } from './mcp/users.js';
+import { Login } from './mcp/login.js';
+import { InstallationTokens } from './mcp/github-app.js';
+import { RepoSync } from './mcp/reposync.js';
+import { Metrics, startHealth, startMetrics } from './metrics.js';
+import { sweep } from './engine/retention.js';
 
 const USAGE = `engine <command> [options]
 
@@ -42,9 +46,14 @@ MCP server (several developers, one engine):
       --patrol [--llm] [--post]  also run the monitor's patrol loop in this process
       --metrics-port <n>      Prometheus metrics at /metrics on their own port (heartbeat)
   mcp-stdio --as <user>       the same tools over stdio, for one local user
-  user add <name> [--admin] [--slack <U…>] [--usd <per day>]
-                              issue a token (printed once; only its hash is stored)
+  user add <name> [--admin] [--email <google email>] [--slack <U…>] [--usd <per day>] [--days <n ≤ 90>]
+                              issue a token (printed once; only its hash is stored; expires, default 90 days).
+                              Hosted, people get theirs at <ENGINE_PUBLIC_URL>/login (Google, @starkfuture.com)
   user list | user remove <name>
+  user invite <email> [--admin]  let someone sign in at /login (no token until they do)
+  user promote | demote <name>  make a user admin or member (no token is issued).
+                              With the Google login on, \`user add\` is off: everyone,
+                              admins too, gets a token by signing in; then promote them
 
 Monitor:
   doctor                      check access, list datasources, show real metric labels
@@ -54,7 +63,8 @@ Monitor:
       --post                  post cards to SLACK_WEBHOOK_URL
       --replay <dir>          read telemetry from an export instead of Grafana
       --fresh                 in-memory state (don't read or write .state/)
-  loop                        patrol every window (default 15 min) until stopped; same flags, plus --metrics-port
+  loop                        patrol every window (default 15 min) until stopped; same flags, plus --metrics-port,
+                              and --port <n> for a /healthz-only listener (the pod's probes, monitor-only hosting)
   export --from <ISO> --to <ISO> [--out <dir>] [--step <min>]
                               record every patrol query in the range (no LLM), for offline replay
   replay --from <ISO> --to <ISO> [--step <min>] [--replay <dir>] [--llm]
@@ -81,6 +91,8 @@ const { positionals, values: a } = parseArgs({
     admin: { type: 'boolean', default: false },
     slack: { type: 'string' },
     usd: { type: 'string' },
+    days: { type: 'string' },
+    email: { type: 'string' },
     challenge: { type: 'boolean', default: false },
     llm: { type: 'boolean', default: false },
     post: { type: 'boolean', default: false },
@@ -141,6 +153,7 @@ function makeEngine(cfg: Config, runsDir = cfg.runsDir): Engine {
   const build = engineBuild(cfg);
   return {
     ...(build ? { build } : {}),
+    minFreeBytes: 200e6, // keep room for logins, settlement and the ledger
     store: new Store(join(cfg.runsDir, 'engine.db')),
     runsDir,
     stopFile: join(cfg.runsDir, 'STOP'),
@@ -158,21 +171,18 @@ function monitorAgent(cfg: Config): MonitorAgent {
 const align = (d: Date, min: number) => new Date(Math.floor(d.getTime() / (min * 60_000)) * min * 60_000);
 
 // The patrol every window until the process ends; each pass lands in metrics.
-async function patrolLoop(cfg: Config, noise: Noise, sink: CardSink, w: number, metrics?: Metrics): Promise<never> {
-  const tel = telemetry(cfg);
-  const state = State.load(cfg.stateFile);
-  const monitor = a.llm ? monitorAgent(cfg) : undefined;
-  for (;;) {
-    const at = align(new Date(), w);
-    try {
-      metrics?.patrol(at, await patrolOnce(tel, cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log }, monitor));
-    } catch (e) {
-      metrics?.patrol(at);
-      log(`patrol failed: ${(e as Error).message}`);
-    }
-    const next = at.getTime() + w * 60_000 + 30_000; // 30 s after the boundary, so the last scrape is in
-    await new Promise((r) => setTimeout(r, Math.max(5_000, next - Date.now())));
-  }
+async function patrolEvery(cfg: Config, noise: Noise, sink: CardSink, w: number, metrics?: Metrics): Promise<void> {
+  await patrolLoop({
+    tel: telemetry(cfg),
+    cfg,
+    noise,
+    state: State.load(cfg.stateFile),
+    sink,
+    windowMin: w,
+    opts: { llm: a.llm, post: a.post, log },
+    monitor: a.llm ? monitorAgent(cfg) : undefined,
+    onPass: metrics ? (at, r) => metrics.patrol(at, r) : undefined,
+  });
 }
 
 function metricsServer(cfg: Config): Metrics | undefined {
@@ -325,31 +335,50 @@ async function main() {
       const users = Users.load(cfg.mcp.usersFile);
       const sub = positionals[1];
       if (sub === 'list') {
-        for (const u of users.list()) console.log(`${u.name.padEnd(16)} ${u.role.padEnd(6)} ${u.slack_id ?? '-'}  $${u.usd_per_day ?? cfg.mcp.userDailyCapUsd}/day  added ${u.added_at.slice(0, 10)}`);
+        for (const u of users.list()) {
+          const exp = expiresAt(u);
+          const state = !u.token_sha256 ? 'invited' : exp > Date.now() ? `expires ${new Date(exp).toISOString().slice(0, 10)}` : 'EXPIRED';
+          console.log(`${u.name.padEnd(16)} ${u.role.padEnd(6)} ${u.slack_id ?? '-'}  $${u.usd_per_day ?? cfg.mcp.userDailyCapUsd}/day  ${state}  ${u.email ?? ''}`);
+        }
         return;
       }
       const name = positionals[2];
-      if (!name) throw new Error('usage: user add|remove <name>');
+      if (!name) throw new Error('usage: user add|remove|promote|demote <name>, user invite <email>');
       if (sub === 'remove') {
         console.log(users.remove(name) ? `${name} removed; their token no longer works` : `no user ${name}`);
         return;
       }
-      if (sub !== 'add') throw new Error('usage: user add|list|remove');
+      if (sub === 'invite') {
+        const u = users.invite(name, { admin: a.admin });
+        console.log(`${u.email} invited as ${u.role} (user ${u.name}); they get a token by signing in at /login`);
+        return;
+      }
+      if (sub === 'promote' || sub === 'demote') {
+        const role = sub === 'promote' ? 'admin' : 'member';
+        console.log(users.setRole(name, role) ? `${name} is now ${role}` : `no user ${name} (they sign in first)`);
+        return;
+      }
+      if (sub !== 'add') throw new Error('usage: user add|list|remove|invite|promote|demote');
+      // DevOps: tokens only after a company Google login. Hosted, the CLI can't mint one.
+      if (cfg.mcp.login) throw new Error(`the Google login is on: people get their token at ${cfg.mcp.login.publicUrl}/login; then \`user promote <name>\` for admins`);
       const usd = a.usd ? Number(a.usd) : undefined;
       if (usd !== undefined && !(usd > 0)) throw new Error('--usd must be a positive number');
-      const token = users.add(name, { admin: a.admin, ...(a.slack ? { slackId: a.slack } : {}), ...(usd ? { usdPerDay: usd } : {}) });
-      console.error(`${name} added (${a.admin ? 'admin' : 'member'}). Give them this token; it is not stored and won't be shown again:`);
+      const days = a.days ? Number(a.days) : undefined;
+      const token = users.add(name, { admin: a.admin, ...(a.slack ? { slackId: a.slack } : {}), ...(usd ? { usdPerDay: usd } : {}), ...(days ? { days } : {}), ...(a.email ? { email: a.email.toLowerCase() } : {}) });
+      console.error(`${name} added (${a.admin ? 'admin' : 'member'}, expires in ${days ?? MAX_TOKEN_DAYS} days). Give them this token; it is not stored and won't be shown again:`);
       console.log(token);
       return;
     }
 
     case 'serve':
     case 'mcp-stdio': {
+      const users = Users.load(cfg.mcp.usersFile);
       const ctx: McpContext = {
         cfg,
         engine: makeEngine(cfg),
-        users: Users.load(cfg.mcp.usersFile),
-        repos: loadRepos(cfg.mcp.reposFile),
+        users,
+        repos: loadRepos(cfg.mcp.reposFile, cfg.mcp.reposDir, cfg.mcp.reposGithub),
+        ...(cfg.mcp.login ? { login: new Login(cfg.mcp.login, users) } : {}),
         ...(cfg.mcp.notifySlack && cfg.slackWebhookUrl ? { notify: slackNotifier(cfg.slackWebhookUrl) } : {}),
         log,
       };
@@ -362,15 +391,41 @@ async function main() {
       }
       const host = a.host ?? '127.0.0.1';
       const port = Number(a.port ?? 8787);
-      if (!ctx.users.list().length) throw new Error('no users yet: add one with `user add <name> --admin`');
+      if (!ctx.users.list().length && !ctx.login) throw new Error('no users yet: add one with `user add <name> --admin`, or configure the Google login');
+      if (ctx.login) {
+        // ENGINE_ADMINS seeds the first admins (as invites) only while the file has none.
+        const seeded = ctx.users.seedAdmins(cfg.mcp.login!.admins);
+        if (seeded.length) log(`seeded admins from ENGINE_ADMINS: ${seeded.join(', ')}`);
+        if (!ctx.users.list().some((u) => u.role === 'admin')) throw new Error('the Google login is on but there is no admin to invite anyone: set ENGINE_ADMINS or `user invite <email> --admin`');
+      }
       const server = startHttp(ctx, { host, port });
       beforeExit = () => (server.close(), shutdown(ctx, 'engine shutting down', 20_000));
-      log(`MCP on http://${host}:${port}/mcp · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
+      log(`MCP on http://${host}:${port}/mcp · login ${ctx.login ? `at ${cfg.mcp.login!.publicUrl}/login` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
       if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
       const metrics = metricsServer(cfg);
+      // Retention: hourly, and once at start.
+      const clean = () => {
+        try {
+          const r = sweep({ runsDir: cfg.runsDir, outDir: cfg.outDir, days: cfg.retentionDays });
+          if (r.runs || r.cards) log(`retention: deleted ${r.runs} run folder(s) and ${r.cards} card(s) older than ${cfg.retentionDays} days`);
+        } catch (e) {
+          log(`retention failed: ${(e as Error).message}`);
+        }
+      };
+      clean();
+      setInterval(clean, 3600_000).unref();
+      if (cfg.mcp.githubApp) {
+        // Clone/fetch the `github:` repos as the GitHub App, now and every 10 min.
+        const app = cfg.mcp.githubApp;
+        const tokens = new InstallationTokens({ appId: app.appId, installationId: app.installationId, privateKey: readFileSync(app.privateKeyFile, 'utf8') });
+        const sync = new RepoSync(ctx.repos, { token: () => tokens.token(), log });
+        sync.start();
+        metrics?.repoSync(sync.state);
+        log(`repo sync every 10 min: ${[...sync.state.keys()].join(', ') || 'no github repos'}`);
+      }
       if (a.patrol) {
         log(`patrol every ${w} min in this process${a.llm ? ' with the investigator' : ''}`);
-        void patrolLoop(cfg, noise, sink, w, metrics);
+        void patrolEvery(cfg, noise, sink, w, metrics);
       }
       await new Promise(() => {}); // until killed
       return;
@@ -395,8 +450,11 @@ async function main() {
       return;
     }
 
-    case 'loop':
-      return void (await patrolLoop(cfg, noise, sink, w, metricsServer(cfg)));
+    case 'loop': {
+      const metrics = metricsServer(cfg);
+      if (a.port) startHealth({ host: a.host ?? '127.0.0.1', port: Number(a.port) });
+      return void (await patrolEvery(cfg, noise, sink, w, metrics));
+    }
 
     case 'export': {
       const from = align(date(a.from, 'from'), w);
