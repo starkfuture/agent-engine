@@ -25,7 +25,7 @@ import { expiresAt, MAX_TOKEN_DAYS, Users } from './mcp/users.js';
 import { Login } from './mcp/login.js';
 import { InstallationTokens } from './mcp/github-app.js';
 import { RepoSync } from './mcp/reposync.js';
-import { Metrics, startMetrics } from './metrics.js';
+import { Metrics, startHealth, startMetrics } from './metrics.js';
 import { sweep } from './engine/retention.js';
 
 const USAGE = `engine <command> [options]
@@ -63,7 +63,8 @@ Monitor:
       --post                  post cards to SLACK_WEBHOOK_URL
       --replay <dir>          read telemetry from an export instead of Grafana
       --fresh                 in-memory state (don't read or write .state/)
-  loop                        patrol every window (default 15 min) until stopped; same flags, plus --metrics-port
+  loop                        patrol every window (default 15 min) until stopped; same flags, plus --metrics-port,
+                              and --port <n> for a /healthz-only listener (the pod's probes, monitor-only hosting)
   export --from <ISO> --to <ISO> [--out <dir>] [--step <min>]
                               record every patrol query in the range (no LLM), for offline replay
   replay --from <ISO> --to <ISO> [--step <min>] [--replay <dir>] [--llm]
@@ -449,8 +450,11 @@ async function main() {
       return;
     }
 
-    case 'loop':
-      return void (await patrolEvery(cfg, noise, sink, w, metricsServer(cfg)));
+    case 'loop': {
+      const metrics = metricsServer(cfg);
+      if (a.port) startHealth({ host: a.host ?? '127.0.0.1', port: Number(a.port) });
+      return void (await patrolEvery(cfg, noise, sink, w, metrics));
+    }
 
     case 'export': {
       const from = align(date(a.from, 'from'), w);

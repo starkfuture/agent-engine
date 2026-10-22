@@ -62,12 +62,25 @@ export class Metrics {
 
 export function startMetrics(metrics: Metrics, engine: Engine, opts: { host: string; port: number }): Server {
   const server = createServer((req, res) => {
-    if (req.method !== 'GET' || (req.url ?? '').split('?')[0] !== '/metrics') return void res.writeHead(404).end();
+    const path = (req.url ?? '').split('?')[0];
+    if (req.method === 'GET' && path === '/healthz') return void res.writeHead(200).end('ok');
+    if (req.method !== 'GET' || path !== '/metrics') return void res.writeHead(404).end();
     try {
       res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' }).end(metrics.render(engine));
     } catch (e) {
       res.writeHead(500).end((e as Error).message);
     }
+  });
+  server.listen(opts.port, opts.host);
+  return server;
+}
+
+// Monitor-only hosting (`loop`): the pod's probes check /healthz on the app
+// port, where `serve` would put the MCP endpoint. This answers only that.
+export function startHealth(opts: { host: string; port: number }): Server {
+  const server = createServer((req, res) => {
+    if (req.method === 'GET' && (req.url ?? '').split('?')[0] === '/healthz') return void res.writeHead(200).end('ok');
+    res.writeHead(404).end();
   });
   server.listen(opts.port, opts.host);
   return server;
