@@ -17,6 +17,7 @@ import { Store } from '../src/engine/store.js';
 import { buildServer, startHttp, type McpContext } from '../src/mcp/server.js';
 import { Users, type User } from '../src/mcp/users.js';
 import { fakeSession, fetchResponse, ok, readResponse, say, type Script } from './fake-session.js';
+import { FakeTelemetry, world } from './fake.js';
 
 const tmp = (p: string) => mkdtempSync(join(tmpdir(), p));
 const lastId = (t: string) => [...t.matchAll(/evidence_id: (E-[0-9a-f]{4}-\d+)/g)].at(-1)?.[1] ?? 'none';
@@ -39,6 +40,7 @@ function agentsDir(): string {
   add('research', 'concurrency: 3\nbuiltin_tools: [WebFetch]\nlimits: { usd_per_run: 1, usd_per_day: 10 }');
   add('codebase', 'concurrency: 3\nbuiltin_tools: [Read]\nlimits: { usd_per_run: 1, usd_per_day: 10 }');
   add('monitor', 'code: monitor\nsensitive_tools: true');
+  add('prod', 'sensitive_tools: true\ntool_pack: telemetry\nlimits: { usd_per_run: 1, usd_per_day: 10 }');
   return root;
 }
 
@@ -161,6 +163,36 @@ test('a private agent’s runs are readable by the requester and admins only', a
   appendFileSync(join(ctx.cfg.agentsDir, 'research', 'agent.yaml'), '\nvisibility: everyone\n');
   assert.match((await bo.call('get_run', { run_id: runId })).text, /asked by ana/);
   assert.ok((await bo.call('list_runs')).text.includes(runId));
+});
+
+test('the prod agent answers from production telemetry over MCP; other agents never get those tools', async () => {
+  const prodOk: Script = async function* (sim) {
+    const r = await sim.mcp('promql', { query: 'sum(rate(backend_be_production_http_requests_total[5m]))' });
+    yield say();
+    await sim.mcp('submit_findings', answer(lastId(r.text), '/v1/auth/signup', 'Sign-in errors are back to normal'));
+    yield ok(0.1);
+  };
+  const session = fakeSession(prodOk, researchOk);
+  const { ctx, who } = context(session);
+  const { call } = await connect(ctx, who('ana'));
+  assert.match((await call('run_agent', { agent: 'prod', task: 'Is sign-in failing right now?' })).text, /needs production telemetry/, 'no telemetry configured: refused');
+
+  ctx.telemetry = new FakeTelemetry(world);
+  assert.match((await call('list_agents')).text, /tools telemetry pack/);
+  const r = await call('run_agent', { agent: 'prod', task: 'Is sign-in failing right now?', wait_seconds: 10 });
+  assert.equal(r.isError, false, r.text);
+  assert.match(r.text, /: ok/);
+  assert.match(r.text, /Sign-in errors are back to normal/);
+  const prodTools = session.requests[0]!.tools.map((t) => t.name);
+  for (const t of ['service_overview', 'route_timeline', 'log_search', 'promql', 'trace_search']) assert.ok(prodTools.includes(t), t);
+
+  await call('run_agent', { agent: 'research', task: 'Where is feature X configured?', wait_seconds: 10 });
+  const researchTools = session.requests[1]!.tools.map((t) => t.name);
+  assert.ok(!researchTools.includes('promql') && !researchTools.includes('log_search'), 'a web agent never gets production tools');
+
+  // Answers built from prod data stay with the asker.
+  const runId = /run (\S+): ok/.exec(r.text)![1]!;
+  assert.match((await (await connect(ctx, who('bo'))).call('get_run', { run_id: runId })).text, /no run/);
 });
 
 test('a deployment offers only its ENGINE_AGENTS (web agents run apart from prod data)', async () => {

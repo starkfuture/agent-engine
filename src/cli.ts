@@ -276,7 +276,7 @@ async function main() {
     case 'agents': {
       for (const ag of listAgents(cfg.agentsDir, cfg.memoryDir)) {
         const l = ag.spec.limits;
-        console.log(`${ag.spec.name.padEnd(10)} @${ag.version}  ${ag.spec.model}  ${ag.spec.every ? `every ${ag.spec.every}m` : 'manual'}  tools: ${[...ag.spec.builtin_tools, ...(ag.spec.code ? [`${ag.spec.code} pack`] : [])].join(', ') || 'none'}  $${l.usd_per_run}/run $${l.usd_per_day}/day ${l.deadline_min}min  challenge: ${ag.spec.challenge.when}`);
+        console.log(`${ag.spec.name.padEnd(10)} @${ag.version}  ${ag.spec.model}  ${ag.spec.every ? `every ${ag.spec.every}m` : 'manual'}  tools: ${[...ag.spec.builtin_tools, ...(ag.spec.code ? [`${ag.spec.code} pack`] : []), ...(ag.spec.tool_pack ? [`${ag.spec.tool_pack} pack`] : [])].join(', ') || 'none'}  $${l.usd_per_run}/run $${l.usd_per_day}/day ${l.deadline_min}min  challenge: ${ag.spec.challenge.when}`);
         if (ag.spec.description) console.log(`           ${ag.spec.description}`);
       }
       return;
@@ -380,6 +380,15 @@ async function main() {
         repos: loadRepos(cfg.mcp.reposFile, cfg.mcp.reposDir, cfg.mcp.reposGithub),
         ...(cfg.mcp.login ? { login: new Login(cfg.mcp.login, users) } : {}),
         ...(cfg.mcp.notifySlack && cfg.slackWebhookUrl ? { notify: slackNotifier(cfg.slackWebhookUrl) } : {}),
+        ...((): { telemetry?: Telemetry } => {
+          // For agents with tool_pack: telemetry (questions about production).
+          try {
+            return { telemetry: liveTelemetry(cfg) };
+          } catch (e) {
+            log(`no production telemetry for MCP agents: ${(e as Error).message}`);
+            return {};
+          }
+        })(),
         log,
       };
       if (cmd === 'mcp-stdio') {

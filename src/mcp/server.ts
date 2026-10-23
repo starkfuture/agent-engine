@@ -11,6 +11,8 @@ import { findingsOutput, type Findings } from '../engine/output.js';
 import { runAgent, type Engine, type Root, type RunResult } from '../engine/run.js';
 import { cleanModelText, redact, safeJson, slackEscape, truncate } from '../engine/text.js';
 import type { RunRow } from '../engine/store.js';
+import type { Telemetry } from '../clients/telemetry.js';
+import { monitorTools } from '../investigate/tools.js';
 import type { Login } from './login.js';
 import { expiresAt, type User, type Users } from './users.js';
 
@@ -27,6 +29,7 @@ export interface McpContext {
   notify?: (text: string) => Promise<void>; // Slack; absent = no notifications
   login?: Login; // Google login that issues tokens; absent = tokens only from the CLI
   log?: (s: string) => void;
+  telemetry?: Telemetry; // production metrics/logs/traces, for agents with tool_pack: telemetry
 }
 
 interface Active {
@@ -101,7 +104,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
             return [
               `${a.spec.name} @${a.version}${a.spec.code ? ' (scheduled; not runnable here)' : ''}`,
               `  ${a.spec.description}`,
-              `  model ${a.spec.model} · tools ${[...a.spec.builtin_tools, ...(a.spec.code ? [`${a.spec.code} pack`] : [])].join(', ') || 'none'} · $${l.usd_per_run}/run · ${l.deadline_min} min · up to ${a.spec.concurrency} at once${needsRepo ? ' · needs repo' : ''} · challenge ${a.spec.challenge.when}`,
+              `  model ${a.spec.model} · tools ${[...a.spec.builtin_tools, ...(a.spec.code ? [`${a.spec.code} pack`] : []), ...(a.spec.tool_pack ? [`${a.spec.tool_pack} pack`] : [])].join(', ') || 'none'} · $${l.usd_per_run}/run · ${l.deadline_min} min · up to ${a.spec.concurrency} at once${needsRepo ? ' · needs repo' : ''} · challenge ${a.spec.challenge.when}`,
             ].join('\n');
           })
           .join('\n\n'),
@@ -131,6 +134,8 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       const agent = agentByName(ctx, name);
       if (!agent) return err(`no agent "${name}"; see list_agents`);
       if (agent.spec.code) return err(`${name} runs on its schedule and can't be started here; read its runs with list_runs`);
+      if (agent.spec.tool_pack === 'telemetry' && !ctx.telemetry) return err(`${name} needs production telemetry, which this engine is not configured to read`);
+      const packTools = agent.spec.tool_pack === 'telemetry' ? monitorTools(ctx.telemetry!, ctx.cfg, new Date()) : undefined;
       const needsRepo = agent.spec.builtin_tools.some((t) => (FILE_TOOLS as readonly string[]).includes(t));
       let roots: Root[] | undefined;
       if (needsRepo) {
@@ -147,6 +152,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
         agent,
         trigger: `mcp:${user.name}`,
         task,
+        ...(packTools ? { tools: packTools } : {}),
         output: findingsOutput,
         ...(challenge ? { challenge: true } : {}),
         ...(roots ? { roots } : {}),

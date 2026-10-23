@@ -34,6 +34,9 @@ export const AgentSpec = z
     builtin_tools: z.array(BUILTIN).default([]),
     // Packs that reach credentialed or sensitive systems (Grafana, k8s, …).
     sensitive_tools: z.boolean().default(false),
+    // In-process tools the engine supplies to runs started over MCP:
+    // telemetry = read-only Prometheus/Loki/Tempo (the monitor's tools).
+    tool_pack: z.enum(['telemetry']).optional(),
     concurrency: z.number().int().min(1).max(10).default(1), // runs of this agent at once
     limits: z
       .object({
@@ -89,6 +92,7 @@ export function loadAgent(dir: string, memoryRoot?: string): LoadedAgent {
   const reads = spec.sensitive_tools || spec.builtin_tools.some((t) => (FILE_TOOLS as readonly string[]).includes(t));
   const egress = spec.builtin_tools.some((t) => (WEB_TOOLS as readonly string[]).includes(t));
   if (reads && egress) throw new Error(`${spec.name}: an agent cannot have both sensitive reads (files or credentialed tools) and web tools`);
+  if (spec.tool_pack && !spec.sensitive_tools) throw new Error(`${spec.name}: tool_pack reaches production data, so sensitive_tools must be true`);
 
   // Hooks and settings in an agent folder would run outside the engine's control.
   for (const bad of ['hooks', '.claude', '.mcp.json']) if (existsSync(join(dir, bad))) throw new Error(`${spec.name}: "${bad}" is not allowed in an agent folder`);
