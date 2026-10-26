@@ -66,9 +66,12 @@ const commit = (root: string, msg = 'c') => execFileSync('git', ['-C', root, '-c
 
 test('all shipped agents load, and the Rule of Two is enforced at load time and at run time', async () => {
   const names = listAgents(join(import.meta.dirname, '..', 'agents')).map((a) => a.spec.name);
-  assert.deepEqual(names, ['codebase', 'monitor', 'research']);
+  assert.deepEqual(names, ['codebase', 'monitor', 'prod', 'research']);
   assert.throws(() => loadAgent(agentDir('builtin_tools: [Read, WebFetch]')), /cannot have both/);
   assert.throws(() => loadAgent(agentDir('sensitive_tools: true\nbuiltin_tools: [WebSearch]')), /cannot have both/);
+  // A production-data tool pack is a sensitive read: it can't be declared without saying so, nor next to web tools.
+  assert.throws(() => loadAgent(agentDir('tool_pack: telemetry')), /sensitive_tools must be true/);
+  assert.throws(() => loadAgent(agentDir('sensitive_tools: true\ntool_pack: telemetry\nbuiltin_tools: [WebFetch]')), /cannot have both/);
   // Credentialed tools passed in code count as sensitive reads.
   const creds: ToolFactory = () => [tool('grafana_query', 'q', {}, async () => ({ content: [] }))];
   await assert.rejects(runAgent(engine(fakeSession()), { agent: loadAgent(agentDir(web)), trigger: 't', task: 'q', output: findingsOutput, tools: creds }), /Rule of Two/);

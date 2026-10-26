@@ -1,0 +1,18 @@
+name: prod
+description: Answers questions about production right now from metrics, logs and traces (read-only, cites evidence). Ask what's wrong, whether a deploy went well, why a route fails.
+visibility: requester # answers are built from production data; only the asker (and admins) see them
+model: claude-sonnet-5-5
+concurrency: 2
+sensitive_tools: true # read-only Prometheus/Loki/Tempo
+tool_pack: telemetry
+builtin_tools: [] # no shell, no files, no web
+limits:
+  max_turns: 30
+  usd_per_run: 1.5
+  usd_per_day: 10
+  deadline_min: 10
+challenge:
+  when: never # turn on per run with challenge: true
+  model: claude-opus-5-5
+  usd: 1
+  max_turns: 15
