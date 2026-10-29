@@ -13,7 +13,7 @@ import { cleanModelText, redact, safeJson, slackEscape, truncate } from '../engi
 import type { RunRow } from '../engine/store.js';
 import type { Telemetry } from '../clients/telemetry.js';
 import { monitorTools } from '../investigate/tools.js';
-import { METADATA_PATH, Refused, type Login } from './login.js';
+import { METADATA_PATH, Refused, serverName, type Login } from './login.js';
 import { expiresAt, type User, type Users } from './users.js';
 
 // The engine over MCP, for several developers. One process holds the engine:
@@ -359,17 +359,20 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
         if (domain && !email.toLowerCase().endsWith(`@${domain}`)) return err(`only @${domain} addresses`);
         try {
           const u = ctx.users.invite(email, { admin: asAdmin });
-          return text(`${u.email} can sign in as ${u.role} (user ${u.name})${ctx.login ? `: claude mcp add --transport http agent-engine ${ctx.cfg.mcp.login!.publicUrl}/mcp --client-id ${ctx.cfg.mcp.login!.clientId} --callback-port ${CALLBACK_PORT}` : ''}`);
+          const login = ctx.login ? ctx.cfg.mcp.login! : undefined;
+          return text(`${u.email} can sign in as ${u.role} (user ${u.name})${login ? `: claude mcp add --transport http ${serverName(login.publicUrl)} ${login.publicUrl.replace(/\/+$/, '')}/mcp --client-id ${login.clientId} --callback-port ${CALLBACK_PORT}` : ''}`);
         } catch (e) {
           return err((e as Error).message);
         }
       },
     );
-    s.registerTool('remove_user', { description: 'Admin: remove a user; they lose access on their next request.', inputSchema: { name: z.string().max(60) } }, async ({ name }) => {
+    s.registerTool('remove_user', { description: 'Admin: remove a user (by name or email); they lose access on their next request.', inputSchema: { name: z.string().max(200) } }, async ({ name }) => {
       const denied = notAdminNow();
       if (denied) return denied;
-      if (name === user.name) return err('you cannot remove yourself');
-      return ctx.users.remove(name) ? text(`${name} removed`) : err(`no user ${name}`);
+      const target = ctx.users.list().find((u) => u.name === name) ?? ctx.users.byEmail(name);
+      if (!target) return err(`no user ${name}`);
+      if (target.name === user.name) return err('you cannot remove yourself');
+      return ctx.users.remove(target.name) ? text(`${target.name} removed`) : err(`no user ${name}`);
     });
     s.registerTool('list_users', { description: 'Admin: users, roles and how they sign in.', inputSchema: {} }, async () => {
       const denied = notAdminNow();

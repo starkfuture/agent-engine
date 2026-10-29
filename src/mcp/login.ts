@@ -106,6 +106,14 @@ const MAX_TOKEN = 16_384;
 const IMPERSONATION = ['adminUser', 'specialAccess', 'impersonator', 'act'];
 export const METADATA_PATH = '/.well-known/oauth-protected-resource/mcp';
 
+// The MCP server name people add, after the deployment's host
+// (agent-engine, agent-engine-web), so adding both doesn't collide.
+export function serverName(publicUrl: string): string {
+  const host = new URL(publicUrl).hostname;
+  const first = host.split('.')[0] ?? '';
+  return host.includes('.') && /^[a-z][a-z0-9-]{0,40}$/.test(first) ? first : 'agent-engine';
+}
+
 const part = (s: string): Record<string, unknown> => {
   try {
     const v = JSON.parse(Buffer.from(s, 'base64url').toString('utf8')) as unknown;

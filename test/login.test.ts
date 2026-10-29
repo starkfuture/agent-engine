@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { loadConfig } from '../src/config.js';
-import { JwksKeys, Login, Refused } from '../src/mcp/login.js';
+import { JwksKeys, Login, Refused, serverName } from '../src/mcp/login.js';
 import { LOCK_WAIT_MS, nameFromEmail, Users } from '../src/mcp/users.js';
 import { fakeKeycloak } from './fake-keycloak.js';
 
@@ -189,6 +189,13 @@ test('CLI tokens expire: 90 days at most, an expired token is unknown', () => {
   const t = users.add('cy', { days: 1 });
   assert.equal(users.authenticate(t)?.name, 'cy');
   assert.equal(users.authenticate(t, new Date(Date.now() + 2 * 86_400_000)), undefined);
+});
+
+test('the MCP server is named after its deployment', () => {
+  assert.equal(serverName('https://agent-engine.starkfuture.com'), 'agent-engine');
+  assert.equal(serverName('https://agent-engine-web.starkfuture.com/'), 'agent-engine-web');
+  assert.equal(serverName('http://localhost:8788'), 'agent-engine');
+  assert.equal(serverName('http://127.0.0.1:8788'), 'agent-engine');
 });
 
 test('user names come from the email local part', () => {

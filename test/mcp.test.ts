@@ -119,7 +119,8 @@ test('only admins manage users; invites never mint a token and stay on the compa
   assert.match((await call('invite_user', { email: 'eve@gmail.com' })).text, /error: only @starkfuture\.com/);
   assert.match((await call('list_users')).text, /^cy +member keycloak +cy@starkfuture\.com$/m);
   assert.match((await call('remove_user', { name: 'root' })).text, /cannot remove yourself/);
-  assert.match((await call('remove_user', { name: 'cy' })).text, /cy removed/);
+  assert.match((await call('remove_user', { name: 'Cy@StarkFuture.com' })).text, /cy removed/, 'by email too');
+  assert.match((await call('remove_user', { name: 'cy' })).text, /error: no user cy/);
 
   // Removed (or demoted) after its request was authenticated: no admin action completes.
   ctx.users.setRole('root', 'member');
@@ -384,6 +385,11 @@ test('HTTP with the Keycloak sign-in: discovery, challenge, invited company acco
   assert.equal(stranger.status, 403, 'a company account alone is not enough');
   assert.equal(stranger.headers.get('www-authenticate'), null, 'signing in again would not help');
   assert.equal((await post({ authorization: `Bearer ${kc.token({ email: 'dee@starkfuture.com', azp: 'stark-admin' })}` })).status, 403);
+
+  // The invite hands out the add command, named after this deployment.
+  ctx.cfg.mcp.login = { ...kc.cfg, publicUrl: 'https://agent-engine-web.starkfuture.com/', admins: [] };
+  const { call } = await connect(ctx, ctx.users.list().find((u) => u.name === 'root')!);
+  assert.match((await call('invite_user', { email: 'eve@starkfuture.com' })).text, /: claude mcp add --transport http agent-engine-web https:\/\/agent-engine-web\.starkfuture\.com\/mcp --client-id agent-engine --callback-port 33419$/);
 
   const client = new Client({ name: 't', version: '1' });
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { authorization: `Bearer ${kc.token({ email: 'dee@starkfuture.com' })}` } } }));
