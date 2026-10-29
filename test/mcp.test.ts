@@ -14,10 +14,12 @@ import type { Findings } from '../src/engine/output.js';
 import type { Engine } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
 import { Store } from '../src/engine/store.js';
+import { Login } from '../src/mcp/login.js';
 import { buildServer, startHttp, type McpContext } from '../src/mcp/server.js';
 import { Users, type User } from '../src/mcp/users.js';
 import { fakeSession, fetchResponse, ok, readResponse, say, type Script } from './fake-session.js';
 import { FakeTelemetry, world } from './fake.js';
+import { fakeKeycloak } from './fake-keycloak.js';
 
 const tmp = (p: string) => mkdtempSync(join(tmpdir(), p));
 const lastId = (t: string) => [...t.matchAll(/evidence_id: (E-[0-9a-f]{4}-\d+)/g)].at(-1)?.[1] ?? 'none';
@@ -115,9 +117,10 @@ test('only admins manage users; invites never mint a token and stay on the compa
   assert.match((await call('invite_user', { email: 'Cy@starkfuture.com' })).text, /cy@starkfuture\.com can sign in as member \(user cy\)/);
   assert.equal(ctx.users.list().find((u) => u.name === 'cy')?.token_sha256, undefined);
   assert.match((await call('invite_user', { email: 'eve@gmail.com' })).text, /error: only @starkfuture\.com/);
-  assert.match((await call('list_users')).text, /^cy +member invited +cy@starkfuture\.com$/m);
+  assert.match((await call('list_users')).text, /^cy +member keycloak +cy@starkfuture\.com$/m);
   assert.match((await call('remove_user', { name: 'root' })).text, /cannot remove yourself/);
-  assert.match((await call('remove_user', { name: 'cy' })).text, /cy removed/);
+  assert.match((await call('remove_user', { name: 'Cy@StarkFuture.com' })).text, /cy removed/, 'by email too');
+  assert.match((await call('remove_user', { name: 'cy' })).text, /error: no user cy/);
 
   // Removed (or demoted) after its request was authenticated: no admin action completes.
   ctx.users.setRole('root', 'member');
@@ -350,4 +353,50 @@ test('HTTP: bearer token per person, POST only, local Host header on a loopback 
   const names = (await client.listTools()).tools.map((x) => x.name);
   assert.ok(names.includes('run_agent') && !names.includes('stop_all'));
   await client.close();
+});
+
+test('HTTP with the Keycloak sign-in: discovery, challenge, invited company accounts only, no CLI tokens', async (t) => {
+  const { ctx, tokens } = context(fakeSession());
+  const kc = fakeKeycloak('https://agent-engine.test');
+  ctx.login = new Login(kc.cfg, kc.keys);
+  ctx.users.invite('dee@starkfuture.com');
+  const server = startHttp(ctx, { host: '127.0.0.1', port: 0 });
+  await new Promise<void>((r, j) => (server.listening ? r() : server.once('listening', r).once('error', j))).catch((e: NodeJS.ErrnoException) => {
+    if (e.code === 'EPERM') t.skip('local port binding not allowed here');
+    throw e;
+  });
+  t.after(() => void server.close());
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } } };
+  const post = (headers: Record<string, string>) => fetch(`${base}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...headers }, body: JSON.stringify(init) });
+
+  const doc = await fetch(`${base}/.well-known/oauth-protected-resource/mcp`);
+  assert.equal(doc.status, 200);
+  assert.deepEqual(((await doc.json()) as { authorization_servers: string[] }).authorization_servers, [kc.cfg.issuer]);
+  assert.equal((await fetch(`${base}/.well-known/oauth-protected-resource`)).status, 200);
+  assert.equal((await fetch(`${base}/login`)).status, 404, 'no Google login page any more');
+
+  const anon = await post({});
+  assert.equal(anon.status, 401);
+  assert.equal(anon.headers.get('www-authenticate'), 'Bearer resource_metadata="https://agent-engine.test/.well-known/oauth-protected-resource/mcp"');
+  assert.equal((await post({ authorization: `Bearer ${tokens.ana}` })).status, 401, 'CLI tokens are not accepted hosted');
+  assert.equal((await post({ authorization: `Bearer ${kc.token({ exp: 1 })}` })).status, 401);
+  const stranger = await post({ authorization: `Bearer ${kc.token({ email: 'stranger@starkfuture.com' })}` });
+  assert.equal(stranger.status, 403, 'a company account alone is not enough');
+  assert.equal(stranger.headers.get('www-authenticate'), null, 'signing in again would not help');
+  assert.equal((await post({ authorization: `Bearer ${kc.token({ email: 'dee@starkfuture.com', azp: 'stark-admin' })}` })).status, 403);
+
+  // The invite hands out the add command, named after this deployment.
+  ctx.cfg.mcp.login = { ...kc.cfg, publicUrl: 'https://agent-engine-web.starkfuture.com/', admins: [] };
+  const { call } = await connect(ctx, ctx.users.list().find((u) => u.name === 'root')!);
+  assert.match((await call('invite_user', { email: 'eve@starkfuture.com' })).text, /: claude mcp add --transport http agent-engine-web https:\/\/agent-engine-web\.starkfuture\.com\/mcp --client-id agent-engine --callback-port 33419$/);
+
+  const client = new Client({ name: 't', version: '1' });
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { authorization: `Bearer ${kc.token({ email: 'dee@starkfuture.com' })}` } } }));
+  const names = (await client.listTools()).tools.map((x) => x.name);
+  assert.ok(names.includes('run_agent') && !names.includes('stop_all'));
+  await client.close();
+
+  ctx.users.remove('dee');
+  assert.equal((await post({ authorization: `Bearer ${kc.token({ email: 'dee@starkfuture.com' })}` })).status, 403, 'removal applies on the next request');
 });

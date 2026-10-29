@@ -74,10 +74,10 @@ export interface Config {
     // Agents this server offers (ENGINE_AGENTS=monitor,codebase); unset = all.
     // Hosted, web-reading agents run in their own deployment, away from prod data.
     agents: string[] | undefined;
-    // Google login that issues tokens (GOOGLE_CLIENT_ID/SECRET, ENGINE_PUBLIC_URL).
+    // Sign-in through Keycloak (KEYCLOAK_ISSUER, ENGINE_PUBLIC_URL); unset = tokens from the CLI.
     // admins: ENGINE_ADMINS, the first admins: seeded into the users file (as invites)
-    // at startup while it has no admin. Sign-in is decided by the file alone.
-    login: { clientId: string; clientSecret: string; publicUrl: string; domain: string; admins: string[] } | undefined;
+    // at startup while it has no admin. Who may sign in is decided by the file alone.
+    login: { issuer: string; jwksUrl: string; clientId: string; publicUrl: string; domain: string; admins: string[] } | undefined;
     reposDir: string | undefined; // where the engine clones `github:` repos (a persistent volume when hosted)
     reposGithub: string | undefined; // ENGINE_REPOS_GITHUB: name=owner/repo[@ref],… (env-only hosts)
     // GitHub App (contents: read) the engine fetches those repos as.
@@ -107,16 +107,31 @@ export function loadDotEnv(file = resolve('.env'), env: NodeJS.ProcessEnv = proc
   }
 }
 
-// All three or none: a half-configured login must stop the server, not run open.
+// KEYCLOAK_ISSUER turns the sign-in on, and then the rest must be right: a
+// half-configured login must stop the server, not run open. Keycloak
+// settings without the issuer stop it too: the sign-in would be off and CLI
+// tokens would work instead. (ENGINE_PUBLIC_URL and the like alone are allowed:
+// the monitor-only deployment carries them; `serve` refuses a non-loopback
+// bind without the sign-in anyway.)
+const LOGIN_VARS = ['KEYCLOAK_JWKS_URL', 'ENGINE_KC_CLIENT_ID'];
 function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
-  const [clientId, clientSecret, publicUrl] = [opt(env.GOOGLE_CLIENT_ID), opt(env.GOOGLE_CLIENT_SECRET), opt(env.ENGINE_PUBLIC_URL)];
-  if (!clientId && !clientSecret) return undefined;
-  if (!clientId || !clientSecret || !publicUrl) throw new Error('Google login needs GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and ENGINE_PUBLIC_URL');
-  if (!/^https:\/\//.test(publicUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(publicUrl)) throw new Error('ENGINE_PUBLIC_URL must be https (or localhost for testing)');
+  const issuer = opt(env.KEYCLOAK_ISSUER)?.replace(/\/+$/, '');
+  if (!issuer) {
+    const set = LOGIN_VARS.filter((k) => opt(env[k]));
+    if (set.length) throw new Error(`${set.join(', ')} set without KEYCLOAK_ISSUER: set the issuer to turn the Keycloak sign-in on, or unset them`);
+    return undefined;
+  }
+  const publicUrl = opt(env.ENGINE_PUBLIC_URL);
+  if (!publicUrl) throw new Error('Keycloak sign-in needs ENGINE_PUBLIC_URL, the address people add to Claude Code');
+  const secure = (u: string) => /^https:\/\//.test(u) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(u);
+  if (!secure(publicUrl)) throw new Error('ENGINE_PUBLIC_URL must be https (or localhost for testing)');
+  if (!secure(issuer)) throw new Error('KEYCLOAK_ISSUER must be https (or localhost for testing)');
+  const jwksUrl = opt(env.KEYCLOAK_JWKS_URL) ?? `${issuer}/protocol/openid-connect/certs`;
+  if (!secure(jwksUrl) && !/^http:\/\/[a-z0-9.-]+\.svc(\.cluster\.local)?(:\d+)?\//.test(jwksUrl)) throw new Error('KEYCLOAK_JWKS_URL must be https, in-cluster or localhost');
   const domain = env.ENGINE_LOGIN_DOMAIN || 'starkfuture.com';
   const admins = (env.ENGINE_ADMINS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   for (const a of admins) if (!a.endsWith(`@${domain}`)) throw new Error(`ENGINE_ADMINS: ${a} is not an @${domain} address`);
-  return { clientId, clientSecret, publicUrl, domain, admins };
+  return { issuer, jwksUrl, clientId: env.ENGINE_KC_CLIENT_ID || 'agent-engine', publicUrl, domain, admins };
 }
 
 export function loadSources(file: string): Sources {

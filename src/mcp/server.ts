@@ -13,12 +13,12 @@ import { cleanModelText, redact, safeJson, slackEscape, truncate } from '../engi
 import type { RunRow } from '../engine/store.js';
 import type { Telemetry } from '../clients/telemetry.js';
 import { monitorTools } from '../investigate/tools.js';
-import type { Login } from './login.js';
+import { METADATA_PATH, Refused, serverName, type Login } from './login.js';
 import { expiresAt, type User, type Users } from './users.js';
 
 // The engine over MCP, for several developers. One process holds the engine:
 // budgets, run history and the kill switch stay in one place; people connect
-// with their own token. Runs start in the background; the caller gets a run id
+// with their own identity. Runs start in the background; the caller gets a run id
 // right away and a Slack mention when it ends.
 
 export interface McpContext {
@@ -27,7 +27,7 @@ export interface McpContext {
   users: Users;
   repos: Map<string, Root>;
   notify?: (text: string) => Promise<void>; // Slack; absent = no notifications
-  login?: Login; // Google login that issues tokens; absent = tokens only from the CLI
+  login?: Login; // Keycloak sign-in; absent = tokens only from the CLI
   log?: (s: string) => void;
   telemetry?: Telemetry; // production metrics/logs/traces, for agents with tool_pack: telemetry
 }
@@ -309,10 +309,11 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
 
   if (admin) {
     // The identity was checked when the request arrived; an admin removed or
-    // demoted since (or whose token was rotated) must not finish an admin action.
+    // demoted since (or whose token was rotated, or whose name now belongs to
+    // another email) must not finish an admin action.
     const notAdminNow = () => {
       const now = ctx.users.list().find((u) => u.name === user.name);
-      return now?.role === 'admin' && now.token_sha256 === user.token_sha256 ? undefined : err('you are no longer an admin');
+      return now?.role === 'admin' && now.token_sha256 === user.token_sha256 && now.email === user.email ? undefined : err('you are no longer an admin');
     };
     s.registerTool(
       'approve_lesson',
@@ -346,11 +347,11 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       if (existsSync(ctx.engine.stopFile)) unlinkSync(ctx.engine.stopFile);
       return text('STOP cleared');
     });
-    // Who may use the engine. Tokens are issued only at /login, and only to
-    // invited emails; nothing here mints one.
+    // Who may use the engine: only invited emails can sign in; nothing here
+    // mints a token.
     s.registerTool(
       'invite_user',
-      { description: 'Admin: let someone sign in at /login and get a token. Nobody else can.', inputSchema: { email: z.string().email().max(200), admin: z.boolean().default(false) } },
+      { description: 'Admin: let someone sign in with their company account. Nobody else can.', inputSchema: { email: z.string().email().max(200), admin: z.boolean().default(false) } },
       async ({ email, admin: asAdmin }) => {
         const denied = notAdminNow();
         if (denied) return denied;
@@ -358,22 +359,25 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
         if (domain && !email.toLowerCase().endsWith(`@${domain}`)) return err(`only @${domain} addresses`);
         try {
           const u = ctx.users.invite(email, { admin: asAdmin });
-          return text(`${u.email} can sign in as ${u.role} (user ${u.name})${ctx.login ? ` at ${ctx.cfg.mcp.login!.publicUrl}/login` : ''}`);
+          const login = ctx.login ? ctx.cfg.mcp.login! : undefined;
+          return text(`${u.email} can sign in as ${u.role} (user ${u.name})${login ? `: claude mcp add --transport http ${serverName(login.publicUrl)} ${login.publicUrl.replace(/\/+$/, '')}/mcp --client-id ${login.clientId} --callback-port ${CALLBACK_PORT}` : ''}`);
         } catch (e) {
           return err((e as Error).message);
         }
       },
     );
-    s.registerTool('remove_user', { description: 'Admin: remove a user; their token stops working now.', inputSchema: { name: z.string().max(60) } }, async ({ name }) => {
+    s.registerTool('remove_user', { description: 'Admin: remove a user (by name or email); they lose access on their next request.', inputSchema: { name: z.string().max(200) } }, async ({ name }) => {
       const denied = notAdminNow();
       if (denied) return denied;
-      if (name === user.name) return err('you cannot remove yourself');
-      return ctx.users.remove(name) ? text(`${name} removed`) : err(`no user ${name}`);
+      const target = ctx.users.list().find((u) => u.name === name) ?? ctx.users.byEmail(name);
+      if (!target) return err(`no user ${name}`);
+      if (target.name === user.name) return err('you cannot remove yourself');
+      return ctx.users.remove(target.name) ? text(`${target.name} removed`) : err(`no user ${name}`);
     });
-    s.registerTool('list_users', { description: 'Admin: users, roles and token state.', inputSchema: {} }, async () => {
+    s.registerTool('list_users', { description: 'Admin: users, roles and how they sign in.', inputSchema: {} }, async () => {
       const denied = notAdminNow();
       if (denied) return denied;
-      const rows = ctx.users.list().map((u) => `${u.name.padEnd(16)} ${u.role.padEnd(6)} ${!u.token_sha256 ? 'invited' : new Date(expiresAt(u)).getTime() > Date.now() ? `token until ${new Date(expiresAt(u)).toISOString().slice(0, 10)}` : 'expired'}  ${u.email ?? ''}`);
+      const rows = ctx.users.list().map((u) => `${u.name.padEnd(16)} ${u.role.padEnd(6)} ${!u.token_sha256 ? 'keycloak' : new Date(expiresAt(u)).getTime() > Date.now() ? `token until ${new Date(expiresAt(u)).toISOString().slice(0, 10)}` : 'expired'}  ${u.email ?? ''}`);
       return text(rows.join('\n') || 'no users');
     });
   }
@@ -417,9 +421,14 @@ async function body(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null');
 }
 
+// Claude Code's fixed OAuth callback port: the Keycloak client allows exactly
+// http://localhost:<port>/callback (and 127.0.0.1), nothing else.
+export const CALLBACK_PORT = 33419;
+
 // Streamable HTTP, stateless: each POST gets a fresh server bound to the
-// caller's identity. Bearer token per person. On a loopback bind the Host
-// header must be local too (DNS rebinding); anywhere else put TLS in front.
+// caller's identity: a Keycloak access token when the sign-in is on, else a
+// CLI-made token. On a loopback bind the Host header must be local too (DNS
+// rebinding); anywhere else put TLS in front.
 export function startHttp(ctx: McpContext, opts: { host: string; port: number }): Server {
   const local = LOOPBACK.has(opts.host);
   const server = createServer(async (req, res) => {
@@ -430,21 +439,35 @@ export function startHttp(ctx: McpContext, opts: { host: string; port: number })
     try {
       const url = new URL(req.url ?? '/', 'http://x');
       if (url.pathname === '/healthz') return void res.writeHead(200).end('ok');
-      const isLogin = url.pathname === '/login' || url.pathname === '/login/callback';
-      if (url.pathname !== '/mcp' && !(isLogin && ctx.login)) return send(404, 'not found');
+      // RFC 9728 puts the document at the path-suffixed form; some clients try the bare one.
+      const isMetadata = url.pathname === METADATA_PATH || url.pathname === '/.well-known/oauth-protected-resource';
+      if (url.pathname !== '/mcp' && !(isMetadata && ctx.login)) return send(404, 'not found');
       if (local && !LOOPBACK.has((req.headers.host ?? '').replace(/:\d+$/, '').replace(/^\[|\]$/g, ''))) return send(403, 'bad host');
-      if (isLogin) {
+      if (isMetadata) {
         if (req.method !== 'GET') return send(405, 'GET only', { allow: 'GET' });
-        const r = await ctx.login!.handle(url);
-        return void res.writeHead(r.status, r.headers).end(r.body);
+        return void res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'max-age=300' }).end(JSON.stringify(ctx.login!.metadata()));
       }
       // Browsers send Origin; MCP clients don't. A page in a developer's
       // browser must not drive the endpoint (MCP spec: validate Origin).
       const origin = req.headers.origin;
       if (origin && !(ctx.cfg.mcp.allowedOrigins ?? []).includes(origin)) return send(403, 'origin not allowed');
       const auth = req.headers.authorization ?? '';
-      const user = ctx.users.authenticate(auth.startsWith('Bearer ') ? auth.slice(7).trim() : undefined);
-      if (!user) return send(401, 'missing or unknown token', { 'www-authenticate': 'Bearer' });
+      const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : undefined;
+      let user: User | undefined;
+      if (ctx.login) {
+        try {
+          const email = await ctx.login.verify(token);
+          user = ctx.users.byEmail(email);
+          if (!user) return send(403, `${email} has not been invited; ask an engine admin`);
+        } catch (e) {
+          if (!(e instanceof Refused)) throw e;
+          if (e.status === 503) ctx.log?.(`sign-in: ${e.message}`);
+          return send(e.status, e.message, e.status === 401 ? { 'www-authenticate': ctx.login.challenge() } : {});
+        }
+      } else {
+        user = ctx.users.authenticate(token);
+        if (!user) return send(401, 'missing or unknown token', { 'www-authenticate': 'Bearer' });
+      }
       if (req.method !== 'POST') return send(405, 'stateless server: POST only', { allow: 'POST' });
       const parsed = await body(req);
       const mcp = buildServer(ctx, user);

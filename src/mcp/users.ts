@@ -3,20 +3,20 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { dirname } from 'node:path';
 import { z } from 'zod';
 
-// People who may use the engine over MCP. Only a SHA-256 of each token is
-// stored; the token itself is shown once, when it is issued. Tokens expire
-// (90 days at most). Hosted, a Google login issues or renews a token, but only
-// for an email an admin has invited (invite() adds it without a token): a
-// company account alone is not enough, since the engine reads prod telemetry
-// and the repos.
+// People who may use the engine over MCP. Hosted, they sign in through
+// Keycloak and this file says who may: only an email an admin has invited
+// (invite() adds it), since a company account alone is not enough: the engine
+// reads prod telemetry and the repos. Locally, the CLI issues tokens instead:
+// only a SHA-256 of each is stored, the token itself is shown once, and it
+// expires (90 days at most).
 const User = z
   .object({
     name: z.string().regex(/^[a-z][a-z0-9._-]{1,40}$/),
     role: z.enum(['member', 'admin']), // admin: stop/resume and approving lessons
-    token_sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(), // absent: invited, not signed in yet
+    token_sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(), // CLI-made users only; absent: signs in through Keycloak
     slack_id: z.string().regex(/^[UW][A-Z0-9]{5,20}$/).optional(), // for the "run finished" mention
     usd_per_day: z.number().positive().max(200).optional(), // overrides ENGINE_USER_DAILY_CAP_USD
-    email: z.string().optional(), // set when the token came from a Google login
+    email: z.string().optional(), // the Keycloak sign-in identity, set by invite()
     added_at: z.string(),
     expires_at: z.string().optional(), // absent (older files): added_at + 90 days
   })
@@ -25,12 +25,6 @@ export type User = z.infer<typeof User>;
 const UsersFile = z.object({ users: z.array(User) }).strict();
 
 const sha = (s: string) => createHash('sha256').update(s).digest();
-
-export class NotInvited extends Error {
-  constructor(readonly email: string) {
-    super(`${email} has not been added; ask an engine admin to invite you`);
-  }
-}
 
 // The user name for an email: its local part, made valid.
 export function nameFromEmail(email: string): string {
@@ -64,8 +58,13 @@ export class Users {
     return existsSync(file) ? UsersFile.parse(JSON.parse(readFileSync(file, 'utf8'))).users : [];
   }
 
+  // The stamp is taken before the read: a change landing in between then
+  // makes the next refresh() re-read, instead of caching the old list as new.
   static load(file: string): Users {
-    return new Users(file, Users.read(file));
+    const stamp = Users.stampOf(file);
+    const users = new Users(file, Users.read(file));
+    users.stamp = stamp;
+    return users;
   }
 
   // A running server picks up `user add`/`user remove` from another process:
@@ -127,8 +126,8 @@ export class Users {
     });
   }
 
-  // An admin lets an email in: a user bound to that email, with no token until
-  // they sign in. Inviting an existing email only changes its role when asked.
+  // An admin lets an email in: a user bound to that email, who signs in
+  // through Keycloak. Inviting an existing email only changes its role when asked.
   invite(email: string, opts: { admin?: boolean } = {}, now = new Date()): User {
     const e = email.toLowerCase();
     return this.mutate((users) => {
@@ -168,19 +167,12 @@ export class Users {
     });
   }
 
-  // After a verified Google login: a new token for that person, replacing any
-  // old one, but only for an email in the users file (invited by an admin, or
-  // seeded from ENGINE_ADMINS). A login never adopts a user bound to another
-  // email, nor one made without an email, and never changes a role.
-  issue(email: string, now = new Date()): { token: string; user: User } {
+  // The user a verified Keycloak sign-in belongs to: only one bound to that
+  // email (invited, or seeded from ENGINE_ADMINS), never a CLI-made user.
+  byEmail(email: string): User | undefined {
+    this.refresh();
     const e = email.toLowerCase();
-    return this.mutate((users) => {
-      const existing = users.find((u) => u.email === e);
-      if (!existing) throw new NotInvited(e);
-      const { token, fields } = Users.fresh(undefined, now);
-      const user = User.parse({ ...existing, ...fields, added_at: existing.added_at });
-      return { users: users.map((u) => (u === existing ? user : u)), result: { token, user } };
-    });
+    return this.users.find((u) => u.email === e);
   }
 
   private static fresh(days = MAX_TOKEN_DAYS, now = new Date()): { token: string; fields: { token_sha256: string; added_at: string; expires_at: string } } {
