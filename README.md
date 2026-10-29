@@ -153,8 +153,17 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 ## MCP server: one engine, several developers
 
 One process holds the engine: budgets, run history, the kill switch, and the
-credentials. Each person connects from Claude Code (or any MCP client) with
-their own token.
+credentials. Each person connects from Claude Code (or any MCP client) as
+themselves: hosted, through the company Keycloak sign-in; locally, with a token
+from the CLI.
+
+Hosted (an admin invites the email first):
+
+```bash
+claude mcp add --transport http agent-engine https://agent-engine.starkfuture.com/mcp --client-id agent-engine --callback-port 33419
+```
+
+Locally:
 
 ```bash
 npm run dev -- user add ana --slack U0123ABCD        # prints a token once; only its hash is stored
@@ -181,11 +190,11 @@ for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 - Hosted: `serve --patrol --llm --metrics-port 9464` runs the MCP endpoint and the monitor's patrol in one process. Telemetry goes straight to the in-cluster backends (`PROMETHEUS_URL`, `LOKI_URL` + `LOKI_ORG_ID`, `TEMPO_URL`); locally it goes through Grafana with a token. Tempo searches are capped at 30 minutes, and regexes starting with `.*` are refused (Tempo is shared).
 - `/metrics` (own port) for the heartbeat alert: `engine_up`, `engine_patrol_last_success_timestamp_seconds`, `engine_patrol_source_up{source}` (blind spots), `engine_runs_today`, `engine_spend_usd` and the caps.
 - `ENGINE_AGENTS` limits which agents a deployment offers. Web-reading agents (research, later ticket triage) run in their own deployment with no access to prod telemetry or the cluster.
-- Tokens expire after at most 90 days (`user add --days`). Hosted, people get their own at `<ENGINE_PUBLIC_URL>/login`: a Google login that must be a verified Workspace account on `ENGINE_LOGIN_DOMAIN` (the `hd` claim, not just the email address). Signing in again rotates the token. Admins are still made with the CLI.
+- Hosted, people sign in through Keycloak (`KEYCLOAK_ISSUER`): the engine is a plain OAuth resource server, so Claude Code finds Keycloak through `/.well-known/oauth-protected-resource/mcp`, signs the person in with the public `agent-engine` client (PKCE) and renews the token itself. Add it with `claude mcp add --transport http agent-engine <ENGINE_PUBLIC_URL>/mcp --client-id agent-engine --callback-port 33419`. Every token is checked against the realm's keys: RS256 only, issuer, audience and client `agent-engine`, an access token (not ID or refresh), unexpired, no impersonation, and a verified email on `ENGINE_LOGIN_DOMAIN`. Locally, `user add` issues tokens that expire after at most 90 days (`--days`).
 - CI: `agent-engine-ci.yml` gates PRs; a push to `main` builds one image and deploys both apps through argo-cd. Changes go through PRs.
 - Hosted repos: an entry in the repos file may be `name: { github: owner/repo, ref?: … }`. With `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY_FILE` (a GitHub App with contents: read), `serve` clones each into `ENGINE_REPOS_DIR/<name>` and fetches every 10 min. Clones are full with no checkout, so snapshots never need the network. The installation token reaches git through `GIT_CONFIG_*` environment variables, never argv or a stored config. Freshness per repo: `engine_repo_last_fetch_timestamp_seconds` and `engine_repo_sync_ok`.
-- A Google login renews only a user bound to the same email; it never adopts a CLI-made user. With the login on, `user add` is refused, and a company account alone is not enough: only emails an admin invited (`invite_user` MCP tool or `user invite <email>`) get a token at `/login`. `ENGINE_ADMINS` seeds the first admins into the users file at startup, and only while it has no admin; after that the file alone decides, so removing or demoting someone sticks. Admin tools re-check the caller's current role before acting. Writers (server and CLI) take a lock and re-read the file, so they can't undo each other. `remove_user` revokes access, and `list_users` shows who is invited or holds a token.
-- CI deploys only when the repo variable `PROD_DEPLOY` is `true`; until then every run on `main` is build-only. Each sign-in page names the MCP server after its deployment (`agent-engine`, `agent-engine-web`).
+- A sign-in maps only to a user bound to the same email; it never adopts a CLI-made user. With the sign-in on, `user add` is refused and CLI tokens are not accepted, and a company account alone is not enough: only emails an admin invited (`invite_user` MCP tool or `user invite <email>`) get in. `ENGINE_ADMINS` seeds the first admins into the users file at startup, and only while it has no admin; after that the file alone decides, so removing or demoting someone sticks. Admin tools re-check the caller's current role before acting. Writers (server and CLI) take a lock and re-read the file, so they can't undo each other. `remove_user` revokes access on the next request, and `list_users` shows each user and how they sign in.
+- CI deploys only when the repo variable `PROD_DEPLOY` is `true`; until then every run on `main` is build-only. Each deployment has its own public URL and MCP server name (`agent-engine`, `agent-engine-web`).
 - Retention (`serve`): run folders and cards older than `ENGINE_RETENTION_DAYS` (default 30) are deleted hourly; the SQLite ledger stays. New runs are refused below 200 MB free; `engine_data_free_bytes` feeds an alert.
 - `prod` agent: ask questions about production right now over MCP ("is sign-in failing?", "did the 14:00 deploy go well?"). It gets the monitor's read-only Prometheus/Loki/Tempo tools (`tool_pack: telemetry`), no web, shell or files, and its answers are visible only to the asker. An agent may declare a tool pack only with `sensitive_tools: true`, and never next to web tools.
 - Tempo: regex matches (`=~`, `!~`) are refused; exact matches only.

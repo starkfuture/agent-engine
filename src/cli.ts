@@ -42,18 +42,16 @@ Agents (folders in agents/):
 
 MCP server (several developers, one engine):
   serve [--host 127.0.0.1] [--port 8787]
-                              Streamable HTTP MCP at /mcp; each person uses their own bearer token
+                              Streamable HTTP MCP at /mcp; each person signs in (Keycloak) or uses their own token
       --patrol [--llm] [--post]  also run the monitor's patrol loop in this process
       --metrics-port <n>      Prometheus metrics at /metrics on their own port (heartbeat)
   mcp-stdio --as <user>       the same tools over stdio, for one local user
-  user add <name> [--admin] [--email <google email>] [--slack <U…>] [--usd <per day>] [--days <n ≤ 90>]
+  user add <name> [--admin] [--email <email>] [--slack <U…>] [--usd <per day>] [--days <n ≤ 90>]
                               issue a token (printed once; only its hash is stored; expires, default 90 days).
-                              Hosted, people get theirs at <ENGINE_PUBLIC_URL>/login (Google, @starkfuture.com)
+                              Local only: with the Keycloak sign-in on (KEYCLOAK_ISSUER), \`user add\` is off
   user list | user remove <name>
-  user invite <email> [--admin]  let someone sign in at /login (no token until they do)
-  user promote | demote <name>  make a user admin or member (no token is issued).
-                              With the Google login on, \`user add\` is off: everyone,
-                              admins too, gets a token by signing in; then promote them
+  user invite <email> [--admin]  let someone sign in with their company account (Keycloak)
+  user promote | demote <name>  make a user admin or member (no token is issued)
 
 Monitor:
   doctor                      check access, list datasources, show real metric labels
@@ -337,7 +335,7 @@ async function main() {
       if (sub === 'list') {
         for (const u of users.list()) {
           const exp = expiresAt(u);
-          const state = !u.token_sha256 ? 'invited' : exp > Date.now() ? `expires ${new Date(exp).toISOString().slice(0, 10)}` : 'EXPIRED';
+          const state = !u.token_sha256 ? 'keycloak' : exp > Date.now() ? `expires ${new Date(exp).toISOString().slice(0, 10)}` : 'EXPIRED';
           console.log(`${u.name.padEnd(16)} ${u.role.padEnd(6)} ${u.slack_id ?? '-'}  $${u.usd_per_day ?? cfg.mcp.userDailyCapUsd}/day  ${state}  ${u.email ?? ''}`);
         }
         return;
@@ -345,22 +343,22 @@ async function main() {
       const name = positionals[2];
       if (!name) throw new Error('usage: user add|remove|promote|demote <name>, user invite <email>');
       if (sub === 'remove') {
-        console.log(users.remove(name) ? `${name} removed; their token no longer works` : `no user ${name}`);
+        console.log(users.remove(name) ? `${name} removed; they lose access on their next request` : `no user ${name}`);
         return;
       }
       if (sub === 'invite') {
         const u = users.invite(name, { admin: a.admin });
-        console.log(`${u.email} invited as ${u.role} (user ${u.name}); they get a token by signing in at /login`);
+        console.log(`${u.email} invited as ${u.role} (user ${u.name}); they sign in with their company account`);
         return;
       }
       if (sub === 'promote' || sub === 'demote') {
         const role = sub === 'promote' ? 'admin' : 'member';
-        console.log(users.setRole(name, role) ? `${name} is now ${role}` : `no user ${name} (they sign in first)`);
+        console.log(users.setRole(name, role) ? `${name} is now ${role}` : `no user ${name} (invite them first)`);
         return;
       }
       if (sub !== 'add') throw new Error('usage: user add|list|remove|invite|promote|demote');
-      // DevOps: tokens only after a company Google login. Hosted, the CLI can't mint one.
-      if (cfg.mcp.login) throw new Error(`the Google login is on: people get their token at ${cfg.mcp.login.publicUrl}/login; then \`user promote <name>\` for admins`);
+      // Hosted, people sign in through Keycloak; the CLI can't mint a token there.
+      if (cfg.mcp.login) throw new Error('the Keycloak sign-in is on: `user invite <email>` instead; then `user promote <name>` for admins');
       const usd = a.usd ? Number(a.usd) : undefined;
       if (usd !== undefined && !(usd > 0)) throw new Error('--usd must be a positive number');
       const days = a.days ? Number(a.days) : undefined;
@@ -378,7 +376,7 @@ async function main() {
         engine: makeEngine(cfg),
         users,
         repos: loadRepos(cfg.mcp.reposFile, cfg.mcp.reposDir, cfg.mcp.reposGithub),
-        ...(cfg.mcp.login ? { login: new Login(cfg.mcp.login, users) } : {}),
+        ...(cfg.mcp.login ? { login: new Login(cfg.mcp.login) } : {}),
         ...(cfg.mcp.notifySlack && cfg.slackWebhookUrl ? { notify: slackNotifier(cfg.slackWebhookUrl) } : {}),
         ...((): { telemetry?: Telemetry } => {
           // For agents with tool_pack: telemetry (questions about production).
@@ -400,16 +398,16 @@ async function main() {
       }
       const host = a.host ?? '127.0.0.1';
       const port = Number(a.port ?? 8787);
-      if (!ctx.users.list().length && !ctx.login) throw new Error('no users yet: add one with `user add <name> --admin`, or configure the Google login');
+      if (!ctx.users.list().length && !ctx.login) throw new Error('no users yet: add one with `user add <name> --admin`, or configure the Keycloak sign-in');
       if (ctx.login) {
         // ENGINE_ADMINS seeds the first admins (as invites) only while the file has none.
         const seeded = ctx.users.seedAdmins(cfg.mcp.login!.admins);
         if (seeded.length) log(`seeded admins from ENGINE_ADMINS: ${seeded.join(', ')}`);
-        if (!ctx.users.list().some((u) => u.role === 'admin')) throw new Error('the Google login is on but there is no admin to invite anyone: set ENGINE_ADMINS or `user invite <email> --admin`');
+        if (!ctx.users.list().some((u) => u.role === 'admin')) throw new Error('the Keycloak sign-in is on but there is no admin to invite anyone: set ENGINE_ADMINS or `user invite <email> --admin`');
       }
       const server = startHttp(ctx, { host, port });
       beforeExit = () => (server.close(), shutdown(ctx, 'engine shutting down', 20_000));
-      log(`MCP on http://${host}:${port}/mcp · login ${ctx.login ? `at ${cfg.mcp.login!.publicUrl}/login` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
+      log(`MCP on http://${host}:${port}/mcp · sign-in ${ctx.login ? `Keycloak ${cfg.mcp.login!.issuer} (client ${cfg.mcp.login!.clientId})` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
       if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
       const metrics = metricsServer(cfg);
       // Retention: hourly, and once at start.

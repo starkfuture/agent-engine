@@ -1,153 +1,130 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { Login, nameFromEmail } from '../src/mcp/login.js';
-import { LOCK_WAIT_MS, Users } from '../src/mcp/users.js';
+import { loadConfig } from '../src/config.js';
+import { JwksKeys, Login, Refused } from '../src/mcp/login.js';
+import { LOCK_WAIT_MS, nameFromEmail, Users } from '../src/mcp/users.js';
+import { fakeKeycloak } from './fake-keycloak.js';
 
-const cfg = { clientId: 'cid.apps.googleusercontent.com', clientSecret: 'shh', publicUrl: 'https://agent-engine.internal.test', domain: 'starkfuture.com' };
-const jwt = (claims: Record<string, unknown>) => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.sig`;
-const good = (over: Record<string, unknown> = {}) => ({ iss: 'https://accounts.google.com', aud: cfg.clientId, exp: Math.floor(Date.now() / 1000) + 600, email: 'ana.lopez@starkfuture.com', email_verified: true, hd: 'starkfuture.com', ...over });
+const refusal = async (p: Promise<unknown>): Promise<number> => {
+  try {
+    await p;
+    return 200;
+  } catch (e) {
+    assert.ok(e instanceof Refused, String(e));
+    return e.status;
+  }
+};
 
-function setup(idClaims: Record<string, unknown>, opts: { invite?: string; admins?: string[] } = {}) {
-  const users = Users.load(join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json'));
-  const sent: URLSearchParams[] = [];
-  const real = globalThis.fetch;
-  globalThis.fetch = (async (_u: string | URL, init?: RequestInit) => {
-    sent.push(new URLSearchParams(String(init?.body)));
-    return new Response(JSON.stringify({ id_token: jwt(idClaims) }), { status: 200 });
-  }) as typeof fetch;
-  if (opts.invite) users.invite(opts.invite);
-  if (opts.admins) users.seedAdmins(opts.admins);
-  const login = new Login(cfg, users);
-  const begin = async () => {
-    const r = await login.handle(new URL('https://x/login'));
-    assert.equal(r.status, 302);
-    return new URL(r.headers.location!);
-  };
-  const back = (state: string, code = 'c0de') => login.handle(new URL(`https://x/login/callback?state=${encodeURIComponent(state)}&code=${code}`));
-  return { users, sent, begin, back, restore: () => (globalThis.fetch = real) };
-}
-
-test('Google login issues a 90-day token to an invited company account, once', async (t) => {
-  const s = setup(good(), { invite: 'ana.lopez@starkfuture.com' });
-  t.after(s.restore);
-  const to = await s.begin();
-  assert.equal(to.origin + to.pathname, 'https://accounts.google.com/o/oauth2/v2/auth');
-  assert.equal(to.searchParams.get('hd'), 'starkfuture.com');
-  assert.equal(to.searchParams.get('code_challenge_method'), 'S256');
-  assert.equal(to.searchParams.get('redirect_uri'), 'https://agent-engine.internal.test/login/callback');
-
-  const r = await s.back(to.searchParams.get('state')!);
-  assert.equal(r.status, 200, r.body);
-  assert.equal(r.headers['cache-control'], 'no-store');
-  const token = /Bearer (eng_[A-Za-z0-9_-]+)/.exec(r.body)![1]!;
-  const u = s.users.authenticate(token)!;
-  assert.equal(u.name, 'ana.lopez');
-  assert.equal(u.role, 'member');
-  assert.equal(u.email, 'ana.lopez@starkfuture.com');
-  const days = (Date.parse(u.expires_at!) - Date.now()) / 86_400_000;
-  assert.ok(days > 89.9 && days <= 90, `${days}`);
-  // PKCE verifier went to Google; the state can't be replayed.
-  assert.ok(s.sent[0]!.get('code_verifier'));
-  assert.equal((await s.back(to.searchParams.get('state')!)).status, 400);
-
-  // Signing in again rotates: the old token stops working.
-  const again = await s.back((await s.begin()).searchParams.get('state')!);
-  const token2 = /Bearer (eng_[A-Za-z0-9_-]+)/.exec(again.body)![1]!;
-  assert.equal(s.users.authenticate(token), undefined);
-  assert.equal(s.users.authenticate(token2)?.name, 'ana.lopez');
-  assert.equal(s.users.list().length, 1);
+test('a Keycloak access token for the engine client yields the verified company email', async () => {
+  const kc = fakeKeycloak();
+  const login = new Login(kc.cfg, kc.keys);
+  assert.equal(await login.verify(kc.token({ email: 'Ana@StarkFuture.com' })), 'ana@starkfuture.com');
+  assert.equal(await login.verify(kc.token({ aud: ['account', 'agent-engine'] })), 'ana@starkfuture.com', 'aud may be a list');
+  assert.equal(await login.verify(kc.token({ exp: Math.floor(Date.now() / 1000) - 2 })), 'ana@starkfuture.com', 'a few seconds of clock skew');
 });
 
-for (const [why, claims] of [
-  ['another domain', good({ email: 'ana@gmail.com', hd: undefined })],
-  ['hd spoofed with a foreign email', good({ email: 'ana@evil.test' })],
-  ['unverified email', good({ email_verified: false })],
-  ['a personal Google account using the company address (no hd)', good({ hd: undefined })],
-  ['another client', good({ aud: 'other' })],
-  ['expired id token', good({ exp: Math.floor(Date.now() / 1000) - 10 })],
-  ['wrong issuer', good({ iss: 'https://evil.test' })],
-] as const)
-  test(`Google login refuses: ${why}`, async (t) => {
-    const s = setup(claims);
-    t.after(s.restore);
-    const r = await s.back((await s.begin()).searchParams.get('state')!);
-    assert.equal(r.status, 403, why);
-    assert.equal(s.users.list().length, 0);
+const other = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
+for (const [why, status, make] of [
+  ['no token', 401, () => undefined],
+  ['garbage', 401, () => 'not-a-jwt'],
+  ['wrong issuer', 401, (kc) => kc.token({ iss: 'https://evil.test/realms/stark' })],
+  ['another realm on the same Keycloak', 401, (kc) => kc.token({ iss: 'https://keycloak.test/auth/realms/master' })],
+  ['not for the engine (aud)', 401, (kc) => kc.token({ aud: 'account' })],
+  ['an ID token', 401, (kc) => kc.token({ typ: 'ID' })],
+  ['a refresh token', 401, (kc) => kc.token({ typ: 'Refresh' })],
+  ['expired', 401, (kc) => kc.token({ exp: Math.floor(Date.now() / 1000) - 60 })],
+  ['not valid yet', 401, (kc) => kc.token({ nbf: Math.floor(Date.now() / 1000) + 60 })],
+  ['HS256 (public key as HMAC secret)', 401, (kc) => kc.token({}, { alg: 'HS256', kid: 'k1' })],
+  ['alg none', 401, (kc) => kc.token({}, { alg: 'none', kid: 'k1' }).replace(/[^.]+$/, '')],
+  ['unknown key', 401, (kc) => kc.token({}, { alg: 'RS256', kid: 'k9' })],
+  ['signed by another key', 401, (kc) => kc.token({}, { alg: 'RS256', kid: 'k1' }, other)],
+  ['payload changed after signing', 401, (kc) => {
+    const [h, , s] = kc.token().split('.');
+    return `${h}.${Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(kc.token().split('.')[1]!, 'base64url').toString()), email: 'boss@starkfuture.com' })).toString('base64url')}.${s}`;
+  }],
+  ['obtained by another client (azp)', 403, (kc) => kc.token({ azp: 'admin-mcp-claude-code' })],
+  ['an impersonated session', 403, (kc) => kc.token({ impersonator: { username: 'admin' } })],
+  ['an admin special-access session', 403, (kc) => kc.token({ adminUser: 'it@starkfuture.com' })],
+  ['unverified email (a customer account using a company address)', 403, (kc) => kc.token({ email_verified: false })],
+  ['another domain', 403, (kc) => kc.token({ email: 'ana@gmail.com' })],
+  ['a look-alike domain', 403, (kc) => kc.token({ email: 'ana@evil-starkfuture.com' })],
+  ['no email', 403, (kc) => kc.token({ email: undefined })],
+] as [string, number, (kc: ReturnType<typeof fakeKeycloak>) => string | undefined][])
+  test(`a token is refused: ${why}`, async () => {
+    const kc = fakeKeycloak();
+    assert.equal(await refusal(new Login(kc.cfg, kc.keys).verify(make(kc))), status, why);
   });
 
-test('a login never takes over a user tied to another email; unknown state is refused', async (t) => {
-  const s = setup(good({ email: 'ana@starkfuture.com' }));
-  t.after(s.restore);
-  s.users.add('ana', { email: 'someone.else@starkfuture.com' });
-  const r = await s.back((await s.begin()).searchParams.get('state')!);
-  assert.equal(r.status, 403);
-  assert.throws(() => s.users.invite('ana@starkfuture.com'), /name ana is taken/);
-  assert.equal((await s.back('forged-state')).status, 400);
-  assert.equal(s.sent.length, 1, 'no code exchange for a forged state');
+test('the protected-resource document points Claude Code at Keycloak', () => {
+  const kc = fakeKeycloak('https://agent-engine.starkfuture.com/');
+  const login = new Login({ ...kc.cfg, issuer: `${kc.cfg.issuer}/` }, kc.keys);
+  assert.deepEqual(login.metadata(), { resource: 'https://agent-engine.starkfuture.com/mcp', authorization_servers: ['https://keycloak.test/auth/realms/stark'], bearer_methods_supported: ['header'], resource_name: 'agent-engine' });
+  assert.equal(login.challenge(), 'Bearer resource_metadata="https://agent-engine.starkfuture.com/.well-known/oauth-protected-resource/mcp"');
 });
 
-test('a login never adopts a CLI-made user, even an admin whose name matches the email', async (t) => {
-  const s = setup(good({ email: 'lead@starkfuture.com' }));
-  t.after(s.restore);
-  const admin = s.users.add('lead', { admin: true }); // an admin token handed out by name
-  const r = await s.back((await s.begin()).searchParams.get('state')!);
-  assert.equal(r.status, 403);
-  assert.equal(s.users.authenticate(admin)?.role, 'admin', 'the admin token still works');
-  assert.equal(s.users.list().length, 1);
+test('signing keys: cached, refetched for a new kid at most every 30 s, stale keys survive an outage', async (t) => {
+  const kc = fakeKeycloak();
+  const jwk = { ...kc.publicKey.export({ format: 'jwk' }), kid: 'k1', use: 'sig' };
+  const enc = { ...generateKeyPairSync('rsa', { modulusLength: 2048 }).publicKey.export({ format: 'jwk' }), kid: 'e1', use: 'enc' };
+  let now = 1_000_000;
+  let fetches = 0;
+  let down = false;
+  const real = globalThis.fetch;
+  t.after(() => (globalThis.fetch = real));
+  globalThis.fetch = (async () => {
+    fetches++;
+    if (down) throw new Error('connect timeout');
+    return new Response(JSON.stringify({ keys: [jwk, enc] }), { status: 200 });
+  }) as typeof fetch;
+
+  const keys = new JwksKeys(kc.cfg.jwksUrl, () => now);
+  assert.ok(await keys.keyFor('k1'));
+  assert.equal(await keys.keyFor('e1'), undefined, 'an encryption key never verifies a signature');
+  assert.equal(fetches, 1, 'the unknown kid right after a fetch waits for the 30 s floor');
+  now += 31_000;
+  assert.equal(await keys.keyFor('k9'), undefined);
+  assert.equal(fetches, 2, 'an unknown kid refetches (rotation)');
+  assert.equal(await keys.keyFor('k9'), undefined);
+  assert.equal(fetches, 2, 'but not on every request');
+
+  down = true;
+  now += 11 * 60_000;
+  assert.ok(await keys.keyFor('k1'), 'Keycloak unreachable: the cached key still verifies');
+  const login = new Login(kc.cfg, keys, () => now);
+  assert.equal(await login.verify(kc.token()), 'ana@starkfuture.com');
+
+  const cold = new JwksKeys(kc.cfg.jwksUrl, () => now);
+  assert.equal(await refusal(new Login(kc.cfg, cold).verify(kc.token())), 503, 'cannot check is not invalid');
 });
 
-test('the token page names the MCP server after the deployment', async (t) => {
-  const s = setup(good(), { invite: 'ana.lopez@starkfuture.com' });
-  t.after(s.restore);
-  const login = new Login({ ...cfg, publicUrl: 'https://agent-engine-web.starkfuture.com' }, s.users);
-  const to = new URL((await login.handle(new URL('https://x/login'))).headers.location!);
-  const r = await login.handle(new URL(`https://x/login/callback?state=${to.searchParams.get('state')}&code=c`));
-  assert.match(r.body, /claude mcp add --transport http agent-engine-web https:\/\/agent-engine-web\.starkfuture\.com\/mcp/);
-});
-
-test('a company account that was not invited gets no token; ENGINE_ADMINS seeds the first admin', async (t) => {
-  const s = setup(good({ email: 'stranger@starkfuture.com' }));
-  t.after(s.restore);
-  const r = await s.back((await s.begin()).searchParams.get('state')!);
-  assert.equal(r.status, 403);
-  assert.match(r.body, /admin hasn't added you/);
-  assert.ok(!/eng_/.test(r.body));
-  assert.equal(s.users.list().length, 0, 'nothing is recorded for an uninvited login');
-
-  const boot = setup(good({ email: 'Lead@starkfuture.com' }), { admins: ['lead@starkfuture.com'] });
-  const ok = await boot.back((await boot.begin()).searchParams.get('state')!);
-  boot.restore();
-  assert.equal(ok.status, 200, ok.body);
-  const token = /Bearer (eng_[A-Za-z0-9_-]+)/.exec(ok.body)![1]!;
-  assert.equal(boot.users.authenticate(token)?.role, 'admin');
-});
-
-test('invited users renew by signing in; once removed, they can neither use nor renew a token', async (t) => {
-  const s = setup(good({ email: 'bo@starkfuture.com' }), { invite: 'bo@starkfuture.com' });
-  t.after(s.restore);
-  const invited = s.users.list()[0]!;
-  assert.equal(invited.token_sha256, undefined, 'an invite carries no token');
-  assert.equal(s.users.authenticate('eng_' + 'x'.repeat(43)), undefined);
-  const first = /Bearer (eng_[A-Za-z0-9_-]+)/.exec((await s.back((await s.begin()).searchParams.get('state')!)).body)![1]!;
-  assert.equal(s.users.authenticate(first)?.role, 'member');
-  assert.ok(s.users.remove('bo'));
-  assert.equal(s.users.authenticate(first), undefined);
-  assert.equal((await s.back((await s.begin()).searchParams.get('state')!)).status, 403);
+test('a sign-in maps only to a user invited with that email, never a CLI-made one', () => {
+  const users = Users.load(join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json'));
+  users.add('lead', { admin: true }); // a CLI admin token, no email
+  users.add('ana', { email: 'someone.else@starkfuture.com' });
+  assert.equal(users.byEmail('lead@starkfuture.com'), undefined);
+  assert.equal(users.byEmail('ana@starkfuture.com'), undefined);
+  assert.throws(() => users.invite('ana@starkfuture.com'), /name ana is taken/);
+  users.invite('Bo@starkfuture.com');
+  assert.equal(users.byEmail('bo@StarkFuture.com')?.name, 'bo');
+  assert.equal(users.byEmail('bo@starkfuture.com')?.token_sha256, undefined, 'an invite carries no token');
+  const server = Users.load(users.file); // a running server
+  assert.ok(users.remove('bo')); // the CLI, another process
+  assert.equal(server.byEmail('bo@starkfuture.com'), undefined, 'removal reaches a running server');
 });
 
 test('ENGINE_ADMINS only seeds an empty file: a removed or demoted admin stays out', () => {
   const users = Users.load(join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json'));
   assert.deepEqual(users.seedAdmins(['Lead@starkfuture.com', 'ops@starkfuture.com']), ['lead@starkfuture.com', 'ops@starkfuture.com']);
-  users.issue('lead@starkfuture.com');
   assert.ok(users.remove('ops'));
   assert.ok(users.setRole('lead', 'member') === true && users.invite('boss@starkfuture.com', { admin: true }));
   assert.deepEqual(users.seedAdmins(['lead@starkfuture.com', 'ops@starkfuture.com']), [], 'an admin exists: nothing reseeded');
-  assert.throws(() => users.issue('ops@starkfuture.com'), /has not been added/, 'removed stays removed');
-  assert.equal(users.issue('lead@starkfuture.com').user.role, 'member', 'a sign-in never restores a role');
+  assert.equal(users.byEmail('ops@starkfuture.com'), undefined, 'removed stays removed');
+  assert.equal(users.byEmail('lead@starkfuture.com')?.role, 'member', 'demoted stays demoted');
 });
 
 test('two writers (server and CLI) never undo each other, and a held lock is respected', () => {
@@ -169,7 +146,7 @@ test('two writers (server and CLI) never undo each other, and a held lock is res
   assert.equal(server.invite('dee@starkfuture.com').name, 'dee');
 });
 
-test('tokens expire: 90 days at most, an expired token is unknown', () => {
+test('CLI tokens expire: 90 days at most, an expired token is unknown', () => {
   const users = Users.load(join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json'));
   assert.throws(() => users.add('long', { days: 91 }), /1 to 90 days/);
   const t = users.add('cy', { days: 1 });
@@ -177,27 +154,39 @@ test('tokens expire: 90 days at most, an expired token is unknown', () => {
   assert.equal(users.authenticate(t, new Date(Date.now() + 2 * 86_400_000)), undefined);
 });
 
-test('login names come from the email local part', () => {
+test('user names come from the email local part', () => {
   assert.equal(nameFromEmail('Ana.Lopez@starkfuture.com'), 'ana.lopez');
   assert.equal(nameFromEmail('1st+x@starkfuture.com'), 'u1st-x');
 });
 
-test('with the Google login on, the CLI cannot mint tokens; admins are promoted after signing in', () => {
+test('sign-in config: KEYCLOAK_ISSUER turns it on, and a half-configured one stops the program', () => {
+  const env = { KEYCLOAK_ISSUER: 'https://keycloak.starkfuture.com/auth/realms/stark/', ENGINE_PUBLIC_URL: 'https://agent-engine.starkfuture.com' };
+  const login = loadConfig(env).mcp.login!;
+  assert.equal(login.issuer, 'https://keycloak.starkfuture.com/auth/realms/stark');
+  assert.equal(login.jwksUrl, 'https://keycloak.starkfuture.com/auth/realms/stark/protocol/openid-connect/certs');
+  assert.equal(login.clientId, 'agent-engine');
+  assert.equal(loadConfig({ ...env, KEYCLOAK_JWKS_URL: 'http://keycloak-production.keycloak.svc.cluster.local:8080/auth/realms/stark/protocol/openid-connect/certs' }).mcp.login!.jwksUrl.startsWith('http://keycloak-production'), true);
+  assert.equal(loadConfig({}).mcp.login, undefined);
+  assert.equal(loadConfig({ ENGINE_PUBLIC_URL: env.ENGINE_PUBLIC_URL }).mcp.login, undefined, 'the URL alone does not turn it on');
+  assert.throws(() => loadConfig({ KEYCLOAK_ISSUER: env.KEYCLOAK_ISSUER }), /ENGINE_PUBLIC_URL/);
+  assert.throws(() => loadConfig({ ...env, KEYCLOAK_ISSUER: 'http://keycloak.starkfuture.com/auth/realms/stark' }), /KEYCLOAK_ISSUER must be https/);
+  assert.throws(() => loadConfig({ ...env, KEYCLOAK_JWKS_URL: 'http://evil.test/certs' }), /KEYCLOAK_JWKS_URL/);
+  assert.throws(() => loadConfig({ ...env, ENGINE_ADMINS: 'boss@gmail.com' }), /not an @starkfuture\.com address/);
+});
+
+test('with the Keycloak sign-in on, the CLI cannot mint tokens; it invites and promotes', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cli-'));
   const file = join(dir, 'users.json');
-  const env = { ...process.env, ENGINE_USERS_FILE: file, GOOGLE_CLIENT_ID: 'cid', GOOGLE_CLIENT_SECRET: 'shh', ENGINE_PUBLIC_URL: 'https://agent-engine.starkfuture.com', ANTHROPIC_API_KEY: '' };
+  const env = { ...process.env, ENGINE_USERS_FILE: file, KEYCLOAK_ISSUER: 'https://keycloak.starkfuture.com/auth/realms/stark', ENGINE_PUBLIC_URL: 'https://agent-engine.starkfuture.com', ANTHROPIC_API_KEY: '' };
   const cli = (...args: string[]) => spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--import', 'tsx', 'src/cli.ts', ...args], { cwd: join(import.meta.dirname, '..'), env, encoding: 'utf8' });
 
   const add = cli('user', 'add', 'lead', '--admin');
   assert.notEqual(add.status, 0);
-  assert.match(add.stderr, /people get their token at https:\/\/agent-engine\.starkfuture\.com\/login/);
+  assert.match(add.stderr, /Keycloak sign-in is on: `user invite <email>` instead/);
   assert.ok(!/eng_/.test(add.stdout), 'no token printed');
 
-  // Someone signs in (a login-issued user), then an admin promotes them.
-  const users = Users.load(file);
-  users.invite('ana@starkfuture.com');
-  const { token } = users.issue('ana@starkfuture.com');
+  assert.match(cli('user', 'invite', 'ana@starkfuture.com').stdout, /invited as member \(user ana\); they sign in with their company account/);
   assert.match(cli('user', 'promote', 'ana').stdout, /ana is now admin/);
-  assert.equal(Users.load(file).authenticate(token)?.role, 'admin');
-  assert.match(cli('user', 'promote', 'nobody').stdout, /no user nobody/);
+  assert.equal(Users.load(file).byEmail('ana@starkfuture.com')?.role, 'admin');
+  assert.match(cli('user', 'promote', 'nobody').stdout, /no user nobody \(invite them first\)/);
 });
