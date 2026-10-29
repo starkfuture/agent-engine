@@ -92,3 +92,12 @@ test('metrics: heartbeat, blind spots, runs and spend in Prometheus text format'
   assert.match(m2.render(engine, now), /engine_patrol_last_run_timestamp_seconds/);
   assert.doesNotMatch(m2.render(engine, now), /engine_patrol_last_success/);
 });
+
+test('trace ids come back with all 32 hex digits (Tempo search drops leading zeros)', async (t) => {
+  const f = stubFetch(() => ({ traces: [{ traceID: '6f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5', rootServiceName: 'checkout', rootTraceName: 'POST /pay', startTimeUnixNano: '0' }, { traceID: '0123456789abcdef0123456789abcdef' }] }));
+  t.after(f.restore);
+  const tel = new DirectTelemetry({ prometheusUrl: 'http://p:9090', tempoUrl: 'http://tempo:3100' });
+  const [short, full] = await tel.tempoSearch('{ status = error }', new Date(), new Date(), 10);
+  assert.equal(short!.traceId, '06f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5');
+  assert.equal(full!.traceId, '0123456789abcdef0123456789abcdef');
+});

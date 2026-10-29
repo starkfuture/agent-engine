@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { tool, type HookCallbackMatcher, type HookEvent, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
@@ -8,7 +8,7 @@ import { FILE_TOOLS, WEB_TOOLS, type LoadedAgent } from './agent.js';
 import { challengeLite, type ChallengeResult } from './challenge.js';
 import { Evidence, evidenceHook } from './evidence.js';
 import { pathGuard } from './guard.js';
-import { pluginCopy, SpendMeter, type Session, type SessionEvent, type SessionRequest } from './session.js';
+import { firstTurnUsd, pluginCopy, SpendMeter, type Session, type SessionEvent, type SessionRequest } from './session.js';
 import { freeBytes } from './retention.js';
 import { snapshot, type Snapshot } from './snapshot.js';
 import type { RunStatus, Store } from './store.js';
@@ -94,11 +94,22 @@ export async function stopAllRuns(reason: string, waitMs: number): Promise<numbe
 const stamp = (d: Date) => d.toISOString().replace(/[-:.]/g, '').slice(0, 15) + 'Z';
 const hasAny = (tools: string[], set: readonly string[]) => tools.some((t) => set.includes(t));
 
+// Who set the kill switch, when and why, as stop_all wrote it ("<time> <user>: <reason>";
+// the CLI writes only the time). Never the file's path: callers see this note.
+function stopDetail(file: string): string {
+  try {
+    const line = readFileSync(file, 'utf8').split('\n')[0]!.replace(/\s+/g, ' ').trim().slice(0, 200);
+    return line ? ` (set ${line})` : '';
+  } catch {
+    return '';
+  }
+}
+
 // Limits the SDK doesn't enforce for one session: the stop file and repeated calls.
 function watcher(stopFile: string, onStop: (why: 'stopped' | 'loop', note: string) => void) {
   const seen = new Map<string, number>();
   return (e: SessionEvent) => {
-    if (existsSync(stopFile)) onStop('stopped', 'stop file');
+    if (existsSync(stopFile)) onStop('stopped', 'kill switch');
     if (e.kind !== 'tool_use') return;
     const k = `${e.name} ${JSON.stringify(e.input)}`;
     const n = (seen.get(k) ?? 0) + 1;
@@ -134,7 +145,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     const free = freeBytes(engine.runsDir);
     if (free !== undefined && free < engine.minFreeBytes) return skipped(`runs volume nearly full (${Math.round(free / 1e6)} MB free)`);
   }
-  if (existsSync(engine.stopFile)) return skipped(`stop file present: ${engine.stopFile}`);
+  if (existsSync(engine.stopFile)) return skipped(`kill switch is on${stopDetail(engine.stopFile)}; an admin clears it with resume`);
 
   const challenge = input.challenge ?? spec.challenge.when === 'always';
   const reserve = spec.limits.usd_per_run + (challenge ? spec.challenge.usd : 0);
@@ -177,7 +188,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
   };
   const timer = setTimeout(() => stop('deadline', `deadline ${spec.limits.deadline_min} min`), spec.limits.deadline_min * 60_000);
   // The kill switch acts within seconds, also while the model is mid-turn.
-  const stopPoll = setInterval(() => existsSync(engine.stopFile) && stop('stopped', 'stop file'), 2000);
+  const stopPoll = setInterval(() => existsSync(engine.stopFile) && stop('stopped', 'kill switch'), 2000);
   stopPoll.unref();
   // A run whose process died (OOM, SIGKILL) stops beating and is reaped by the
   // next admission, even if a new process got the same pid.
@@ -292,7 +303,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
         note = (err as Error).message.slice(0, 300);
       }
     }
-    if (!gotResult) cost = meter.unsettled(spec.limits.usd_per_run); // aborted or crashed: what was spent, plus the turn in flight
+    if (!gotResult) cost = meter.unsettled(spec.limits.usd_per_run, firstTurnUsd(spec.model, spec.limits.usd_per_run)); // aborted or crashed: what was spent, plus the turn in flight
     if (evidence.failure && status === 'ok') {
       status = 'error';
       note = evidence.failure;

@@ -113,14 +113,24 @@ export function turnCost(model: string, u: { input_tokens?: number; output_token
   return (((u.input_tokens ?? 0) * p[0] + (u.output_tokens ?? 0) * p[1] + (u.cache_creation_input_tokens ?? 0) * p[2] + (u.cache_read_input_tokens ?? 0) * p[3]) / 1e6) * multiplier;
 }
 
+// A turn that may have been in flight when a session ended without a result:
+// the system prompt and tools written to the cache plus a reply, priced for
+// the model. Unknown model: the old flat guess.
+export function firstTurnUsd(model: string, allowance: number): number {
+  return turnCost(model, { cache_creation_input_tokens: 30_000, output_tokens: 2_000 }) ?? Math.max(0.25 * allowance, 0.5);
+}
+
 // What a session spent so far, from completed turns. Used when a session ends
 // without a result message (cancelled, deadline, crash): book what was spent
-// plus the turn that may have been in flight, never more than the allowance.
-// If spend can't be known (turns happened but no usage arrived, or a model
-// has no price), book the whole allowance.
+// plus the turn that may have been in flight, priced like the largest turn so
+// far (turns grow with the conversation) or a model-priced first turn,
+// whichever is more, never more than the allowance. If spend can't be known
+// (turns happened but no usage arrived, or a model has no price), book the
+// whole allowance.
 export class SpendMeter {
   private readonly seen = new Set<string>();
   private priced = 0;
+  private largest = 0;
   private unpriced = false;
   private steps = 0;
 
@@ -129,13 +139,16 @@ export class SpendMeter {
       if (this.seen.has(e.id)) return;
       this.seen.add(e.id);
       if (e.cost === undefined) this.unpriced = true;
-      else this.priced += e.cost;
+      else {
+        this.priced += e.cost;
+        this.largest = Math.max(this.largest, e.cost);
+      }
     } else if (e.kind === 'tool_use' || e.kind === 'text') this.steps++;
   }
 
-  unsettled(allowance: number): number {
+  unsettled(allowance: number, inFlight = Math.max(0.25 * allowance, 0.5)): number {
     if (this.unpriced || (this.steps > 0 && this.seen.size === 0)) return allowance;
-    return Math.min(allowance, this.priced + Math.max(0.25 * allowance, 0.5));
+    return Math.min(allowance, this.priced + Math.max(this.largest, inFlight));
   }
 }
 

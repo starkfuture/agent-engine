@@ -414,7 +414,13 @@ test('a run that ends without a result books what it spent plus the turn in flig
   m.observe({ kind: 'tool_use', name: 'Read', input: {} });
   m.observe({ kind: 'usage', id: 'b', cost: 0.2 });
   assert.ok(Math.abs(m.unsettled(2) - (0.3 + 0.5)) < 1e-9);
+  assert.ok(Math.abs(m.unsettled(2, 0.07) - (0.3 + 0.2)) < 1e-9, 'the turn in flight is priced like the largest turn so far');
   assert.equal(m.unsettled(0.6), 0.6, 'never above the allowance');
+  const { firstTurnUsd } = await import('../src/engine/session.js');
+  const sonnet = firstTurnUsd('claude-sonnet-5-5', 1.5);
+  assert.ok(sonnet > 0.05 && sonnet < 0.15, `a cancelled first Sonnet turn books cents, not $0.50: ${sonnet}`);
+  assert.ok(Math.abs(new SpendMeter().unsettled(1.5, sonnet) - sonnet) < 1e-9, 'cancelled before any turn finished');
+  assert.equal(firstTurnUsd('some-unpriced-model', 2), 0.5, 'unknown model: the old flat guess');
   const noUsage = new SpendMeter();
   noUsage.observe({ kind: 'text', text: 'hi' });
   assert.equal(noUsage.unsettled(2), 2, 'turns happened but no usage arrived');
@@ -436,10 +442,11 @@ test('the kill switch stops a run within seconds, even mid-turn with no events',
   const r = await runAgent(e, { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput });
   assert.equal(r.status, 'stopped');
   assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0} ms`);
-  assert.ok(Math.abs(r.cost - 0.55) < 1e-9, String(r.cost));
+  const { firstTurnUsd } = await import('../src/engine/session.js');
+  assert.ok(Math.abs(r.cost - (0.05 + firstTurnUsd(loadAgent(d).spec.model, 1))) < 1e-9, `spent so far plus a model-priced turn in flight: ${r.cost}`);
 });
 
-test('deadline aborts the run; with no completed turn it books the in-flight margin', async () => {
+test('deadline aborts the run; with no completed turn it books a model-priced first turn', async () => {
   const d = agentDir(`${web}\nlimits: { deadline_min: 0.001, usd_per_run: 0.7 }`);
   const s = fakeSession(async function* (sim) {
     await sim.sleep(5_000);
@@ -448,7 +455,8 @@ test('deadline aborts the run; with no completed turn it books the in-flight mar
   const e = engine(s);
   const r = await runAgent(e, { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput });
   assert.equal(r.status, 'deadline');
-  assert.equal(r.cost, 0.5, 'min(allowance, max(25%, $0.5))');
+  const { firstTurnUsd } = await import('../src/engine/session.js');
+  assert.ok(Math.abs(r.cost - firstTurnUsd(loadAgent(d).spec.model, 0.7)) < 1e-9 && r.cost < 0.15, `a first turn in flight, priced for the model: ${r.cost}`);
   assert.equal(e.store.get(r.runId)?.status, 'deadline');
 });
 
@@ -466,7 +474,8 @@ test('the STOP file stops a run at the next step, and blocks new runs', async ()
   const r = await runAgent(e, { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput });
   assert.equal(r.status, 'stopped');
   const again = await runAgent(e, { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput });
-  assert.match(again.note!, /stop file/);
+  assert.match(again.note!, /^kill switch is on \(set now\); an admin clears it with resume$/);
+  assert.ok(!again.note!.includes(e.stopFile), 'never the server path');
 });
 
 test('the same real call three times is a loop', async () => {
