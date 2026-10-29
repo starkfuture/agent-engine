@@ -388,7 +388,7 @@ test('HTTP with the Keycloak sign-in: discovery, challenge, invited company acco
   assert.equal((await post({ authorization: `Bearer ${kc.token({ email: 'dee@starkfuture.com', azp: 'stark-admin' })}` })).status, 403);
 
   // The invite hands out the add command, named after this deployment.
-  ctx.cfg.mcp.login = { ...kc.cfg, publicUrl: 'https://agent-engine-web.starkfuture.com/', admins: [] };
+  ctx.cfg.mcp.login = { ...kc.cfg, publicUrl: 'https://agent-engine-web.starkfuture.com/', admins: [], scopes: [] };
   const { call } = await connect(ctx, ctx.users.list().find((u) => u.name === 'root')!);
   assert.match((await call('invite_user', { email: 'eve@starkfuture.com' })).text, /: claude mcp add --transport http agent-engine-web https:\/\/agent-engine-web\.starkfuture\.com\/mcp --client-id agent-engine --callback-port 33419$/);
 

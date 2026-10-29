@@ -77,7 +77,7 @@ export interface Config {
     // Sign-in through Keycloak (KEYCLOAK_ISSUER, ENGINE_PUBLIC_URL); unset = tokens from the CLI.
     // admins: ENGINE_ADMINS, the first admins: seeded into the users file (as invites)
     // at startup while it has no admin. Who may sign in is decided by the file alone.
-    login: { issuer: string; jwksUrl: string; clientId: string; publicUrl: string; domain: string; admins: string[] } | undefined;
+    login: { issuer: string; jwksUrl: string; clientId: string; publicUrl: string; domain: string; admins: string[]; scopes: string[] } | undefined;
     reposDir: string | undefined; // where the engine clones `github:` repos (a persistent volume when hosted)
     reposGithub: string | undefined; // ENGINE_REPOS_GITHUB: name=owner/repo[@ref],… (env-only hosts)
     // GitHub App (contents: read) the engine fetches those repos as.
@@ -131,7 +131,12 @@ function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   const domain = env.ENGINE_LOGIN_DOMAIN || 'starkfuture.com';
   const admins = (env.ENGINE_ADMINS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   for (const a of admins) if (!a.endsWith(`@${domain}`)) throw new Error(`ENGINE_ADMINS: ${a} is not an @${domain} address`);
-  return { issuer, jwksUrl, clientId: env.ENGINE_KC_CLIENT_ID || 'agent-engine', publicUrl, domain, admins };
+  // KEYCLOAK_SCOPES: scopes the protected-resource document advertises, so Claude Code requests them
+  // (offline_access = stay signed in for the client's offline cap). Only scopes the Keycloak client
+  // carries: Keycloak refuses a sign-in that asks for one it doesn't.
+  const scopes = (env.KEYCLOAK_SCOPES ?? '').split(/[\s,]+/).filter(Boolean);
+  for (const s of scopes) if (!/^[a-z][a-z0-9_:.-]{0,60}$/i.test(s)) throw new Error(`KEYCLOAK_SCOPES: "${s}" is not a scope name`);
+  return { issuer, jwksUrl, clientId: env.ENGINE_KC_CLIENT_ID || 'agent-engine', publicUrl, domain, admins, scopes };
 }
 
 export function loadSources(file: string): Sources {
