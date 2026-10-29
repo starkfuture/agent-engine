@@ -108,10 +108,19 @@ export function loadDotEnv(file = resolve('.env'), env: NodeJS.ProcessEnv = proc
 }
 
 // KEYCLOAK_ISSUER turns the sign-in on, and then the rest must be right: a
-// half-configured login must stop the server, not run open.
+// half-configured login must stop the server, not run open. Keycloak
+// settings without the issuer stop it too: the sign-in would be off and CLI
+// tokens would work instead. (ENGINE_PUBLIC_URL and the like alone are allowed:
+// the monitor-only deployment carries them; `serve` refuses a non-loopback
+// bind without the sign-in anyway.)
+const LOGIN_VARS = ['KEYCLOAK_JWKS_URL', 'ENGINE_KC_CLIENT_ID'];
 function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   const issuer = opt(env.KEYCLOAK_ISSUER)?.replace(/\/+$/, '');
-  if (!issuer) return undefined;
+  if (!issuer) {
+    const set = LOGIN_VARS.filter((k) => opt(env[k]));
+    if (set.length) throw new Error(`${set.join(', ')} set without KEYCLOAK_ISSUER: set the issuer to turn the Keycloak sign-in on, or unset them`);
+    return undefined;
+  }
   const publicUrl = opt(env.ENGINE_PUBLIC_URL);
   if (!publicUrl) throw new Error('Keycloak sign-in needs ENGINE_PUBLIC_URL, the address people add to Claude Code');
   const secure = (u: string) => /^https:\/\//.test(u) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(u);

@@ -98,8 +98,23 @@ test('signing keys: cached, refetched for a new kid at most every 30 s, stale ke
   const login = new Login(kc.cfg, keys, () => now);
   assert.equal(await login.verify(kc.token()), 'ana@starkfuture.com');
 
+  // During the outage, a key we don't hold can't be checked: 503, and no fetch per request.
+  assert.equal(await refusal(login.verify(kc.token({}, { alg: 'RS256', kid: 'k2' }))), 503, 'a rotated key during an outage is not "invalid"');
+  assert.equal(await refusal(login.verify(kc.token({}, { alg: 'RS256', kid: 'k3' }))), 503);
+  assert.equal(fetches, 3, 'unknown keys during an outage do not refetch on every request');
+  now += 31_000;
+  assert.equal(await refusal(login.verify(kc.token({}, { alg: 'RS256', kid: 'k2' }))), 503);
+  assert.equal(fetches, 4, 'retried after 30 s');
+  down = false;
+  now += 31_000;
+  assert.equal(await refusal(login.verify(kc.token({}, { alg: 'RS256', kid: 'k2' }))), 401, 'Keycloak back and the key really is unknown: invalid');
+  assert.equal(fetches, 5);
+
   const cold = new JwksKeys(kc.cfg.jwksUrl, () => now);
+  down = true;
   assert.equal(await refusal(new Login(kc.cfg, cold).verify(kc.token())), 503, 'cannot check is not invalid');
+  assert.equal(await refusal(new Login(kc.cfg, cold).verify(kc.token())), 503);
+  assert.equal(fetches, 6, 'a cold cache retries at most every 30 s too');
 });
 
 test('a sign-in maps only to a user invited with that email, never a CLI-made one', () => {
@@ -115,6 +130,28 @@ test('a sign-in maps only to a user invited with that email, never a CLI-made on
   const server = Users.load(users.file); // a running server
   assert.ok(users.remove('bo')); // the CLI, another process
   assert.equal(server.byEmail('bo@starkfuture.com'), undefined, 'removal reaches a running server');
+});
+
+test('a removal landing while the server loads the users file is not lost', () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json');
+  const cli = Users.load(file);
+  cli.invite('lead@starkfuture.com', { admin: true });
+  // Interleave: the server reads the file, then the CLI removes the admin before the server takes its stamp.
+  const statics = Users as unknown as { read: (f: string) => unknown };
+  const read = statics.read;
+  statics.read = (f: string) => {
+    statics.read = read; // once: remove() reads the file too
+    const before = read(f);
+    cli.remove('lead');
+    return before;
+  };
+  let server: Users;
+  try {
+    server = Users.load(file);
+  } finally {
+    statics.read = read;
+  }
+  assert.equal(server.byEmail('lead@starkfuture.com'), undefined, 'the next lookup re-reads the file');
 });
 
 test('ENGINE_ADMINS only seeds an empty file: a removed or demoted admin stays out', () => {
@@ -167,7 +204,9 @@ test('sign-in config: KEYCLOAK_ISSUER turns it on, and a half-configured one sto
   assert.equal(login.clientId, 'agent-engine');
   assert.equal(loadConfig({ ...env, KEYCLOAK_JWKS_URL: 'http://keycloak-production.keycloak.svc.cluster.local:8080/auth/realms/stark/protocol/openid-connect/certs' }).mcp.login!.jwksUrl.startsWith('http://keycloak-production'), true);
   assert.equal(loadConfig({}).mcp.login, undefined);
-  assert.equal(loadConfig({ ENGINE_PUBLIC_URL: env.ENGINE_PUBLIC_URL }).mcp.login, undefined, 'the URL alone does not turn it on');
+  assert.equal(loadConfig({ ENGINE_PUBLIC_URL: env.ENGINE_PUBLIC_URL, ENGINE_LOGIN_DOMAIN: 'starkfuture.com' }).mcp.login, undefined, 'the URL alone does not turn it on (the monitor-only deployment carries it)');
+  assert.throws(() => loadConfig({ KEYCLOAK_JWKS_URL: 'https://keycloak.starkfuture.com/certs' }), /set without KEYCLOAK_ISSUER/);
+  assert.throws(() => loadConfig({ ENGINE_KC_CLIENT_ID: 'agent-engine' }), /ENGINE_KC_CLIENT_ID set without KEYCLOAK_ISSUER/);
   assert.throws(() => loadConfig({ KEYCLOAK_ISSUER: env.KEYCLOAK_ISSUER }), /ENGINE_PUBLIC_URL/);
   assert.throws(() => loadConfig({ ...env, KEYCLOAK_ISSUER: 'http://keycloak.starkfuture.com/auth/realms/stark' }), /KEYCLOAK_ISSUER must be https/);
   assert.throws(() => loadConfig({ ...env, KEYCLOAK_JWKS_URL: 'http://evil.test/certs' }), /KEYCLOAK_JWKS_URL/);
@@ -189,4 +228,14 @@ test('with the Keycloak sign-in on, the CLI cannot mint tokens; it invites and p
   assert.match(cli('user', 'promote', 'ana').stdout, /ana is now admin/);
   assert.equal(Users.load(file).byEmail('ana@starkfuture.com')?.role, 'admin');
   assert.match(cli('user', 'promote', 'nobody').stdout, /no user nobody \(invite them first\)/);
+});
+
+test('serve refuses a reachable bind without the Keycloak sign-in: CLI tokens are loopback-only', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cli-'));
+  const file = join(dir, 'users.json');
+  Users.load(file).add('lead', { admin: true });
+  const env = { ...process.env, ENGINE_USERS_FILE: file, ENGINE_RUNS_DIR: join(dir, 'runs'), ENGINE_REPOS_FILE: join(dir, 'repos.yaml'), ENGINE_PUBLIC_URL: 'https://agent-engine.starkfuture.com', ANTHROPIC_API_KEY: '', KEYCLOAK_ISSUER: '' };
+  const r = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--import', 'tsx', 'src/cli.ts', 'serve', '--host', '0.0.0.0', '--port', '0'], { cwd: join(import.meta.dirname, '..'), env, encoding: 'utf8', timeout: 60_000 });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /serving on 0\.0\.0\.0 needs the Keycloak sign-in/);
 });

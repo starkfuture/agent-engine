@@ -45,10 +45,15 @@ const JWKS_MIN_REFETCH_MS = 30_000; // an unknown kid refetches (key rotation), 
 
 // The realm's public keys, cached. A failed refresh keeps the keys already
 // held: Keycloak rotates by adding a key first, so one timed-out fetch must not
-// lock everyone out. Only with nothing cached does the failure surface (503).
+// lock everyone out. Fetches (successful or not) happen at most every 30 s, so
+// requests naming unknown keys can't make the engine hammer Keycloak. While
+// the last fetch failed, a key we don't hold is "cannot check" (503), never
+// "invalid" (401), which would send people to sign in again for nothing.
 export class JwksKeys implements SigningKeys {
   private keys = new Map<string, KeyObject>();
-  private fetchedAt = 0;
+  private fetchedAt = -Infinity; // last successful fetch
+  private attemptedAt = -Infinity; // last fetch, successful or not
+  private failure: string | undefined; // why the last fetch failed
   private inflight: Promise<void> | undefined;
 
   constructor(
@@ -57,18 +62,21 @@ export class JwksKeys implements SigningKeys {
   ) {}
 
   async keyFor(kid: string): Promise<KeyObject | undefined> {
-    if (this.now() - this.fetchedAt > JWKS_TTL_MS) await this.refreshKeepingStale();
-    if (!this.keys.has(kid) && this.now() - this.fetchedAt > JWKS_MIN_REFETCH_MS) await this.refreshKeepingStale();
-    return this.keys.get(kid);
+    const now = this.now();
+    if (now - this.attemptedAt >= JWKS_MIN_REFETCH_MS && (now - this.fetchedAt > JWKS_TTL_MS || !this.keys.has(kid))) await this.refresh();
+    const key = this.keys.get(kid);
+    if (!key && this.failure) throw new Refused(503, `cannot fetch Keycloak's signing keys: ${this.failure}`);
+    return key;
   }
 
-  private async refreshKeepingStale(): Promise<void> {
+  private async refresh(): Promise<void> {
+    this.attemptedAt = this.now();
     try {
       this.inflight ??= this.load().finally(() => (this.inflight = undefined));
       await this.inflight;
+      this.failure = undefined;
     } catch (e) {
-      if (!this.keys.size) throw new Refused(503, `cannot fetch Keycloak's signing keys: ${(e as Error).message}`);
-      this.fetchedAt = this.now() - JWKS_TTL_MS + JWKS_MIN_REFETCH_MS; // retry soon, serve the stale set meanwhile
+      this.failure = (e as Error).message;
     }
   }
 

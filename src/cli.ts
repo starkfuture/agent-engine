@@ -398,6 +398,8 @@ async function main() {
       }
       const host = a.host ?? '127.0.0.1';
       const port = Number(a.port ?? 8787);
+      // CLI tokens are for a developer's own machine. Anywhere reachable, only the Keycloak sign-in.
+      if (!ctx.login && !['127.0.0.1', '::1', 'localhost'].includes(host)) throw new Error(`serving on ${host} needs the Keycloak sign-in (KEYCLOAK_ISSUER); CLI tokens are for loopback only`);
       if (!ctx.users.list().length && !ctx.login) throw new Error('no users yet: add one with `user add <name> --admin`, or configure the Keycloak sign-in');
       if (ctx.login) {
         // ENGINE_ADMINS seeds the first admins (as invites) only while the file has none.

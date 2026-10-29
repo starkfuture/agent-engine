@@ -204,5 +204,5 @@ for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 - `ENGINE_NOTIFY_SLACK=1` with `SLACK_WEBHOOK_URL` @-mentions the requester when a run ends. Model text in Slack is escaped, so it can't ping (`<!channel>`) or hide links.
 - SIGTERM/Ctrl-C stops running runs and waits (≤ 20 s) until each is settled and its requester notified. A run whose process died stops beating and is reaped within 2 min, even if a restarted server got the same pid.
 - Callers name a repo; they never pass a path. Scheduled agents (monitor) can't be started over MCP.
-- Bind is loopback by default. Anywhere else, put TLS in front (tokens travel in a header).
+- Bind is loopback by default. Anywhere else, `serve` refuses to start without the Keycloak sign-in (CLI tokens are loopback-only), and TLS goes in front (tokens travel in a header).
 - `mcp-stdio --as <user>` serves the same tools over stdio for one local user.

@@ -58,8 +58,13 @@ export class Users {
     return existsSync(file) ? UsersFile.parse(JSON.parse(readFileSync(file, 'utf8'))).users : [];
   }
 
+  // The stamp is taken before the read: a change landing in between then
+  // makes the next refresh() re-read, instead of caching the old list as new.
   static load(file: string): Users {
-    return new Users(file, Users.read(file));
+    const stamp = Users.stampOf(file);
+    const users = new Users(file, Users.read(file));
+    users.stamp = stamp;
+    return users;
   }
 
   // A running server picks up `user add`/`user remove` from another process:
