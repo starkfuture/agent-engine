@@ -140,7 +140,8 @@ test('only admins get the kill switch and lesson approval', async () => {
   await call('stop_all', { reason: 'testing' });
   assert.ok(existsSync(ctx.engine.stopFile));
   const skipped = await (await connect(ctx, who('ana'))).call('run_agent', { agent: 'research', task: 'Anything at all, please.' });
-  assert.match(skipped.text, /skipped[\s\S]*stop file/);
+  assert.match(skipped.text, /skipped[\s\S]*kill switch is on \(set \S+ root: testing\); an admin clears it with resume/);
+  assert.ok(!skipped.text.includes(ctx.engine.stopFile), 'never the server path');
   await call('approve_lesson', { agent: 'research', lesson: 'Prefer the official docs over blog posts.' });
   assert.match(readFileSync(join(ctx.cfg.agentsDir, 'research', 'memory', 'lessons.md'), 'utf8'), /official docs.*approved by root/);
 });

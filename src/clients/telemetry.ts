@@ -62,6 +62,12 @@ class Gate {
 }
 
 const sec = (d: Date) => Math.floor(d.getTime() / 1000);
+// Tempo's search drops leading zeros from trace ids; the trace view and
+// /api/traces/<id> want all 32 hex digits.
+const fullTraceId = (id: unknown): string => {
+  const s = String(id ?? '');
+  return /^[0-9a-f]{1,31}$/i.test(s) ? s.padStart(32, '0') : s;
+};
 
 type Source = 'prometheus' | 'loki' | 'tempo';
 interface Route {
@@ -144,7 +150,7 @@ class HttpTelemetry implements Telemetry {
     const from = new Date(Math.max(start.getTime(), end.getTime() - TEMPO_MAX_MINUTES * 60_000));
     const j = await this.get('tempo', '/api/search', { q: traceql, start: String(sec(from)), end: String(sec(end)), limit: String(limit) });
     return ((j.traces ?? []) as any[]).map((t) => ({
-      traceId: t.traceID,
+      traceId: fullTraceId(t.traceID),
       rootService: t.rootServiceName ?? '?',
       rootName: t.rootTraceName ?? '?',
       startSec: Math.floor(Number(t.startTimeUnixNano ?? 0) / 1e9),
