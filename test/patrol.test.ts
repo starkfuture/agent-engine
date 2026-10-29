@@ -8,6 +8,7 @@ import { checkReport, type Report } from '../src/investigate/report.js';
 import { reportCard } from '../src/output/card.js';
 import { CardSink } from '../src/output/sink.js';
 import { Noise } from '../src/patrol/noise.js';
+import { Owners } from '../src/patrol/owners.js';
 import { State } from '../src/patrol/state.js';
 import { buildSummary, renderSummary } from '../src/patrol/summary.js';
 import { loadAgent } from '../src/engine/agent.js';
@@ -25,6 +26,7 @@ const cfg = (): Config => ({
   lokiUid: undefined,
   tempoUid: undefined,
   windowMinutes: 15,
+  attentionFloor: 10,
   sources: {
     http_families: [
       { id: 'legacy-v1', selector: 'backend_be_production_http_requests_total', service: 'backend-production', route_label: 'route', status_label: 'status_code' },
@@ -35,6 +37,7 @@ const cfg = (): Config => ({
     traces: { traceql: '{ status = error }', limit: 10 },
   },
   noiseFile: '/dev/null',
+  ownersFile: '/dev/null',
   stateFile: join(mkdtempSync(join(tmpdir(), 'sre-test-')), 'state.json'),
   outDir: mkdtempSync(join(tmpdir(), 'sre-out-')),
   llm: { available: false, dailyCapUsd: 10, monthlyCapUsd: 100 },
@@ -140,6 +143,16 @@ test('without LLM credentials the patrol still writes a rows card and says why',
   assert.equal(r.skippedLlm, 'no LLM credentials configured');
   assert.equal(r.cards.length, 1);
   assert.ok(r.cards[0]!.endsWith('-rows.md'));
+});
+
+test('the rows card leads with a summary and mentions the owner of what to look at', async () => {
+  const c = cfg();
+  const owners = new Owners({ owners: { 'backend-*': '<@U0BACKEND1>' } });
+  const r = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: false, post: false, owners });
+  const md = readFileSync(r.cards[0]!, 'utf8');
+  assert.match(md, /^## Patrol 2026-09-29 12:15Z: 2 to look at · cc <@U0BACKEND1>\n/);
+  assert.match(md, /`\/v1\/auth\/password\/reset 400` — now 75 of 95 requests \(1h ago 2\) vs expected 2\.1 · spike, started <@U0BACKEND1>/);
+  assert.match(md, /_not investigated: LLM disabled for this run · blind spots: logs, traces_/);
 });
 
 function monitor(c: Config, session: Session, llmAvailable = true): MonitorAgent {

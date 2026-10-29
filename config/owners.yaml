@@ -1,0 +1,26 @@
+# Who owns what: on the patrol card, each line to look at (fresh or worse, at or
+# above PATROL_ATTENTION_FLOOR events) mentions its service's owner, and the
+# summary line lists everyone mentioned. Services that match nothing get no
+# mention: the card never guesses.
+#
+# Keys match the row's service (the workload/app name on the card, e.g.
+# keycloak-production, ecom-service-production):
+#   exact-name            the whole name, case-insensitive
+#   prefix-*              any service starting with it (the longest prefix wins)
+#   /regex/               anchored, case-insensitive, like noise.yaml
+# An exact name beats a prefix, a prefix beats a regex; regexes go in file order.
+#
+# Values are Slack mentions, and only these two forms are accepted:
+#   '<@U…>'               a person (Slack member id, from their profile: ⋮ → Copy member ID)
+#   '<!subteam^S…>'       a user group
+# Anything else (<!channel>, <!here>, links) stops the engine at startup.
+#
+# mentions: false turns every mention off (the card still lists the lines).
+# SRE_OWNERS_FILE points the engine at another file.
+
+mentions: true
+
+owners: {}
+#  keycloak-production: '<@U0000000000>'
+#  frontend-next-*: '<!subteam^S0000000000>'
+#  '/(ecom|product-catalog)-service-production/': '<!subteam^S0000000001>'

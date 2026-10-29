@@ -77,6 +77,20 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 
 The baseline is `min(1 d, 7 d)`, scaled by current traffic, so a one-day incident doesn't become its own baseline the next day. The 1 h window only labels a row "started" or "ongoing".
 
+### The rows card
+
+One summary line first, for example `Patrol 2026-10-29 14:00Z: 1 to look at · 10 still ongoing · 3 quiet · cc @owner`, then:
+
+- **To look at:** fresh or worse rows, by severity: protected journeys (`never_suppress`), then outages (5xx, traffic drops, workloads), error counters and traces, error logs, then 4xx. Each line has the service, a short subject, now vs expected (and 1 h ago), the verdict and trend, since when, and the owner's mention.
+- **Still ongoing:** reminders (reported before, not worse), one compact line each, no stats beyond the count.
+- **Quiet:** fresh or worse HTTP, log, trace and counter rows under `PATROL_ATTENTION_FLOOR` events in the window (default 10). Listed, never mentioned. Workload rows, traffic drops and protected journeys are never quiet. The floor only changes the card: detection, state and what the investigator sees stay the same.
+
+Rows of one service whose text differs in a single token (a locale, a status, a queue name) share a line: `MISSING_MESSAGE: more — 3 locales: sl-SI, fr-FR, hu-HU`. Log subjects show the meaningful part (for Keycloak events: type, error, client), without timestamps, thread names or placeholders.
+
+Slack gets at most 10 lines to look at, 6 ongoing and 8 quiet, cut at whole lines well under its 3000-character section limit, then "…and N more" (which still mentions the owners of the cut lines). The full list stays on the engine in `out/patrols/<stamp>.md`, and the card's own file in `out/cards/` lists every line.
+
+**Owners** (`config/owners.yaml`, or `SRE_OWNERS_FILE`) map a service name, a `prefix-*` or a `/regex/` to `<@U…>` (a person) or `<!subteam^S…>` (a user group). Lines to look at mention the owner and the summary line lists everyone mentioned; a service that matches nothing gets no mention. Only these two forms load (anything else, such as `<!channel>`, stops the engine), and they are the only text on the card that reaches Slack unescaped. `mentions: false` in the file turns them off. The shipped file has examples only.
+
 ## Run it
 
 ```bash
@@ -114,8 +128,9 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 |---|---|
 | `config/sources.yaml` | What the patrol reads. Labels marked UNVERIFIED need `doctor` first. |
 | `config/noise.yaml` | Known noise (reason and expiry required) and the never-suppress list. |
+| `config/owners.yaml` | Service → Slack mention for the rows card. Ships with examples only. |
 | `src/clients/telemetry.ts` | Grafana datasource proxy client (Prometheus, Loki, Tempo), plus record and replay. |
-| `src/patrol/` | Collectors, scoring, noise, state, summary. |
+| `src/patrol/` | Collectors, scoring, noise, state, summary, owners, and the card digest (ranking, floor, grouping). |
 | `src/engine/` | The engine: agent loader, run, session (SDK), evidence, guard, ledger, challenge, generic output. |
 | `agents/` | Agent folders: `monitor`, `research`, `codebase`. |
 | `src/investigate/` | Monitor: telemetry tools, task prompt, report schema. |
