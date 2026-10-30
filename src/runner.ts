@@ -10,6 +10,7 @@ import { monitorTools } from './investigate/tools.js';
 import { patrolCard, reportCard } from './output/card.js';
 import type { CardSink } from './output/sink.js';
 import type { Noise } from './patrol/noise.js';
+import type { Owners } from './patrol/owners.js';
 import type { State } from './patrol/state.js';
 import { buildSummary, renderSummary, type FlaggedRow, type Summary } from './patrol/summary.js';
 import { redact, safeJson } from './engine/text.js';
@@ -19,6 +20,7 @@ export interface PatrolOptions {
   post: boolean;
   trigger?: string; // 'patrol' (default) | 'replay' | 'manual'
   log?: (s: string) => void;
+  owners?: Owners | undefined; // Slack mentions on the rows card; absent = none
 }
 
 export interface PatrolResult {
@@ -62,7 +64,13 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   else if (!monitor.engine.llmAvailable) skip = 'no LLM credentials configured';
 
   // The deterministic card goes out first: the AI never delays what code found.
-  result.cards.push(await sink.emit(patrolCard(summary, skip ?? 'AI investigation started'), `${stamp(summary.at)}-rows`, o.post));
+  const card = patrolCard(summary, skip ? `not investigated: ${skip}` : 'AI investigation started', {
+    owners: o.owners,
+    floor: cfg.attentionFloor,
+    protected: (r) => noise.protected(r),
+    ref: `patrols/${stamp(summary.at)}.md`,
+  });
+  result.cards.push(await sink.emit(card, `${stamp(summary.at)}-rows`, o.post));
 
   if (!skip && monitor) {
     const rowKeys = new Set(summary.send.map((r) => r.key));
