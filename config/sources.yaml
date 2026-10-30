@@ -40,7 +40,10 @@ workloads:
 
 logs:
   selector: '{namespace="microservices"}'
-  error_filter: '|~ `(?i)(level"?\s*[:=]\s*"?(error|fatal)|\b(ERROR|FATAL)\b)`'
+  # The cheap case-insensitive filter first: the precise regex alone over every
+  # microservices line took over 30 s (the query timeout) for about half the
+  # patrols; behind the prefilter it takes ~5 s and matches the same lines.
+  error_filter: '|~ "(?i)(error|fatal)" |~ `(?i)(level"?\s*[:=]\s*"?(error|fatal)|\b(ERROR|FATAL)\b)`'
   service_label: app
   max_lines: 3000
 
