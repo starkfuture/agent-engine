@@ -319,8 +319,14 @@ test('the AI card reads in Slack: level in the header, two short paragraphs, no 
   assert.match(slack, /route\.\\n\*Suggested fix/, 'at a sentence end');
   assert.match(c.markdown, /E-abcd-1: 75 of 95 requests were 400/);
   assert.match(c.markdown, /Tail\./);
-  const escalated = reportCard(report(), '2026-09-29T12:15:00Z', 'run r-2', { verdict: 'escalate', overall: 'The counts include bot traffic', blocking: [], notes: [] } as never);
-  assert.match(JSON.stringify(escalated.blocks), /A second AI check disagrees, a human decides:\* The counts include bot traffic/);
+  const objection = (claim: string, evidence: string[]) => ({ claim, evidence, failure_scenario: '', settling_check: '', blocking: true });
+  const mine = reportCard(report(), '2026-09-29T12:15:00Z', 'run r-2', { verdict: 'escalate', overall: 'Mixed', blocking: [objection('The 400s are bot traffic (E-abcd-1).', ['E-abcd-1'])], notes: [] } as never);
+  assert.match(JSON.stringify(mine.blocks), /A second AI check disputes this, a human decides:\* The 400s are bot traffic\./, 'its own objection, without the id');
+  const named = reportCard(report(), '2026-09-29T12:15:00Z', 'run r-3', { verdict: 'escalate', overall: 'Mixed', blocking: [objection('/v1/auth/password/reset 400s are retries', ['E-ffff-9'])], notes: [] } as never);
+  assert.match(JSON.stringify(named.blocks), /disputes this/, 'or one that names its route');
+  const other = reportCard(report(), '2026-09-29T12:15:00Z', 'run r-4', { verdict: 'escalate', overall: 'The stock-sync row is not noise', blocking: [objection('stock-sync INSERT spans are failing', ['E-ffff-2'])], notes: [] } as never);
+  assert.doesNotMatch(JSON.stringify(other.blocks), /disputes this/, 'an objection about another finding stays off this card');
+  assert.match(JSON.stringify(other.blocks), /second check disputes another finding/);
 });
 
 test('card escapes Slack controls in model and production text', () => {

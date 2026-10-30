@@ -68,13 +68,18 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
   // is escaped so <!channel>, <@U…> or <url|label> can't act.
   const head = `${SEV[r.severity]} ${LEVEL[r.severity]}: ${r.title}`;
   const pair = (a: string, x: string, b: string, y: string) => ({ type: 'section', text: { type: 'mrkdwn', text: clip(`*${a}:* ${esc(brief(x, 400))}\n*${b}:* ${esc(brief(y, 400))}`) } });
-  const doubt = challenge && challenge.verdict !== 'upheld' && challenge.verdict !== 'error';
+  // The challenger reviews the whole patrol. Only objections about THIS report
+  // (they cite its evidence or name one of its routes) go on its card.
+  const own = new Set(r.evidence.map((e) => e.id));
+  const subjects = r.rows.map((k) => k.split('|')[2]).filter((x): x is string => !!x && x.length > 3);
+  const against = challenge?.verdict === 'escalate' ? challenge.blocking.filter((o) => o.evidence.some((id) => own.has(id)) || subjects.some((s) => o.claim.includes(s))) : [];
+  const elsewhere = challenge?.verdict === 'escalate' && !against.length;
   const blocks = [
     { type: 'header', text: { type: 'plain_text', text: clip(head, 150) } },
     { type: 'context', elements: [{ type: 'mrkdwn', text: `*${r.status}* ${esc(`since ${when(r.started_at, patrolAt)} · confidence ${r.cause.confidence}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}` }] },
     pair("What's wrong", r.what_broke, 'Impact', r.impact),
     pair('Likely cause', r.cause.hypothesis, 'Suggested fix', r.suggested_fix),
-    ...(doubt ? [{ type: 'section', text: { type: 'mrkdwn', text: clip(`⚠️ *A second AI check disagrees, a human decides:* ${esc(brief(m(challenge.overall), 400))}`) } }] : []),
+    ...(against.length ? [{ type: 'section', text: { type: 'mrkdwn', text: clip(`⚠️ *A second AI check disputes this, a human decides:* ${esc(brief(noIds(m(against.map((o) => o.claim).join(' '))), 400))}`) } }] : []),
     {
       type: 'context',
       elements: [
@@ -85,7 +90,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
               [
                 `${r.evidence.length} evidence ${r.evidence.length === 1 ? 'item' : 'items'}`,
                 r.not_checked.length ? `${r.not_checked.length} not checked` : '',
-                challenge?.verdict === 'upheld' ? 'second check agrees' : challenge?.verdict === 'error' ? 'second check failed' : '',
+                challenge?.verdict === 'upheld' ? 'second check agrees' : challenge?.verdict === 'error' ? 'second check failed' : elsewhere ? 'second check disputes another finding' : '',
                 `patrol ${when(patrolAt, patrolAt)}`,
                 footer,
               ]
@@ -102,6 +107,9 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
 }
 
 const LEVEL = { critical: 'Critical', major: 'Major', minor: 'Minor', noise: 'Noise' } as const;
+
+// Evidence ids mean nothing in Slack; the card's file keeps them.
+const noIds = (s: string) => s.replace(/\s*\(?\bE-[0-9a-f]{4}-\d+\)?/g, '');
 
 // A time as HH:MMZ, with the date only when it isn't the patrol's day.
 function when(iso: string, patrolAt: string): string {
