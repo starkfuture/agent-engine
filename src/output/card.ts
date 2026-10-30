@@ -63,24 +63,59 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     `_Rows: ${r.rows.join(', ')} · patrol ${patrolAt} · ${footer}_`,
   ].join('\n');
 
-  // mrkdwn: model and production text is escaped so <!channel>, <@U…> or <url|label> can't act.
-  const section = (label: string, body: string) => ({ type: 'section', text: { type: 'mrkdwn', text: clip(`*${label}*\n${esc(body)}`) } });
+  // Slack: what someone reads in the channel. Two short paragraphs, no evidence
+  // ids; the card's file and the run keep everything. Model and production text
+  // is escaped so <!channel>, <@U…> or <url|label> can't act.
+  const head = `${SEV[r.severity]} ${LEVEL[r.severity]}: ${r.title}`;
+  const pair = (a: string, x: string, b: string, y: string) => ({ type: 'section', text: { type: 'mrkdwn', text: clip(`*${a}:* ${esc(brief(x, 400))}\n*${b}:* ${esc(brief(y, 400))}`) } });
+  const doubt = challenge && challenge.verdict !== 'upheld' && challenge.verdict !== 'error';
   const blocks = [
-    { type: 'header', text: { type: 'plain_text', text: clip(`${SEV[r.severity]} ${r.title}`, 150) } },
+    { type: 'header', text: { type: 'plain_text', text: clip(head, 150) } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `*${r.status}* ${esc(`since ${when(r.started_at, patrolAt)} · confidence ${r.cause.confidence}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}` }] },
+    pair("What's wrong", r.what_broke, 'Impact', r.impact),
+    pair('Likely cause', r.cause.hypothesis, 'Suggested fix', r.suggested_fix),
+    ...(doubt ? [{ type: 'section', text: { type: 'mrkdwn', text: clip(`⚠️ *A second AI check disagrees, a human decides:* ${esc(brief(m(challenge.overall), 400))}`) } }] : []),
     {
       type: 'context',
-      elements: [{ type: 'mrkdwn', text: `*${r.status}* · ${esc(`since ${r.started_at} · severity ${r.severity} · confidence ${r.cause.confidence}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}` }],
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: clip(
+            esc(
+              [
+                `${r.evidence.length} evidence ${r.evidence.length === 1 ? 'item' : 'items'}`,
+                r.not_checked.length ? `${r.not_checked.length} not checked` : '',
+                challenge?.verdict === 'upheld' ? 'second check agrees' : challenge?.verdict === 'error' ? 'second check failed' : '',
+                `patrol ${when(patrolAt, patrolAt)}`,
+                footer,
+              ]
+                .filter(Boolean)
+                .join(' · '),
+            ),
+            300,
+          ),
+        },
+      ],
     },
-    section('What broke', r.what_broke),
-    section('Impact', r.impact),
-    section('Likely cause', r.cause.hypothesis),
-    section('Suggested fix', r.suggested_fix),
-    section('Evidence', r.evidence.map((e) => `• ${e.id}: ${e.claim}`).join('\n')),
-    ...(r.not_checked.length ? [section('Not checked', r.not_checked.map((x) => `• ${x}`).join('\n'))] : []),
-    ...(ch.length ? [section('Challenge', ch.join('\n'))] : []),
-    { type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(`patrol ${patrolAt} · ${footer}`), 300) }] },
   ];
-  return { text: `${esc(`${SEV[r.severity]} ${r.title}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}`, blocks, markdown: md };
+  return { text: `${esc(head)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}`, blocks, markdown: md };
+}
+
+const LEVEL = { critical: 'Critical', major: 'Major', minor: 'Minor', noise: 'Noise' } as const;
+
+// A time as HH:MMZ, with the date only when it isn't the patrol's day.
+function when(iso: string, patrolAt: string): string {
+  if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(iso)) return iso.slice(0, 40);
+  const t = `${iso.slice(11, 16)}Z`;
+  return iso.slice(0, 10) === patrolAt.slice(0, 10) ? t : `${iso.slice(5, 10)} ${t}`;
+}
+
+// At most `n` characters, ending at a sentence when one ends past a third of it.
+export function brief(s: string, n: number): string {
+  if (s.length <= n) return s;
+  const cut = s.slice(0, n);
+  const end = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('.\n'));
+  return end > n / 3 ? cut.slice(0, end + 1) : `${cut.slice(0, n - 1).trimEnd()}…`;
 }
 
 // ---- the patrol card ------------------------------------------------------------
