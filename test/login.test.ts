@@ -67,6 +67,19 @@ test('the protected-resource document points Claude Code at Keycloak', () => {
   assert.equal(login.challenge(), 'Bearer resource_metadata="https://agent-engine.starkfuture.com/.well-known/oauth-protected-resource/mcp"');
 });
 
+test('the document advertises KEYCLOAK_SCOPES so Claude Code asks for an offline session, and nothing by default', () => {
+  const env = { KEYCLOAK_ISSUER: 'https://keycloak.starkfuture.com/auth/realms/stark', ENGINE_PUBLIC_URL: 'https://agent-engine.starkfuture.com' };
+  const kc = fakeKeycloak();
+  assert.equal(loadConfig(env).mcp.login!.scopes.length, 0);
+  assert.equal('scopes_supported' in new Login({ ...kc.cfg, scopes: [] }, kc.keys).metadata(), false, 'unset: Claude Code asks for no extra scope');
+  const login = loadConfig({ ...env, KEYCLOAK_SCOPES: 'offline_access' }).mcp.login!;
+  assert.deepEqual(login.scopes, ['offline_access']);
+  assert.deepEqual(new Login({ ...kc.cfg, scopes: login.scopes }, kc.keys).metadata().scopes_supported, ['offline_access']);
+  assert.throws(() => loadConfig({ ...env, KEYCLOAK_SCOPES: 'offline_access "x"' }), /not a scope name/);
+  assert.deepEqual(loadConfig({ ...env, KEYCLOAK_SCOPES: 'offline_access, api://engine/read 1st' }).mcp.login!.scopes, ['offline_access', 'api://engine/read', '1st'], 'any RFC 6749 scope name');
+  assert.throws(() => loadConfig({ KEYCLOAK_SCOPES: 'offline_access' }), /KEYCLOAK_SCOPES set without KEYCLOAK_ISSUER/, 'scopes alone mean a half-configured sign-in');
+});
+
 test('signing keys: cached, refetched for a new kid at most every 30 s, stale keys survive an outage', async (t) => {
   const kc = fakeKeycloak();
   const jwk = { ...kc.publicKey.export({ format: 'jwk' }), kid: 'k1', use: 'sig' };

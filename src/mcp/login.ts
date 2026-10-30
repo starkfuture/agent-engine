@@ -20,6 +20,7 @@ export interface LoginConfig {
   clientId: string; // the Keycloak client Claude Code signs in with; tokens must be for it (aud) and from it (azp)
   publicUrl: string; // https://agent-engine.<internal domain>, the address people add to Claude Code
   domain: string; // starkfuture.com
+  scopes?: string[]; // what Claude Code should ask for (offline_access: stay signed in for the client's offline cap); only scopes the Keycloak client has, or Keycloak refuses the sign-in
 }
 
 // 401: the token itself is wrong (expired, forged, another issuer); signing in
@@ -138,7 +139,7 @@ export class Login {
 
   // RFC 9728: where Claude Code learns which authorization server to use.
   metadata(): Record<string, unknown> {
-    return { resource: `${this.base}/mcp`, authorization_servers: [this.issuer], bearer_methods_supported: ['header'], resource_name: 'agent-engine' };
+    return { resource: `${this.base}/mcp`, authorization_servers: [this.issuer], bearer_methods_supported: ['header'], resource_name: 'agent-engine', ...(this.cfg.scopes?.length ? { scopes_supported: this.cfg.scopes } : {}) };
   }
 
   challenge(): string {
