@@ -7,7 +7,7 @@ export const ReportShape = {
   title: z.string().min(5).max(140).describe('One line: what is wrong, where. No severity words.'),
   severity: z
     .enum(['critical', 'major', 'minor', 'noise'])
-    .describe('Your assessment (advisory only: paging is decided by deterministic rules, never by this field).'),
+    .describe('Decides what is posted: critical and major go to the team channel; minor and noise are only recorded. Protected journeys and big spikes are posted by code regardless.'),
   status: z.enum(['active', 'recovering', 'resolved', 'unclear']),
   started_at: z.string().describe('ISO time of the first bad event you found, or "unknown".'),
   what_broke: z.string().min(10).max(700).describe('Observable symptom: endpoint/flow, status codes, error text (redacted).'),

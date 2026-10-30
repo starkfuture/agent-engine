@@ -26,7 +26,9 @@ function challengeLines(c: ChallengeResult | undefined): string[] {
 // into the card. (Redacting the serialised blocks broke JSON on `KEY="…"`.)
 const m = (s: string) => cleanModelText(redact(s));
 
-export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult): Card {
+// `cc`: owner mentions from the owners file (validated there), the only text
+// that reaches Slack unescaped.
+export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult, cc: string[] = []): Card {
   const r: Report = {
     ...raw,
     title: m(raw.title),
@@ -42,7 +44,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
   const ch = challengeLines(challenge).map(m);
   const md = [
     `## ${SEV[r.severity]} ${r.title}`,
-    `**Status:** ${r.status} · **Since:** ${r.started_at} · **Severity (advisory):** ${r.severity} · **Confidence:** ${r.cause.confidence}`,
+    `**Status:** ${r.status} · **Since:** ${r.started_at} · **Severity:** ${r.severity} · **Confidence:** ${r.cause.confidence}${cc.length ? ` · cc ${cc.join(' ')}` : ''}`,
     '',
     `**What broke:** ${r.what_broke}`,
     '',
@@ -67,7 +69,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     { type: 'header', text: { type: 'plain_text', text: clip(`${SEV[r.severity]} ${r.title}`, 150) } },
     {
       type: 'context',
-      elements: [{ type: 'mrkdwn', text: `*${r.status}* · ${esc(`since ${r.started_at} · severity ${r.severity} (advisory) · confidence ${r.cause.confidence}`)}` }],
+      elements: [{ type: 'mrkdwn', text: `*${r.status}* · ${esc(`since ${r.started_at} · severity ${r.severity} · confidence ${r.cause.confidence}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}` }],
     },
     section('What broke', r.what_broke),
     section('Impact', r.impact),
@@ -78,7 +80,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     ...(ch.length ? [section('Challenge', ch.join('\n'))] : []),
     { type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(`patrol ${patrolAt} · ${footer}`), 300) }] },
   ];
-  return { text: esc(`${SEV[r.severity]} ${r.title}`), blocks, markdown: md };
+  return { text: `${esc(`${SEV[r.severity]} ${r.title}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}`, blocks, markdown: md };
 }
 
 // ---- the patrol card ------------------------------------------------------------
