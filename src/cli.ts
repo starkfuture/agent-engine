@@ -7,6 +7,7 @@ import { loadConfig, loadDotEnv, type Config } from './config.js';
 import { DirectTelemetry, GrafanaTelemetry, readToken, RecordingTelemetry, ReplayTelemetry, type Telemetry } from './clients/telemetry.js';
 import { httpQuery } from './patrol/collectors.js';
 import { Noise } from './patrol/noise.js';
+import { Owners } from './patrol/owners.js';
 import { State } from './patrol/state.js';
 import { rowLine } from './patrol/summary.js';
 import { CardSink } from './output/sink.js';
@@ -169,7 +170,7 @@ function monitorAgent(cfg: Config): MonitorAgent {
 const align = (d: Date, min: number) => new Date(Math.floor(d.getTime() / (min * 60_000)) * min * 60_000);
 
 // The patrol every window until the process ends; each pass lands in metrics.
-async function patrolEvery(cfg: Config, noise: Noise, sink: CardSink, w: number, metrics?: Metrics): Promise<void> {
+async function patrolEvery(cfg: Config, noise: Noise, owners: Owners, sink: CardSink, w: number, metrics?: Metrics): Promise<void> {
   await patrolLoop({
     tel: telemetry(cfg),
     cfg,
@@ -177,7 +178,7 @@ async function patrolEvery(cfg: Config, noise: Noise, sink: CardSink, w: number,
     state: State.load(cfg.stateFile),
     sink,
     windowMin: w,
-    opts: { llm: a.llm, post: a.post, log },
+    opts: { llm: a.llm, post: a.post, log, owners },
     monitor: a.llm ? monitorAgent(cfg) : undefined,
     onPass: metrics ? (at, r) => metrics.patrol(at, r) : undefined,
   });
@@ -267,6 +268,7 @@ async function main() {
   loadDotEnv();
   const cfg = loadConfig();
   const noise = Noise.load(cfg.noiseFile);
+  const owners = Owners.load(cfg.ownersFile);
   const sink = new CardSink(cfg.outDir, cfg.slackWebhookUrl);
   const w = cfg.windowMinutes;
 
@@ -285,7 +287,7 @@ async function main() {
       if (!name) throw new Error('usage: run <agent> --task "<text>"');
       if (name === 'monitor') {
         const state = a.fresh ? State.memory() : State.load(cfg.stateFile);
-        const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, align(new Date(), w), { llm: true, post: a.post, log }, monitorAgent(cfg));
+        const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, align(new Date(), w), { llm: true, post: a.post, log, owners }, monitorAgent(cfg));
         for (const c of r.cards) console.log(`card: ${c}`);
         return;
       }
@@ -434,7 +436,7 @@ async function main() {
       }
       if (a.patrol) {
         log(`patrol every ${w} min in this process${a.llm ? ' with the investigator' : ''}`);
-        void patrolEvery(cfg, noise, sink, w, metrics);
+        void patrolEvery(cfg, noise, owners, sink, w, metrics);
       }
       await new Promise(() => {}); // until killed
       return;
@@ -453,7 +455,7 @@ async function main() {
     case 'patrol': {
       const state = a.fresh ? State.memory() : State.load(cfg.stateFile);
       const at = align(a.at ? date(a.at, 'at') : new Date(), w);
-      const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log }, a.llm ? monitorAgent(cfg) : undefined);
+      const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log, owners }, a.llm ? monitorAgent(cfg) : undefined);
       for (const row of r.summary.send) console.log(rowLine(row));
       for (const c of r.cards) console.log(`card: ${c}`);
       return;
@@ -462,7 +464,7 @@ async function main() {
     case 'loop': {
       const metrics = metricsServer(cfg);
       if (a.port) startHealth({ host: a.host ?? '127.0.0.1', port: Number(a.port) });
-      return void (await patrolEvery(cfg, noise, sink, w, metrics));
+      return void (await patrolEvery(cfg, noise, owners, sink, w, metrics));
     }
 
     case 'export': {
@@ -513,9 +515,9 @@ async function main() {
       const monitor = a.llm ? { engine: makeEngine(cfg, join(outDir, 'runs')), agent: loadAgent(join(cfg.agentsDir, 'monitor'), cfg.memoryDir) } : undefined;
       const timeline: string[] = [`# Replay ${from.toISOString()} → ${to.toISOString()} (step ${step} min, window ${w} min)`, ''];
       for (let t = from; t <= to; t = new Date(t.getTime() + step * 60_000)) {
-        const r = await patrolOnce(tel, replayCfg, noise, state, new CardSink(outDir), t, { llm: a.llm, post: false, trigger: 'replay', log }, monitor);
+        const r = await patrolOnce(tel, replayCfg, noise, state, new CardSink(outDir), t, { llm: a.llm, post: false, trigger: 'replay', log, owners }, monitor);
         const down = r.summary.sources.filter((s) => !s.ok).map((s) => s.source);
-        timeline.push(`## ${t.toISOString()}  send ${r.summary.send.length} · known ${r.summary.known.length} · recovered ${r.summary.recovered.length}${down.length ? ` · blind: ${down.join(', ')}` : ''}`);
+        timeline.push(`## ${t.toISOString()}  send ${r.summary.send.length} · known ${r.summary.known.length} · recovered ${r.summary.recovered.length} · to Slack ${r.slack.length}${down.length ? ` · blind: ${down.join(', ')}` : ''}`);
         for (const row of r.summary.send) timeline.push(`- ${rowLine(row)}`);
         if (r.investigation) timeline.push(`- investigator: ${r.investigation.status}, ${r.investigation.outputs.length} report(s), $${r.investigation.cost.toFixed(2)}${r.investigation.challenge ? `, challenge ${r.investigation.challenge.verdict}` : ''}`);
       }

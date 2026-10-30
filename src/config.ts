@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { parse } from 'yaml';
 import { z } from 'zod';
+import { DEFAULT_FLOOR } from './patrol/digest.js';
 
 const HttpFamily = z.object({
   id: z.string(),
@@ -47,8 +48,10 @@ export interface Config {
   lokiUid: string | undefined;
   tempoUid: string | undefined;
   windowMinutes: number;
+  attentionFloor: number; // fresh or worse event rows below this count are "quiet" on the card, not "to look at"
   sources: Sources;
   noiseFile: string;
+  ownersFile: string; // service → Slack mention for lines to look at
   stateFile: string;
   outDir: string;
   llm: {
@@ -158,8 +161,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     lokiUid: opt(env.LOKI_DATASOURCE_UID),
     tempoUid: opt(env.TEMPO_DATASOURCE_UID),
     windowMinutes: num(env.PATROL_WINDOW_MINUTES, 15, 'PATROL_WINDOW_MINUTES'),
+    attentionFloor: num(env.PATROL_ATTENTION_FLOOR, DEFAULT_FLOOR, 'PATROL_ATTENTION_FLOOR'),
     sources: loadSources(r(env.SRE_SOURCES_FILE ?? 'config/sources.yaml')),
     noiseFile: r(env.SRE_NOISE_FILE ?? 'config/noise.yaml'),
+    ownersFile: r(env.SRE_OWNERS_FILE ?? 'config/owners.yaml'),
     stateFile: r(env.SRE_STATE_FILE ?? '.state/state.json'),
     outDir: r(env.SRE_OUT_DIR ?? 'out'),
     llm: {

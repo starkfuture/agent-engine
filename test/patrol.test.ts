@@ -8,6 +8,7 @@ import { checkReport, type Report } from '../src/investigate/report.js';
 import { reportCard } from '../src/output/card.js';
 import { CardSink } from '../src/output/sink.js';
 import { Noise } from '../src/patrol/noise.js';
+import { Owners } from '../src/patrol/owners.js';
 import { State } from '../src/patrol/state.js';
 import { buildSummary, renderSummary } from '../src/patrol/summary.js';
 import { loadAgent } from '../src/engine/agent.js';
@@ -25,6 +26,7 @@ const cfg = (): Config => ({
   lokiUid: undefined,
   tempoUid: undefined,
   windowMinutes: 15,
+  attentionFloor: 10,
   sources: {
     http_families: [
       { id: 'legacy-v1', selector: 'backend_be_production_http_requests_total', service: 'backend-production', route_label: 'route', status_label: 'status_code' },
@@ -35,6 +37,7 @@ const cfg = (): Config => ({
     traces: { traceql: '{ status = error }', limit: 10 },
   },
   noiseFile: '/dev/null',
+  ownersFile: '/dev/null',
   stateFile: join(mkdtempSync(join(tmpdir(), 'sre-test-')), 'state.json'),
   outDir: mkdtempSync(join(tmpdir(), 'sre-out-')),
   llm: { available: false, dailyCapUsd: 10, monthlyCapUsd: 100 },
@@ -142,6 +145,16 @@ test('without LLM credentials the patrol still writes a rows card and says why',
   assert.ok(r.cards[0]!.endsWith('-rows.md'));
 });
 
+test('the rows card leads with a summary and mentions the owner of what to look at', async () => {
+  const c = cfg();
+  const owners = new Owners({ owners: { 'backend-*': '<@U0BACKEND1>' } });
+  const r = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: false, post: false, owners });
+  const md = readFileSync(r.cards[0]!, 'utf8');
+  assert.match(md, /^## Patrol 2026-09-29 12:15Z: 2 to look at · cc <@U0BACKEND1>\n/);
+  assert.match(md, /`\/v1\/auth\/password\/reset 400` — now 75 of 95 requests \(1h ago 2\) vs expected 2\.1 · spike, started <@U0BACKEND1>/);
+  assert.match(md, /_not investigated: LLM disabled for this run · blind spots: logs, traces_/);
+});
+
 function monitor(c: Config, session: Session, llmAvailable = true): MonitorAgent {
   return {
     engine: { store: new Store(join(c.runsDir, 'engine.db')), runsDir: c.runsDir, stopFile: join(c.runsDir, 'STOP'), session, dailyCapUsd: 20, llmAvailable },
@@ -176,6 +189,7 @@ test('the rows card goes out before the AI; reports cite real tool results; prot
   assert.equal(r.investigation?.challenge?.verdict, 'upheld');
   assert.equal(r.cards.length, 2);
   assert.ok(r.cards[0]!.endsWith('-rows.md'), 'deterministic card first');
+  assert.deepEqual(r.slack, r.cards, 'urgent rows and a critical report both go to Slack');
   assert.match(readFileSync(r.cards[1]!, 'utf8'), /Challenge: upheld/);
   assert.equal(session.requests[0]!.builtin.length, 0, 'monitor gets no built-in tools');
 });
@@ -200,6 +214,62 @@ const report = (over: Partial<Report> = {}): Report => ({
   not_checked: [],
   rows: ['http|backend-production|/v1/auth/password/reset|400'],
   ...over,
+});
+
+// The same incident at a quarter of the size: still worth a look (above the
+// floor), but neither protected nor a big spike, so the AI decides.
+const smaller = (q: string, at: Date) => world(q, at).map((x) => (/^4/.test(x.labels.status_code ?? '') && x.labels.route !== '/v1/products' ? { ...x, value: Math.round(x.value / 4) } : x));
+const RESET = 'http|backend-production|/v1/auth/password/reset|400';
+const SIGNUP = 'http|backend-production|/v1/auth/signup|400';
+
+test('without the AI only urgent rows reach Slack', async () => {
+  const c = cfg();
+  const big = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: false, post: false });
+  assert.deepEqual(big.slack, big.cards, 'a big spike posts the rows card');
+  const small = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: false, post: false });
+  assert.equal(small.summary.send.length, 2);
+  assert.equal(small.cards.length, 1, 'the rows card is still written');
+  assert.deepEqual(small.slack, []);
+});
+
+test('a 6-hour reminder of an urgent row is not posted again', async () => {
+  const c = cfg();
+  const state = State.memory();
+  const first = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), state, new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: false, post: false });
+  assert.equal(first.slack.length, 1);
+  const later = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), state, new CardSink(c.outDir), new Date('2026-09-29T18:30:00Z'), { llm: false, post: false });
+  assert.ok(later.summary.send.some((r) => r.key === RESET && r.novelty === 'reminder'));
+  assert.deepEqual(later.slack, []);
+});
+
+test('the AI decides the rest: critical and major are posted with their owners, minor is only recorded', async () => {
+  const c = cfg();
+  const owners = new Owners({ owners: { 'backend-*': '<@U0BACKEND1>' } });
+  const session = fakeSession(async function* (sim) {
+    const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+    const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+    const quote = /\/v1\/auth\/password\/reset 400 \| \d+/.exec(out.text)![0];
+    for (const [severity, rows] of [['major', [RESET]], ['minor', [SIGNUP]]] as const) {
+      const r = await sim.mcp('submit_report', report({ severity, rows: [...rows], evidence: [{ id, quote, claim: 'reset requests return 400' }] }));
+      assert.equal(r.isError, false, r.text);
+    }
+    yield ok(0.3, 4);
+  });
+  const r = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false, owners }, monitor(c, session));
+  assert.equal(r.investigation?.outputs.length, 2);
+  assert.equal(r.investigation?.challenge, undefined, 'not urgent, not challenged');
+  assert.equal(r.cards.length, 3);
+  assert.equal(r.slack.length, 1, 'only the major report');
+  assert.ok(r.slack[0]!.endsWith('-1.md'));
+  assert.match(readFileSync(r.slack[0]!, 'utf8'), /\*\*Severity:\*\* major · \*\*Confidence:\*\* medium · cc <@U0BACKEND1>/);
+});
+
+test('nothing new above the floor: no AI run, nothing posted', async () => {
+  const c = { ...cfg(), attentionFloor: 100 };
+  const r = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false }, monitor(c, fakeSession()));
+  assert.equal(r.skippedLlm, 'nothing new above the attention floor');
+  assert.equal(r.investigation, undefined);
+  assert.deepEqual(r.slack, []);
 });
 
 test('reports must cover real rows and state measured impact for critical', () => {
@@ -234,6 +304,29 @@ test('card survives quotes in model text, and strips images and unknown links', 
   assert.ok(!all.includes('evil.test/p'));
   assert.ok(!all.includes('d=1'));
   assert.ok(all.includes('https://monitoring.starkfuture.com/d/abc'));
+});
+
+test('the AI card reads in Slack: level in the header, two short paragraphs, no evidence ids; the file keeps it all', () => {
+  const long = `${'The rollout renamed the route. '.repeat(20)}Tail.`;
+  const c = reportCard(report({ severity: 'major', cause: { hypothesis: long, confidence: 'medium' } }), '2026-09-29T12:15:00Z', 'run r-1', { verdict: 'upheld', overall: 'Holds up', blocking: [], notes: [] } as never);
+  const slack = JSON.stringify(c.blocks);
+  assert.equal((c.blocks[0] as { text: { text: string } }).text.text, '🟠 Major: Password reset returns 400 for valid requests');
+  assert.match(slack, /since 12:00Z · confidence medium/);
+  assert.match(slack, /What's wrong:\*/);
+  assert.doesNotMatch(slack, /E-abcd-1/, 'evidence ids stay in the file');
+  assert.match(slack, /1 evidence item · second check agrees · patrol 12:15Z · run r-1/);
+  assert.ok(!slack.includes('Tail.'), 'long text is cut');
+  assert.match(slack, /route\.\\n\*Suggested fix/, 'at a sentence end');
+  assert.match(c.markdown, /E-abcd-1: 75 of 95 requests were 400/);
+  assert.match(c.markdown, /Tail\./);
+  const objection = (claim: string, evidence: string[]) => ({ claim, evidence, failure_scenario: '', settling_check: '', blocking: true });
+  const mine = reportCard(report(), '2026-09-29T12:15:00Z', 'run r-2', { verdict: 'escalate', overall: 'Mixed', blocking: [objection('The 400s are bot traffic (E-abcd-1).', ['E-abcd-1'])], notes: [] } as never);
+  assert.match(JSON.stringify(mine.blocks), /A second AI check disputes this, a human decides:\* The 400s are bot traffic\./, 'its own objection, without the id');
+  const named = reportCard(report(), '2026-09-29T12:15:00Z', 'run r-3', { verdict: 'escalate', overall: 'Mixed', blocking: [objection('/v1/auth/password/reset 400s are retries', ['E-ffff-9'])], notes: [] } as never);
+  assert.match(JSON.stringify(named.blocks), /disputes this/, 'or one that names its route');
+  const other = reportCard(report(), '2026-09-29T12:15:00Z', 'run r-4', { verdict: 'escalate', overall: 'The stock-sync row is not noise', blocking: [objection('stock-sync INSERT spans are failing', ['E-ffff-2'])], notes: [] } as never);
+  assert.doesNotMatch(JSON.stringify(other.blocks), /disputes this/, 'an objection about another finding stays off this card');
+  assert.match(JSON.stringify(other.blocks), /second check disputes another finding/);
 });
 
 test('card escapes Slack controls in model and production text', () => {

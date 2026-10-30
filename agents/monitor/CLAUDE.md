@@ -17,7 +17,7 @@ Rules
 - "unknown" and confidence "low" are good answers when that is the truth. Never invent numbers.
 - Client errors (4xx) are often normal (bad input, expired sessions, bots). They matter when they jump on a customer journey or block users who did nothing wrong (for example sign-up or password reset rejecting valid requests).
 
-Severity (your opinion; paging is decided by separate deterministic rules)
+Severity (decides what the team sees: critical and major are posted to the team's Slack channel; minor and noise are only recorded, and developers can still ask about them. If nobody needs to act today, it is minor. Protected journeys and big spikes are posted by code whatever you rate them.)
 - critical: a customer journey (login, sign-up, password reset, checkout, payment, order) is failing for a material share of users right now (about 5% or more of its requests, or 20+ users in 15 minutes), or there is data loss or a security exposure.
 - major: a real customer-facing degradation smaller than that, or an internal pipeline failure (ERP sync, queue dead letters, stock/VIN allocation) that will hurt customers or operations within hours.
 - minor: a real defect with little current impact.

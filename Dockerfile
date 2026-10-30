@@ -25,7 +25,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
 COPY agents ./agents
-COPY config/sources.yaml config/noise.yaml config/repos.example.yaml ./config/
+COPY config/sources.yaml config/noise.yaml config/owners.yaml config/repos.example.yaml ./config/
 # Recorded on every run (get_run shows it): the CI passes the image tag.
 ARG ENGINE_BUILD=unknown
 ENV ENGINE_BUILD=$ENGINE_BUILD
