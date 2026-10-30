@@ -517,7 +517,7 @@ async function main() {
       for (let t = from; t <= to; t = new Date(t.getTime() + step * 60_000)) {
         const r = await patrolOnce(tel, replayCfg, noise, state, new CardSink(outDir), t, { llm: a.llm, post: false, trigger: 'replay', log, owners }, monitor);
         const down = r.summary.sources.filter((s) => !s.ok).map((s) => s.source);
-        timeline.push(`## ${t.toISOString()}  send ${r.summary.send.length} · known ${r.summary.known.length} · recovered ${r.summary.recovered.length}${down.length ? ` · blind: ${down.join(', ')}` : ''}`);
+        timeline.push(`## ${t.toISOString()}  send ${r.summary.send.length} · known ${r.summary.known.length} · recovered ${r.summary.recovered.length} · to Slack ${r.slack.length}${down.length ? ` · blind: ${down.join(', ')}` : ''}`);
         for (const row of r.summary.send) timeline.push(`- ${rowLine(row)}`);
         if (r.investigation) timeline.push(`- investigator: ${r.investigation.status}, ${r.investigation.outputs.length} report(s), $${r.investigation.cost.toFixed(2)}${r.investigation.challenge ? `, challenge ${r.investigation.challenge.verdict}` : ''}`);
       }

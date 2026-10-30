@@ -189,6 +189,7 @@ test('the rows card goes out before the AI; reports cite real tool results; prot
   assert.equal(r.investigation?.challenge?.verdict, 'upheld');
   assert.equal(r.cards.length, 2);
   assert.ok(r.cards[0]!.endsWith('-rows.md'), 'deterministic card first');
+  assert.deepEqual(r.slack, r.cards, 'urgent rows and a critical report both go to Slack');
   assert.match(readFileSync(r.cards[1]!, 'utf8'), /Challenge: upheld/);
   assert.equal(session.requests[0]!.builtin.length, 0, 'monitor gets no built-in tools');
 });
@@ -213,6 +214,62 @@ const report = (over: Partial<Report> = {}): Report => ({
   not_checked: [],
   rows: ['http|backend-production|/v1/auth/password/reset|400'],
   ...over,
+});
+
+// The same incident at a quarter of the size: still worth a look (above the
+// floor), but neither protected nor a big spike, so the AI decides.
+const smaller = (q: string, at: Date) => world(q, at).map((x) => (/^4/.test(x.labels.status_code ?? '') && x.labels.route !== '/v1/products' ? { ...x, value: Math.round(x.value / 4) } : x));
+const RESET = 'http|backend-production|/v1/auth/password/reset|400';
+const SIGNUP = 'http|backend-production|/v1/auth/signup|400';
+
+test('without the AI only urgent rows reach Slack', async () => {
+  const c = cfg();
+  const big = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: false, post: false });
+  assert.deepEqual(big.slack, big.cards, 'a big spike posts the rows card');
+  const small = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: false, post: false });
+  assert.equal(small.summary.send.length, 2);
+  assert.equal(small.cards.length, 1, 'the rows card is still written');
+  assert.deepEqual(small.slack, []);
+});
+
+test('a 6-hour reminder of an urgent row is not posted again', async () => {
+  const c = cfg();
+  const state = State.memory();
+  const first = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), state, new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: false, post: false });
+  assert.equal(first.slack.length, 1);
+  const later = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), state, new CardSink(c.outDir), new Date('2026-09-29T18:30:00Z'), { llm: false, post: false });
+  assert.ok(later.summary.send.some((r) => r.key === RESET && r.novelty === 'reminder'));
+  assert.deepEqual(later.slack, []);
+});
+
+test('the AI decides the rest: critical and major are posted with their owners, minor is only recorded', async () => {
+  const c = cfg();
+  const owners = new Owners({ owners: { 'backend-*': '<@U0BACKEND1>' } });
+  const session = fakeSession(async function* (sim) {
+    const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+    const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+    const quote = /\/v1\/auth\/password\/reset 400 \| \d+/.exec(out.text)![0];
+    for (const [severity, rows] of [['major', [RESET]], ['minor', [SIGNUP]]] as const) {
+      const r = await sim.mcp('submit_report', report({ severity, rows: [...rows], evidence: [{ id, quote, claim: 'reset requests return 400' }] }));
+      assert.equal(r.isError, false, r.text);
+    }
+    yield ok(0.3, 4);
+  });
+  const r = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false, owners }, monitor(c, session));
+  assert.equal(r.investigation?.outputs.length, 2);
+  assert.equal(r.investigation?.challenge, undefined, 'not urgent, not challenged');
+  assert.equal(r.cards.length, 3);
+  assert.equal(r.slack.length, 1, 'only the major report');
+  assert.ok(r.slack[0]!.endsWith('-1.md'));
+  assert.match(readFileSync(r.slack[0]!, 'utf8'), /\*\*Severity:\*\* major · \*\*Confidence:\*\* medium · cc <@U0BACKEND1>/);
+});
+
+test('nothing new above the floor: no AI run, nothing posted', async () => {
+  const c = { ...cfg(), attentionFloor: 100 };
+  const r = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false }, monitor(c, fakeSession()));
+  assert.equal(r.skippedLlm, 'nothing new above the attention floor');
+  assert.equal(r.investigation, undefined);
+  assert.deepEqual(r.slack, []);
 });
 
 test('reports must cover real rows and state measured impact for critical', () => {
