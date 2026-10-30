@@ -78,7 +78,7 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 **What reaches Slack** (with `--post` and a webhook): the AI decides, except for what it must never hide.
 
 - **Urgent rows, at once, by code:** a new or worse protected journey (`never_suppress`) or big spike (50+ events and 5× expected). The rows card is posted before the AI starts, with or without it. 6-hour reminders of something already posted are not.
-- **Everything else, only as an AI report rated critical or major.** Minor and noise reports, and the rows card itself, stay on disk, where the MCP answers from them. Report cards mention the owners of the services they cover.
+- **Everything else, only as an AI report rated critical or major.** Minor and noise reports, and the rows card itself, stay on disk, where the MCP answers from them. Report cards mention the owners of the services they cover. In Slack a report reads as a header with its level, then two short paragraphs (what's wrong and impact, likely cause and fix); evidence and what wasn't checked stay in the card's file and the run.
 - **Without the AI** (no `--llm`, no credentials, kill switch, budget spent, crash), only urgent rows are posted.
 
 The baseline is `min(1 d, 7 d)`, scaled by current traffic, so a one-day incident doesn't become its own baseline the next day. The 1 h window only labels a row "started" or "ongoing".

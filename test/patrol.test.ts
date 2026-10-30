@@ -306,6 +306,23 @@ test('card survives quotes in model text, and strips images and unknown links', 
   assert.ok(all.includes('https://monitoring.starkfuture.com/d/abc'));
 });
 
+test('the AI card reads in Slack: level in the header, two short paragraphs, no evidence ids; the file keeps it all', () => {
+  const long = `${'The rollout renamed the route. '.repeat(20)}Tail.`;
+  const c = reportCard(report({ severity: 'major', cause: { hypothesis: long, confidence: 'medium' } }), '2026-09-29T12:15:00Z', 'run r-1', { verdict: 'upheld', overall: 'Holds up', blocking: [], notes: [] } as never);
+  const slack = JSON.stringify(c.blocks);
+  assert.equal((c.blocks[0] as { text: { text: string } }).text.text, '🟠 Major: Password reset returns 400 for valid requests');
+  assert.match(slack, /since 12:00Z · confidence medium/);
+  assert.match(slack, /What's wrong:\*/);
+  assert.doesNotMatch(slack, /E-abcd-1/, 'evidence ids stay in the file');
+  assert.match(slack, /1 evidence item · second check agrees · patrol 12:15Z · run r-1/);
+  assert.ok(!slack.includes('Tail.'), 'long text is cut');
+  assert.match(slack, /route\.\\n\*Suggested fix/, 'at a sentence end');
+  assert.match(c.markdown, /E-abcd-1: 75 of 95 requests were 400/);
+  assert.match(c.markdown, /Tail\./);
+  const escalated = reportCard(report(), '2026-09-29T12:15:00Z', 'run r-2', { verdict: 'escalate', overall: 'The counts include bot traffic', blocking: [], notes: [] } as never);
+  assert.match(JSON.stringify(escalated.blocks), /A second AI check disagrees, a human decides:\* The counts include bot traffic/);
+});
+
 test('card escapes Slack controls in model and production text', () => {
   const c = reportCard(report({ title: 'Down <!here>', what_broke: 'log says <!channel> see <https://evil.test|grafana>' }), '2026-09-29T12:15:00Z', 'test');
   // mrkdwn and the notification text parse controls; plain_text (the header) does not.
