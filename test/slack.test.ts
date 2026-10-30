@@ -1,0 +1,162 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { recoveredCard } from '../src/output/card.js';
+import { CardSink } from '../src/output/sink.js';
+import { botTransport, SlackError, SlackOutbox, webhookTransport, type Transport } from '../src/output/slack.js';
+
+type Sent = { text: string; thread_ts?: string; reply_broadcast?: boolean };
+
+// A bot-like transport: records posts, hands out ts values, fails on demand.
+function fakeBot(fail: (n: number) => SlackError | undefined = () => undefined): Transport & { sent: Sent[] } {
+  let n = 0;
+  const sent: Sent[] = [];
+  return {
+    threads: true,
+    sent,
+    async post(m) {
+      const err = fail(++n);
+      if (err) throw err;
+      sent.push({ text: m.text, ...(m.thread_ts ? { thread_ts: m.thread_ts, reply_broadcast: m.reply_broadcast } : {}) });
+      return `1700000000.${String(sent.length).padStart(6, '0')}`;
+    },
+  };
+}
+
+const msg = (text: string) => ({ text, blocks: [] });
+const clock = (start: string) => {
+  let t = Date.parse(start);
+  return { now: () => new Date(t), advance: (min: number) => (t += min * 60_000) };
+};
+const outbox = (t: Transport, c = clock('2026-10-31T10:00:00Z')) => ({ box: new SlackOutbox(':memory:', t, { now: c.now, sleep: async () => {}, gapMs: 0 }), c });
+
+test('one message per issue: later news on the same rows goes into its thread, and only older threads get it broadcast', async () => {
+  const bot = fakeBot();
+  const { box, c } = outbox(bot);
+  box.enqueue({ kind: 'rows', keys: ['http|svc|/a|500'], broadcast: true, message: msg('urgent /a 500') });
+  box.enqueue({ kind: 'report', keys: ['http|svc|/a|500'], broadcast: true, message: msg('Major: /a fails') });
+  assert.deepEqual(await box.flush(), { sent: 2, pending: 0, failed: 0, skipped: 0 });
+  assert.equal(bot.sent[0]!.thread_ts, undefined, 'first post opens the thread');
+  assert.equal(bot.sent[1]!.thread_ts, '1700000000.000001', 'the AI report lands in it');
+  assert.equal(bot.sent[1]!.reply_broadcast, false, 'same news, minutes later: not broadcast');
+
+  c.advance(120);
+  box.enqueue({ kind: 'rows', keys: ['http|svc|/a|500', 'http|svc|/b|500'], broadcast: true, message: msg('worse') });
+  await box.flush();
+  assert.equal(bot.sent[2]!.thread_ts, '1700000000.000001');
+  assert.equal(bot.sent[2]!.reply_broadcast, true, 'news on an older thread shows in the channel too');
+
+  c.advance(25 * 60);
+  box.enqueue({ kind: 'rows', keys: ['http|svc|/b|500'], broadcast: true, message: msg('a day later') });
+  await box.flush();
+  assert.equal(bot.sent[3]!.thread_ts, undefined, 'after a quiet day the issue starts a new message');
+});
+
+test('a Slack failure stays queued and goes out on the next flush; a bad message fails once', async () => {
+  const bot = fakeBot((n) => (n === 1 ? new SlackError('Slack: HTTP 500') : n === 3 ? new SlackError('Slack: invalid_blocks', undefined, true) : undefined));
+  const { box } = outbox(bot);
+  box.enqueue({ kind: 'rows', keys: ['k1'], broadcast: true, message: msg('one') });
+  box.enqueue({ kind: 'rows', keys: ['k2'], broadcast: true, message: msg('two') });
+  const logs: string[] = [];
+  assert.deepEqual(await box.flush((s) => logs.push(s)), { sent: 0, pending: 2, failed: 0, skipped: 0 });
+  assert.match(logs[0]!, /will retry: Slack: HTTP 500/);
+  assert.deepEqual(await box.flush(), { sent: 1, pending: 0, failed: 1, skipped: 0 });
+  assert.deepEqual(bot.sent.map((s) => s.text), ['one']);
+  assert.deepEqual(box.status(), [{ status: 'failed', n: 1 }, { status: 'sent', n: 1 }]);
+});
+
+test('rate limits: a short Retry-After is waited out, a long one leaves the rest for the next patrol, and a day-old post gives up', async () => {
+  const waits: number[] = [];
+  let calls = 0;
+  const t: Transport = {
+    threads: true,
+    async post() {
+      calls++;
+      if (calls === 1) throw new SlackError('rate limited', 2);
+      if (calls === 3) throw new SlackError('rate limited', 120);
+      return `ts${calls}`;
+    },
+  };
+  const c = clock('2026-10-31T10:00:00Z');
+  const box = new SlackOutbox(':memory:', t, { now: c.now, sleep: async (ms) => void waits.push(ms), gapMs: 0 });
+  for (const k of ['a', 'b', 'c']) box.enqueue({ kind: 'rows', keys: [k], broadcast: true, message: msg(k) });
+  assert.deepEqual(await box.flush(), { sent: 1, pending: 2, failed: 0, skipped: 0 });
+  assert.ok(waits.includes(2000), 'waited the 2 s Slack asked for');
+  c.advance(25 * 60);
+  assert.equal((await box.flush()).failed, 2, 'posts older than a day give up instead of arriving stale');
+});
+
+test('recoveries reply only where the problem was posted, grouped per thread', async () => {
+  const bot = fakeBot();
+  const { box } = outbox(bot);
+  box.enqueue({ kind: 'rows', keys: ['http|svc|/a|500', 'logs|svc|Queue stalled|'], broadcast: true, message: msg('urgent') });
+  await box.flush();
+  const groups = box.groupByThread(['http|svc|/a|500', 'logs|svc|Queue stalled|', 'http|other|/x|503']);
+  assert.deepEqual(groups, [['http|svc|/a|500', 'logs|svc|Queue stalled|']], 'a row that was never posted has no thread');
+  const card = recoveredCard(groups[0]!, '2026-10-31T10:30:00.000Z');
+  assert.match(card.markdown, /Back to normal at 10:30Z/);
+  assert.match(card.markdown, /- svc · \/a 500/);
+  box.enqueue({ kind: 'recovered', keys: groups[0]!, broadcast: false, message: { text: card.text, blocks: card.blocks } });
+  box.enqueue({ kind: 'recovered', keys: ['http|other|/x|503'], broadcast: false, message: msg('never posted') });
+  assert.deepEqual(await box.flush(), { sent: 1, pending: 0, failed: 0, skipped: 1 });
+  assert.equal(bot.sent[1]!.thread_ts, '1700000000.000001');
+  assert.equal(bot.sent[1]!.reply_broadcast, false);
+});
+
+test('the webhook cannot thread: every post is top-level, as before', async () => {
+  const sent: string[] = [];
+  const box = new SlackOutbox(':memory:', { threads: false, post: async (m) => void sent.push(m.text) }, { sleep: async () => {}, gapMs: 0 });
+  box.enqueue({ kind: 'rows', keys: ['k'], broadcast: true, message: msg('one') });
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: true, message: msg('two') });
+  await box.flush();
+  assert.deepEqual(sent, ['one', 'two']);
+  assert.deepEqual(box.groupByThread(['k']), []);
+});
+
+test('the bot calls chat.postMessage with the channel, thread and no unfurling; Slack errors map to retry or permanent', async (t) => {
+  const real = globalThis.fetch;
+  t.after(() => (globalThis.fetch = real));
+  const calls: Array<{ url: string; auth: string | null; body: Record<string, unknown> }> = [];
+  let reply: () => Response = () => Response.json({ ok: true, ts: '1.2' });
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, auth: new Headers(init.headers).get('authorization'), body: JSON.parse(String(init.body)) });
+    return reply();
+  }) as typeof fetch;
+  const bot = botTransport('xoxb-test', 'C0TEST123');
+  assert.equal(await bot.post({ text: 't', blocks: [], thread_ts: '9.9', reply_broadcast: true }), '1.2');
+  assert.equal(calls[0]!.url, 'https://slack.com/api/chat.postMessage');
+  assert.equal(calls[0]!.auth, 'Bearer xoxb-test');
+  assert.deepEqual(calls[0]!.body, { channel: 'C0TEST123', text: 't', blocks: [], thread_ts: '9.9', reply_broadcast: true, unfurl_links: false, unfurl_media: false });
+
+  reply = () => new Response('', { status: 429, headers: { 'retry-after': '7' } });
+  await assert.rejects(bot.post({ text: 't', blocks: [] }), (e: SlackError) => e.retryAfterSec === 7 && !e.permanent);
+  reply = () => Response.json({ ok: false, error: 'invalid_blocks' });
+  await assert.rejects(bot.post({ text: 't', blocks: [] }), (e: SlackError) => e.permanent);
+  reply = () => Response.json({ ok: false, error: 'not_in_channel' });
+  await assert.rejects(bot.post({ text: 't', blocks: [] }), (e: SlackError) => !e.permanent && /not_in_channel/.test(e.message));
+
+  const hook = webhookTransport('https://hooks.slack.test/x');
+  reply = () => new Response('invalid_blocks', { status: 400 });
+  await assert.rejects(hook.post({ text: 't', blocks: [] }), (e: SlackError) => e.permanent);
+});
+
+test('the sink queues only cards meant for Slack, with their rows', async () => {
+  const bot = fakeBot();
+  const box = new SlackOutbox(':memory:', bot, { sleep: async () => {}, gapMs: 0 });
+  const sink = new CardSink(mkdtempSync(join(tmpdir(), 'sink-')), box);
+  sink.emit({ text: 'disk only', blocks: [], markdown: 'x' }, 'a');
+  sink.emit({ text: 'to slack', blocks: [], markdown: 'y' }, 'b', { kind: 'rows', keys: ['k'], broadcast: true });
+  await sink.flush();
+  assert.deepEqual(bot.sent.map((s) => s.text), ['to slack']);
+});
+
+test('config: the bot token needs its channel id, and both are checked', async () => {
+  const { loadConfig } = await import('../src/config.js');
+  assert.equal(loadConfig({}).slackBotToken, undefined);
+  assert.deepEqual((({ slackBotToken, slackChannel }) => ({ slackBotToken, slackChannel }))(loadConfig({ SLACK_BOT_TOKEN: 'xoxb-1', SLACK_CHANNEL_ID: 'C0CBLUZLW4S' })), { slackBotToken: 'xoxb-1', slackChannel: 'C0CBLUZLW4S' });
+  assert.throws(() => loadConfig({ SLACK_BOT_TOKEN: 'xoxb-1' }), /needs SLACK_CHANNEL_ID/);
+  assert.throws(() => loadConfig({ SLACK_BOT_TOKEN: 'xoxp-user-token', SLACK_CHANNEL_ID: 'C0CBLUZLW4S' }), /bot token/);
+  assert.throws(() => loadConfig({ SLACK_BOT_TOKEN: 'xoxb-1', SLACK_CHANNEL_ID: '#prod-monitor' }), /not a channel id/);
+});

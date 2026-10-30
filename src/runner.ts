@@ -7,8 +7,8 @@ import { runAgent, type Engine, type RunResult } from './engine/run.js';
 import { monitorTask } from './investigate/prompt.js';
 import { checkReport, Report, ReportShape } from './investigate/report.js';
 import { monitorTools } from './investigate/tools.js';
-import { patrolCard, reportCard, type Card } from './output/card.js';
-import type { CardSink } from './output/sink.js';
+import { patrolCard, recoveredCard, reportCard, type Card } from './output/card.js';
+import type { CardSink, EmitSlack } from './output/sink.js';
 import { bucketOf } from './patrol/digest.js';
 import type { Noise } from './patrol/noise.js';
 import type { Owners } from './patrol/owners.js';
@@ -65,15 +65,23 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   log(`patrol ${summary.at}: ${summary.send.length} to send, ${summary.known.length} known, ${summary.suppressed.length} noise, ${summary.recovered.length} recovered, sources down: ${summary.sources.filter((s) => !s.ok).map((s) => s.source).join(', ') || 'none'}`);
 
   const result: PatrolResult = { summary, cards: [], slack: [] };
-  const emit = async (card: Card, name: string, slack: boolean) => {
-    const file = await sink.emit(card, name, o.post && slack);
+  // slack: queued for the channel (sent when posting is on) with the rows it is about.
+  const emit = (card: Card, name: string, slack?: EmitSlack) => {
+    const file = sink.emit(card, name, o.post ? slack : undefined);
     result.cards.push(file);
     if (slack) result.slack.push(file);
   };
-  if (!summary.send.length) {
+  // Every patrol ends here: save the state first, then send what is queued. A
+  // Slack failure stays queued for the next patrol and never re-runs the model.
+  const finish = async () => {
     state.save();
-    return result; // quiet patrol: no LLM call, no card, $0
-  }
+    if (o.post && sink.outbox?.threads && summary.recovered.length)
+      for (const keys of sink.outbox.groupByThread(summary.recovered)) sink.emit(recoveredCard(keys, summary.at), `${stamp(summary.at)}-recovered-${keys.length}`, { kind: 'recovered', keys, broadcast: false });
+    const f = await sink.flush(log);
+    if (f && f.sent + f.pending + f.failed > 0) log(`slack: ${f.sent} sent${f.pending ? `, ${f.pending} waiting for the next patrol` : ''}${f.failed ? `, ${f.failed} failed` : ''}`);
+    return result;
+  };
+  if (!summary.send.length) return finish(); // quiet patrol: no LLM call, no card, $0
 
   // New or worse only: a 6-hour reminder of something already posted isn't news.
   const urgentRows = summary.send.filter((r) => r.novelty !== 'reminder' && urgent(r, noise));
@@ -95,7 +103,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     protected: (r) => noise.protected(r),
     ref: `patrols/${stamp(summary.at)}.md`,
   });
-  await emit(card, `${stamp(summary.at)}-rows`, urgentRows.length > 0);
+  emit(card, `${stamp(summary.at)}-rows`, urgentRows.length ? { kind: 'rows', keys: urgentRows.map((r) => r.key), broadcast: true } : undefined);
   if (urgentRows.length) log(`rows card to Slack: ${urgentRows.length} urgent row(s)`);
 
   if (!skip && monitor) {
@@ -124,23 +132,22 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       result.skippedLlm = `investigator crashed: ${(e as Error).message.slice(0, 200)}`;
       log(result.skippedLlm);
       for (const r of summary.send) state.reported(r, at);
-      state.save();
-      return result;
+      return finish();
     }
     result.investigation = inv;
     log(`investigation ${inv.status}: ${inv.outputs.length} report(s), ${inv.evidence.items.size} tool call(s), ${inv.turns} turn(s), $${inv.cost.toFixed(3)}${inv.challenge ? `, challenge ${inv.challenge.verdict}` : ''}${inv.note ? ` (${inv.note})` : ''}`);
     const footer = `${monitor.agent.spec.model} · ${inv.evidence.items.size} tool calls · $${inv.cost.toFixed(2)} · run ${inv.runId}`;
     const byKey = new Map(summary.send.map((r) => [r.key, r]));
     const ownersOf = (rep: Report) => [...new Set(rep.rows.map((k) => byKey.get(k) && o.owners?.ownerOf(byKey.get(k)!.service)).filter((x): x is string => !!x))];
-    for (const [i, r] of inv.outputs.entries()) await emit(reportCard(r, summary.at, footer, inv.challenge, ownersOf(r)), `${stamp(summary.at)}-${i + 1}`, POSTED.has(r.severity));
+    for (const [i, r] of inv.outputs.entries())
+      emit(reportCard(r, summary.at, footer, inv.challenge, ownersOf(r)), `${stamp(summary.at)}-${i + 1}`, POSTED.has(r.severity) ? { kind: 'report', keys: r.rows, broadcast: true } : undefined);
     log(`${inv.outputs.filter((r) => POSTED.has(r.severity)).length} of ${inv.outputs.length} report(s) rated critical or major go to Slack`);
     if (inv.status !== 'ok') skip = `investigator ${inv.status}${inv.note ? `: ${inv.note}` : ''}`;
   }
   if (skip) result.skippedLlm = skip;
 
   for (const r of summary.send) state.reported(r, at);
-  state.save();
-  return result;
+  return finish();
 }
 
 // One patrol per window, 30 s after each boundary (so the last scrape is in),

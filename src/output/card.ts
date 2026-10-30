@@ -1,6 +1,6 @@
 import type { ChallengeResult } from '../engine/challenge.js';
 import type { Report } from '../investigate/report.js';
-import { DEFAULT_FLOOR, digest, type DigestOptions, type Line } from '../patrol/digest.js';
+import { DEFAULT_FLOOR, digest, shortSubject, type DigestOptions, type Line } from '../patrol/digest.js';
 import type { Owners } from '../patrol/owners.js';
 import type { FlaggedRow, Summary } from '../patrol/summary.js';
 import { cleanModelText, redact, slackEscape as esc } from '../engine/text.js';
@@ -237,4 +237,22 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
     `_${footer(MD, false)}_`,
   ].join('\n');
   return { text: `${esc(title)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}`, blocks, markdown: md };
+}
+
+// ---- recovered ------------------------------------------------------------------
+// A short reply in the thread where the rows were posted. Row keys are
+// section|service|subject|status; the subject may itself contain '|'.
+export function recoveredCard(keys: string[], at: string): Card {
+  const line = (k: string) => {
+    const parts = k.split('|');
+    const [section, service] = parts;
+    const status = parts.length > 3 ? parts[parts.length - 1] : '';
+    const subject = parts.slice(2, parts.length > 3 ? -1 : undefined).join('|');
+    return `${service} · ${shortSubject({ section: section as FlaggedRow['section'], subject })}${status ? ` ${status}` : ''}`;
+  };
+  const lines = keys.map(line);
+  const head = `✅ Back to normal at ${minute(at).slice(11)}`;
+  const text = `${head}: ${lines.length === 1 ? lines[0] : `${lines.length} signals`}`;
+  const blocks = [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(redact(`${head}\n${lines.map((l) => `• ${l}`).join('\n')}`)), 2900) }] }];
+  return { text: esc(redact(text)), blocks, markdown: `**${head}**\n${lines.map((l) => `- ${l}`).join('\n')}` };
 }

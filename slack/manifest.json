@@ -1,0 +1,19 @@
+{
+  "_metadata": { "major_version": 2 },
+  "display_information": {
+    "name": "Agent Engine",
+    "description": "Production monitor issues from the agent engine (starkfuture/agent-engine): one message per issue, updates in its thread.",
+    "background_color": "#1d1d1d"
+  },
+  "features": {
+    "bot_user": { "display_name": "Agent Engine", "always_online": false }
+  },
+  "oauth_config": {
+    "scopes": { "bot": ["chat:write", "incoming-webhook"] }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

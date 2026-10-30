@@ -11,6 +11,7 @@ import { Owners } from './patrol/owners.js';
 import { State } from './patrol/state.js';
 import { rowLine } from './patrol/summary.js';
 import { CardSink } from './output/sink.js';
+import { botTransport, SlackOutbox, webhookTransport } from './output/slack.js';
 import { listAgents, loadAgent } from './engine/agent.js';
 import { Store } from './engine/store.js';
 import { redact } from './engine/text.js';
@@ -59,7 +60,7 @@ Monitor:
   patrol                      one patrol pass
       --at <ISO>              evaluate at a past time (replay against live data)
       --llm                   run the investigator (needs ANTHROPIC_API_KEY or Bedrock)
-      --post                  post cards to SLACK_WEBHOOK_URL
+      --post                  post cards to Slack (SLACK_BOT_TOKEN + SLACK_CHANNEL_ID, else SLACK_WEBHOOK_URL)
       --replay <dir>          read telemetry from an export instead of Grafana
       --fresh                 in-memory state (don't read or write .state/)
   loop                        patrol every window (default 15 min) until stopped; same flags, plus --metrics-port,
@@ -269,7 +270,9 @@ async function main() {
   const cfg = loadConfig();
   const noise = Noise.load(cfg.noiseFile);
   const owners = Owners.load(cfg.ownersFile);
-  const sink = new CardSink(cfg.outDir, cfg.slackWebhookUrl);
+  // The bot when configured (threads, one message per issue), else the webhook.
+  const transport = cfg.slackBotToken ? botTransport(cfg.slackBotToken, cfg.slackChannel!) : cfg.slackWebhookUrl ? webhookTransport(cfg.slackWebhookUrl) : undefined;
+  const sink = new CardSink(cfg.outDir, transport ? new SlackOutbox(join(cfg.runsDir, 'engine.db'), transport) : undefined);
   const w = cfg.windowMinutes;
 
   switch (cmd) {

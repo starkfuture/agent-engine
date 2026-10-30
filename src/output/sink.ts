@@ -1,29 +1,32 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Card } from './card.js';
+import type { FlushResult, PostKind, SlackOutbox } from './slack.js';
 
-// Cards always land on disk; Slack only when a webhook is configured AND the
-// caller asked to post.
+export interface EmitSlack {
+  kind: PostKind;
+  keys: string[]; // the rows this card is about: they pick the Slack thread
+  broadcast: boolean; // show it in the channel when it lands in an older thread
+}
+
+// Cards always land on disk; Slack only when an outbox is configured AND the
+// caller asked to post. Posts are queued and sent by flush(), which never throws.
 export class CardSink {
   constructor(
     private readonly outDir: string,
-    private readonly webhook?: string,
+    readonly outbox?: SlackOutbox,
   ) {}
 
-  async emit(card: Card, name: string, post: boolean): Promise<string> {
+  emit(card: Card, name: string, slack?: EmitSlack): string {
     const dir = join(this.outDir, 'cards');
     mkdirSync(dir, { recursive: true });
     const file = join(dir, `${name}.md`);
     writeFileSync(file, card.markdown + '\n');
-    if (post && this.webhook) {
-      const res = await fetch(this.webhook, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text: card.text, blocks: card.blocks, unfurl_links: false, unfurl_media: false }), // no link previews: unfurling is an outbound channel
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!res.ok) throw new Error(`Slack webhook: HTTP ${res.status} ${await res.text()}`);
-    }
+    if (slack && this.outbox) this.outbox.enqueue({ ...slack, message: { text: card.text, blocks: card.blocks }, file });
     return file;
+  }
+
+  async flush(log?: (s: string) => void): Promise<FlushResult | undefined> {
+    return this.outbox?.flush(log);
   }
 }
