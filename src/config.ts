@@ -113,7 +113,7 @@ export function loadDotEnv(file = resolve('.env'), env: NodeJS.ProcessEnv = proc
 // tokens would work instead. (ENGINE_PUBLIC_URL and the like alone are allowed:
 // the monitor-only deployment carries them; `serve` refuses a non-loopback
 // bind without the sign-in anyway.)
-const LOGIN_VARS = ['KEYCLOAK_JWKS_URL', 'ENGINE_KC_CLIENT_ID'];
+const LOGIN_VARS = ['KEYCLOAK_JWKS_URL', 'ENGINE_KC_CLIENT_ID', 'KEYCLOAK_SCOPES'];
 function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   const issuer = opt(env.KEYCLOAK_ISSUER)?.replace(/\/+$/, '');
   if (!issuer) {
@@ -135,7 +135,8 @@ function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   // (offline_access = stay signed in for the client's offline cap). Only scopes the Keycloak client
   // carries: Keycloak refuses a sign-in that asks for one it doesn't.
   const scopes = (env.KEYCLOAK_SCOPES ?? '').split(/[\s,]+/).filter(Boolean);
-  for (const s of scopes) if (!/^[a-z][a-z0-9_:.-]{0,60}$/i.test(s)) throw new Error(`KEYCLOAK_SCOPES: "${s}" is not a scope name`);
+  // RFC 6749 scope-token characters, minus the comma that separates them here.
+  for (const s of scopes) if (!/^[\x21\x23-\x2b\x2d-\x5b\x5d-\x7e]+$/.test(s)) throw new Error(`KEYCLOAK_SCOPES: "${s}" is not a scope name`);
   return { issuer, jwksUrl, clientId: env.ENGINE_KC_CLIENT_ID || 'agent-engine', publicUrl, domain, admins, scopes };
 }
 
