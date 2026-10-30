@@ -3,8 +3,11 @@
 #
 # glibc (slim, not alpine): npm installs the SDK's linux-x64 / linux-arm64 CLI
 # binary from the lockfile's optional dependencies, matching this base.
+#
+# The AWS ECR Public mirror of Docker's official images: anonymous Docker Hub
+# pulls from shared CI runners hit its rate limit (429), as in keycloak-stark.
 
-FROM node:22-slim AS build
+FROM public.ecr.aws/docker/library/node:22-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -12,7 +15,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
-FROM node:22-slim
+FROM public.ecr.aws/docker/library/node:22-slim
 # git: the codebase agent snapshots repos with git. tini: PID 1 that forwards
 # SIGTERM to node (graceful shutdown settles running runs) and reaps the
 # Claude CLI subprocesses.
