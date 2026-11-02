@@ -3,6 +3,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import { recoveredCard } from '../src/output/card.js';
 import { CardSink } from '../src/output/sink.js';
 import { botTransport, SlackError, SlackOutbox, webhookTransport, type Transport } from '../src/output/slack.js';
@@ -159,4 +160,63 @@ test('config: the bot token needs its channel id, and both are checked', async (
   assert.throws(() => loadConfig({ SLACK_BOT_TOKEN: 'xoxb-1' }), /needs SLACK_CHANNEL_ID/);
   assert.throws(() => loadConfig({ SLACK_BOT_TOKEN: 'xoxp-user-token', SLACK_CHANNEL_ID: 'C0CBLUZLW4S' }), /bot token/);
   assert.throws(() => loadConfig({ SLACK_BOT_TOKEN: 'xoxb-1', SLACK_CHANNEL_ID: '#prod-monitor' }), /not a channel id/);
+});
+
+test('two senders sharing a database deliver each entry once and preserve thread order', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'outbox-')), 'engine.db');
+  const sent: Sent[] = [];
+  let entered!: () => void;
+  const started = new Promise<void>(r => { entered = r; });
+  let release!: () => void;
+  const blocked = new Promise<void>(r => { release = r; });
+  const transport: Transport = { threads: true, post: async m => {
+    sent.push(m);
+    if (sent.length === 1) { entered(); await blocked; }
+    return `ts${sent.length}`;
+  } };
+  const a = new SlackOutbox(file, transport, { sleep: async () => {}, gapMs: 0 });
+  const b = new SlackOutbox(file, transport, { sleep: async () => {}, gapMs: 0 });
+  a.enqueue({ kind: 'rows', keys: ['k'], broadcast: true, message: msg('urgent') });
+  a.enqueue({ kind: 'report', keys: ['k'], broadcast: true, message: msg('analysis') });
+  const first = a.flush();
+  await started;
+  try {
+    const overlap = await b.flush();
+    assert.equal(overlap.sent, 0, 'another sender cannot take entries already being delivered');
+    assert.equal(overlap.pending, 2);
+  } finally { release(); }
+  assert.equal((await first).sent, 2);
+  assert.deepEqual(sent.map(s => [s.text, s.thread_ts]), [['urgent', undefined], ['analysis', 'ts1']]);
+  assert.equal((await b.flush()).sent, 0);
+  assert.deepEqual(b.status(), [{ status: 'sent', n: 2 }]);
+});
+
+test('an abandoned sender lease expires and its pending posts can be delivered', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'outbox-crash-')), 'engine.db');
+  const bot = fakeBot();
+  const c = clock('2026-10-31T10:00:00Z');
+  const box = new SlackOutbox(file, bot, { now: c.now, sleep: async () => {}, gapMs: 0 });
+  box.enqueue({ kind: 'rows', keys: ['k'], broadcast: true, message: msg('urgent') });
+  const db = new DatabaseSync(file);
+  db.prepare(`INSERT INTO slack_sender (id, owner, expires_at) VALUES (1, 'crashed', '2026-10-31T10:01:00.000Z')`).run();
+  db.close();
+  assert.deepEqual(await box.flush(), { sent: 0, pending: 1, failed: 0, skipped: 0 });
+  c.advance(2);
+  assert.deepEqual(await box.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
+  assert.deepEqual(bot.sent.map(s => s.text), ['urgent']);
+});
+
+test('separate flushes and senders share the channel rate limit', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'outbox-gap-')), 'engine.db');
+  const c = clock('2026-10-31T10:00:00Z');
+  const sentAt: number[] = [];
+  const t: Transport = { threads: true, post: async () => { sentAt.push(c.now().getTime()); return `ts${sentAt.length}`; } };
+  const opts = { now: c.now, sleep: async (ms: number) => { c.advance(ms / 60_000); }, gapMs: 1100 };
+  const first = new SlackOutbox(file, t, opts);
+  const second = new SlackOutbox(file, t, opts);
+  first.enqueue({ kind: 'rows', keys: ['k'], broadcast: true, message: msg('urgent') });
+  await first.flush();
+  second.enqueue({ kind: 'report', keys: ['k'], broadcast: true, message: msg('analysis') });
+  await second.flush();
+  assert.equal(sentAt[1]! - sentAt[0]!, 1100);
 });

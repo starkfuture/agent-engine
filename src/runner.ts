@@ -71,14 +71,22 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     result.cards.push(file);
     if (slack) result.slack.push(file);
   };
-  // Every patrol ends here: save the state first, then send what is queued. A
-  // Slack failure stays queued for the next patrol and never re-runs the model.
+  // A failed send waits for the next patrol, including when the urgent card
+  // was attempted before the investigator. Do not retry it again at finish().
+  let slackWaiting = false;
+  const flush = async () => {
+    if (!o.post || slackWaiting) return;
+    const f = await sink.flush(log);
+    if (f) slackWaiting = f.pending > 0;
+    if (f && f.sent + f.pending + f.failed > 0) log(`slack: ${f.sent} sent${f.pending ? `, ${f.pending} waiting for the next patrol` : ''}${f.failed ? `, ${f.failed} failed` : ''}`);
+  };
+  // Finish by saving the state and delivering any reports/recoveries. Urgent
+  // rows take the separate fast path below, before the model starts.
   const finish = async () => {
     state.save();
     if (o.post && sink.outbox?.threads && summary.recovered.length)
       for (const keys of sink.outbox.groupByThread(summary.recovered)) sink.emit(recoveredCard(keys, summary.at), `${stamp(summary.at)}-recovered-${keys.length}`, { kind: 'recovered', keys, broadcast: false });
-    const f = await sink.flush(log);
-    if (f && f.sent + f.pending + f.failed > 0) log(`slack: ${f.sent} sent${f.pending ? `, ${f.pending} waiting for the next patrol` : ''}${f.failed ? `, ${f.failed} failed` : ''}`);
+    await flush();
     return result;
   };
   if (!summary.send.length) return finish(); // quiet patrol: no LLM call, no card, $0
@@ -104,7 +112,10 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     ref: `patrols/${stamp(summary.at)}.md`,
   });
   emit(card, `${stamp(summary.at)}-rows`, urgentRows.length ? { kind: 'rows', keys: urgentRows.map((r) => r.key), broadcast: true } : undefined);
-  if (urgentRows.length) log(`rows card to Slack: ${urgentRows.length} urgent row(s)`);
+  if (urgentRows.length) {
+    log(`rows card to Slack: ${urgentRows.length} urgent row(s)`);
+    await flush();
+  }
 
   if (!skip && monitor) {
     const rowKeys = new Set(summary.send.map((r) => r.key));

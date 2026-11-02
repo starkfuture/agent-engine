@@ -90,6 +90,11 @@ Every post goes through an outbox in the engine's SQLite file (`slack_outbox`):
 - **Delivered means Slack answered ok.** A failure waits for the next patrol and gives up after a day.
 - **Slack being down never stops a patrol or re-runs the model.**
 - **One message a second per channel.** A `Retry-After` of up to 10 s is waited out; a longer one, or an outage, leaves the rest for the next patrol.
+- **One sender per database, with a renewable lease.** Overlapping patrols cannot flush the same entries concurrently; an abandoned lease expires after a minute. The channel's rate limit is shared across flushes.
+- **Posting off means no delivery**, including messages left queued by an earlier patrol.
+- **Recovery requires healthy observers.** A missing or failed source leaves its issues unresolved; recovery is recorded once when the source returns, including after a restart. Suppressing a signal does not resolve it.
+
+Delivery is at least once: if Slack accepts a message but its response is lost, a retry may duplicate it. The outbox prevents overlapping senders from duplicating a post; it cannot make the remote send and the local receipt one transaction.
 
 The incoming webhook (`SLACK_WEBHOOK_URL`) still works as a fallback, without threads.
 

@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 
 // Every Slack post goes through an outbox in the engine's SQLite file. A post
 // counts as delivered only after Slack says ok; a failure waits for the next
@@ -104,6 +105,7 @@ export interface OutboxOptions {
 }
 
 const H = 3600_000;
+const SENDER_LEASE_MS = 60_000; // renewed while sending; transport calls time out after 10 s
 
 export class SlackOutbox {
   private readonly db: DatabaseSync;
@@ -127,6 +129,7 @@ export class SlackOutbox {
       );
       CREATE INDEX IF NOT EXISTS slack_outbox_pending ON slack_outbox (status) WHERE status = 'pending';
       CREATE TABLE IF NOT EXISTS slack_threads (key TEXT PRIMARY KEY, ts TEXT NOT NULL, opened_at TEXT NOT NULL, last_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS slack_sender (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, expires_at TEXT NOT NULL, last_attempt_at INTEGER);
     `);
     this.o = {
       threadHours: 24,
@@ -178,13 +181,45 @@ export class SlackOutbox {
   // Send what is pending, oldest first. Never throws: Slack being down must not
   // stop a patrol or re-run the model.
   async flush(log: (s: string) => void = () => {}): Promise<FlushResult> {
+    // One sender for this channel/database, across instances and processes.
+    // A crashed sender's lease expires; a late sender cannot release its
+    // replacement's lease. Do not hold a SQLite transaction over network I/O.
+    const owner = randomUUID();
+    const now = this.o.now();
+    const expiry = () => new Date(this.o.now().getTime() + SENDER_LEASE_MS).toISOString();
+    const claimed = this.db.prepare(`INSERT INTO slack_sender (id, owner, expires_at) VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at WHERE slack_sender.expires_at <= ?`)
+      .run(owner, expiry(), now.toISOString()).changes;
+    if (!claimed) return { sent: 0, pending: this.pendingCount(), failed: 0, skipped: 0 };
+    let held = true;
+    const renew = () => held && !!this.db.prepare(`UPDATE slack_sender SET expires_at = ? WHERE id = 1 AND owner = ?`).run(expiry(), owner).changes;
+    const heartbeat = setInterval(() => {
+      try { held = renew(); } catch { held = false; }
+    }, SENDER_LEASE_MS / 3);
+    heartbeat.unref();
+    try {
+      return await this.sendPending(log, renew);
+    } finally {
+      clearInterval(heartbeat);
+      this.db.prepare(`UPDATE slack_sender SET owner = '', expires_at = '1970-01-01T00:00:00.000Z' WHERE id = 1 AND owner = ?`).run(owner);
+    }
+  }
+
+  private pendingCount(): number {
+    return Number((this.db.prepare(`SELECT COUNT(*) AS n FROM slack_outbox WHERE status = 'pending'`).get() as { n: number }).n);
+  }
+
+  private async sendPending(log: (s: string) => void, renew: () => boolean): Promise<FlushResult> {
     const out: FlushResult = { sent: 0, pending: 0, failed: 0, skipped: 0 };
     const pending = this.db.prepare(`SELECT * FROM slack_outbox WHERE status = 'pending' ORDER BY id`).all() as Array<{
       id: number; created_at: string; kind: PostKind; keys: string; broadcast: number; message: string; attempts: number;
     }>;
-    let first = true;
     let waits = 0; // Retry-After waits this flush, so a 429 storm can't hold the patrol
     for (let i = 0; i < pending.length; i++) {
+      if (!renew()) {
+        out.pending = this.pendingCount();
+        return out;
+      }
       const p = pending[i]!;
       const now = this.o.now();
       if (now.getTime() - Date.parse(p.created_at) > this.o.giveUpHours * H) {
@@ -201,8 +236,16 @@ export class SlackOutbox {
         continue;
       }
       const fresh = thread && now.getTime() - Date.parse(thread.opened_at) < this.o.freshMinutes * 60_000;
-      if (!first) await this.o.sleep(this.o.gapMs);
-      first = false;
+      // Persist the gap across flushes too: an urgent card is flushed before
+      // the model, and a fast investigation may finish less than a second later.
+      const last = this.db.prepare(`SELECT last_attempt_at FROM slack_sender WHERE id = 1`).get() as { last_attempt_at: number | null };
+      const wait = last.last_attempt_at === null ? 0 : this.o.gapMs - (this.o.now().getTime() - last.last_attempt_at);
+      if (wait > 0) await this.o.sleep(wait);
+      if (!renew()) {
+        out.pending = this.pendingCount();
+        return out;
+      }
+      this.db.prepare(`UPDATE slack_sender SET last_attempt_at = ? WHERE id = 1`).run(this.o.now().getTime());
       try {
         const ts = await this.transport.post({
           ...(JSON.parse(p.message) as SlackMessage),
@@ -234,10 +277,11 @@ export class SlackOutbox {
           continue;
         }
         // Rate limited for long, or Slack unreachable: the rest waits for the next patrol.
-        out.pending = pending.length - i;
+        out.pending = this.pendingCount();
         return out;
       }
     }
+    out.pending = this.pendingCount();
     return out;
   }
 
