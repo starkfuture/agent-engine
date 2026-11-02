@@ -110,11 +110,13 @@ test('only admins manage users; invites never mint a token and stay on the compa
   const { ctx, who } = context(fakeSession());
   (ctx.cfg.mcp as { login?: unknown }).login = { domain: 'starkfuture.com', publicUrl: 'https://agent-engine.test', admins: [] };
   const names = async (u: string) => (await (await connect(ctx, who(u))).client.listTools()).tools.map((t) => t.name);
-  for (const t of ['invite_user', 'remove_user', 'list_users']) {
+  for (const t of ['invite_user', 'remove_user', 'list_users', 'bind_slack_user']) {
     assert.ok(!(await names('ana')).includes(t), `member must not see ${t}`);
     assert.ok((await names('root')).includes(t), `admin sees ${t}`);
   }
   const { call } = await connect(ctx, who('root'));
+  assert.match((await call('bind_slack_user',{user:'bo',slack_id:'U0BO12345'})).text,/Slack identity bound/);
+  assert.equal(ctx.users.bySlack('U0BO12345')?.name,'bo');
   assert.match((await call('invite_user', { email: 'Cy@starkfuture.com' })).text, /cy@starkfuture\.com can sign in as member \(user cy\)/);
   assert.equal(ctx.users.list().find((u) => u.name === 'cy')?.token_sha256, undefined);
   assert.match((await call('invite_user', { email: 'eve@gmail.com' })).text, /error: only @starkfuture\.com/);

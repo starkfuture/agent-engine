@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { parse } from 'yaml';
 import { z } from 'zod';
 import { DEFAULT_FLOOR } from './patrol/digest.js';
+import { notificationPolicy, type NotificationPolicy } from './output/schedule.js';
 
 const HttpFamily = z.object({
   id: z.string(),
@@ -111,6 +112,8 @@ export interface Config {
   // The Slack bot (chat.postMessage, threads); the webhook is the fallback when unset.
   slackBotToken: string | undefined;
   slackChannel: string | undefined; // channel id, e.g. C0…
+  slackInteraction?: { appToken: string; teamId: string; appId: string };
+  slackNotifications?: NotificationPolicy;
   mcp: {
     usersFile: string; // hashed tokens, one per person (gitignored)
     reposFile: string; // repos the codebase agent may read on this host (gitignored)
@@ -178,6 +181,14 @@ function slackBot(env: NodeJS.ProcessEnv): Pick<Config, 'slackBotToken' | 'slack
   if (token && !channel) throw new Error('SLACK_BOT_TOKEN needs SLACK_CHANNEL_ID, the channel the bot posts to');
   if (channel && !/^[CG][A-Z0-9]{6,}$/.test(channel)) throw new Error(`SLACK_CHANNEL_ID: "${channel}" is not a channel id`);
   return { slackBotToken: token, slackChannel: channel };
+}
+
+function slackInteraction(env: NodeJS.ProcessEnv): Config['slackInteraction'] {
+  if (!env.SLACK_APP_TOKEN) return undefined;
+  if (!env.SLACK_APP_TOKEN.startsWith('xapp-')) throw new Error('SLACK_APP_TOKEN must be an app-level token');
+  if (!env.SLACK_BOT_TOKEN || !env.SLACK_CHANNEL_ID) throw new Error('Socket Mode needs the bot token and channel');
+  if (!/^T[A-Z0-9]{6,}$/.test(env.SLACK_TEAM_ID ?? '') || !/^A[A-Z0-9]{6,}$/.test(env.SLACK_APP_ID ?? '')) throw new Error('Socket Mode needs SLACK_TEAM_ID and SLACK_APP_ID');
+  return {appToken:env.SLACK_APP_TOKEN,teamId:env.SLACK_TEAM_ID!,appId:env.SLACK_APP_ID!};
 }
 
 const LOGIN_VARS = ['KEYCLOAK_JWKS_URL', 'ENGINE_KC_CLIENT_ID', 'KEYCLOAK_SCOPES'];
@@ -259,6 +270,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     retentionDays: num(env.ENGINE_RETENTION_DAYS, 30, 'ENGINE_RETENTION_DAYS'),
     slackWebhookUrl: opt(env.SLACK_WEBHOOK_URL),
     ...slackBot(env),
+    slackInteraction: slackInteraction(env),
+    slackNotifications: notificationPolicy(env),
     mcp: {
       usersFile: r(env.ENGINE_USERS_FILE ?? 'config/users.local.json'),
       reposFile: r(env.ENGINE_REPOS_FILE ?? 'config/repos.local.yaml'),

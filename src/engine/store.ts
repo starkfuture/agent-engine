@@ -109,6 +109,8 @@ export class Store {
     }
   }
 
+  reconcile(now = new Date()): void { this.reap(now); }
+
   // Called every 30 s by a running run.
   beat(id: string, now: Date): void {
     this.db.prepare(`UPDATE runs SET heartbeat_at = ? WHERE id = ? AND status = 'running'`).run(now.toISOString(), id);

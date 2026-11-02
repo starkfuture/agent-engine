@@ -104,6 +104,7 @@ export async function patrolOnce(
   // rows take the separate fast path below, before the model starts.
   const finish = async () => {
     state.save();
+    if(o.post) sink.outbox?.recordHealth(summary);
     if (o.post && sink.outbox?.threads && summary.recovered.length)
       for (const keys of sink.outbox.groupByThread(summary.recovered))
         sink.emit(recoveredCard(keys, summary.at), `${stamp(summary.at)}-recovered-${keys.length}`, { kind: 'recovered', keys, broadcast: false });
@@ -199,7 +200,7 @@ export async function patrolOnce(
       emit(
         reportCard(r, summary.at, footer, inv.challenge, ownersOf(r)),
         `${stamp(summary.at)}-${i + 1}`,
-        POSTED.has(r.severity) ? { kind: 'report', keys: r.rows, broadcast: true } : undefined,
+        POSTED.has(r.severity) ? { kind: 'report', keys: r.rows, broadcast: true,urgent:r.severity==='critical'||r.rows.some(k=>byKey.has(k)&&urgent(byKey.get(k)!,noise)) } : undefined,
       );
     log(`${inv.outputs.filter((r) => POSTED.has(r.severity)).length} of ${inv.outputs.length} report(s) rated critical or major go to Slack`);
     if (inv.status !== 'ok') skip = `investigator ${inv.status}${inv.note ? `: ${inv.note}` : ''}`;
