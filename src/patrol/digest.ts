@@ -48,7 +48,7 @@ export function bucketOf(r: FlaggedRow, floor: number, prot: boolean): Bucket {
 // counters and traces, then error logs, then client errors (4xx, hang-ups).
 export function tier(r: Row, prot: boolean): number {
   if (prot) return 0;
-  if (r.section === 'drop' || r.section === 'workload' || (r.section === 'http' && /^5/.test(r.status ?? ''))) return 1;
+  if (r.section === 'drop' || r.section === 'workload' || r.section === 'infra' || (r.section === 'http' && /^5/.test(r.status ?? ''))) return 1;
   if (r.section === 'errors' || r.section === 'traces') return 2;
   if (r.section === 'logs') return 3;
   return 4;

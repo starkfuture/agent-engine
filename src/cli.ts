@@ -29,6 +29,7 @@ import { InstallationTokens } from './mcp/github-app.js';
 import { RepoSync } from './mcp/reposync.js';
 import { Metrics, startHealth, startMetrics } from './metrics.js';
 import { sweep } from './engine/retention.js';
+import { coverage } from './patrol/coverage.js';
 
 const USAGE = `engine <command> [options]
 
@@ -56,6 +57,7 @@ MCP server (several developers, one engine):
   user promote | demote <name>  make a user admin or member (no token is issued)
 
 Monitor:
+  coverage                    current per-service throughput, non-5xx fraction, p95/p99 latency and missing measurements (no LLM)
   doctor                      check access, list datasources, show real metric labels
   patrol                      one patrol pass
       --at <ISO>              evaluate at a past time (replay against live data)
@@ -268,6 +270,7 @@ async function main() {
   }
   loadDotEnv();
   const cfg = loadConfig();
+  if (cmd === 'coverage') { console.log(JSON.stringify(await coverage(telemetry(cfg),cfg.sources,a.at?date(a.at,'at'):new Date(),cfg.windowMinutes),null,2)); return; }
   const noise = Noise.load(cfg.noiseFile);
   const owners = Owners.load(cfg.ownersFile);
   // The bot when configured (threads, one message per issue), else the webhook.

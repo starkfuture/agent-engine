@@ -14,6 +14,11 @@ export interface Card {
   markdown: string;
 }
 
+export function noticeCard(title: string, body: string): Card {
+  const safeTitle = m(title), safeBody = m(body);
+  return {text:esc(`${safeTitle}: ${safeBody}`),blocks:[{type:'section',text:{type:'mrkdwn',text:clip(`*${esc(safeTitle)}*\n${esc(safeBody)}`)}}],markdown:`## ${safeTitle}\n\n${safeBody}`};
+}
+
 // What the challenger concluded, in one block. Escalate = a human decides.
 function challengeLines(c: ChallengeResult | undefined): string[] {
   if (!c) return [];
@@ -167,6 +172,9 @@ function since(l: Line, s: Summary): string | undefined {
 
 function lookLine(f: Fmt, l: Line, s: Summary, owner: string | undefined): string {
   const rs = l.rows;
+  if (rs[0]?.measurement) {
+    return `${f.dot} ${head(f,l)} — ${rs.map(r => { const m = r.measurement!; return `${num(m.value)} ${f.t(m.unit)} (${m.level}, ${m.direction} ${m.threshold} for ${m.forMinutes} min)`; }).join('; ')}${owner ? ` ${owner}` : ''}`;
+  }
   const totals = rs.length === 1 && rs[0]!.totals ? ` of ${rs[0]!.totals.now} requests` : '';
   const stats = `now ${rs.some((r) => r.truncated) ? '≥' : ''}${sum(rs, (r) => r.counts.now)}${totals} (1h ago ${sum(rs, (r) => r.counts.h1)}) vs expected ${num(sum(rs, (r) => r.score.expected))}`;
   const tags = [...uniq(rs.map((r) => r.score.verdict)), ...(rs.some((r) => r.novelty === 'worse') ? ['worse'] : []), ...uniq(rs.map((r) => TREND[r.score.trend])), ...(l.protected ? ['protected journey'] : [])];
@@ -174,7 +182,7 @@ function lookLine(f: Fmt, l: Line, s: Summary, owner: string | undefined): strin
   return [`${f.dot} ${head(f, l)}${v}${l.variants ? ' ·' : ' —'} ${stats}`, tags.join(', '), since(l, s)].filter(Boolean).join(' · ') + (owner ? ` ${owner}` : '');
 }
 
-const ongoingLine = (f: Fmt, l: Line, s: Summary) => [`${f.dot} ${head(f, l)}${variants(f, l, false)}`, `now ${sum(l.rows, (r) => r.counts.now)}`, since(l, s)].filter(Boolean).join(' · ');
+const ongoingLine = (f: Fmt, l: Line, s: Summary) => [`${f.dot} ${head(f, l)}${variants(f, l, false)}`, l.rows[0]?.measurement ? l.rows.map(r => `${num(r.measurement!.value)} ${f.t(r.measurement!.unit)}`).join(', ') : `now ${sum(l.rows, (r) => r.counts.now)}`, since(l, s)].filter(Boolean).join(' · ');
 const quietItem = (f: Fmt, l: Line) => `${head(f, l)}${variants(f, l, false)} (${sum(l.rows, (r) => r.counts.now)})`;
 
 // Whole lines only: at most `max` lines (one more rather than "…and 1 more")

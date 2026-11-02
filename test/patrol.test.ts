@@ -402,6 +402,7 @@ test('a crashed investigator still leaves the rows reported and saved', async ()
   assert.equal(r.cards.length, 1);
   const next = await buildSummary(new FakeTelemetry(world), c, new Noise({}), state, new Date('2026-09-29T12:30:00Z'));
   assert.equal(next.send.length, 0, 'not re-sent next patrol');
+  assert.ok(next.known.every(row => state.needsInvestigation(row.key)), 'investigation work is still pending');
 });
 
 test('card survives quotes in model text, and strips images and unknown links', () => {
@@ -481,4 +482,56 @@ test('the patrol loop runs with or without a metrics listener', async () => {
     assert.ok(queries > 0, `patrol queried telemetry (listener: ${listen})`);
     if (listen) assert.deepEqual(passes.map((d) => d.toISOString()), ['2026-09-29T12:15:00.000Z', '2026-09-29T12:15:00.000Z']);
   }
+});
+
+test('a recurrence becomes fresh after four distinct healthy patrols, and observer outages do not count', async () => {
+  const c = cfg(),
+    state = State.memory(),
+    noise = new Noise({}),
+    start = new Date('2026-09-29T12:15:00Z');
+  const first = await buildSummary(new FakeTelemetry(world), c, noise, state, start);
+  first.send.forEach((r) => state.reported(r, start));
+  const healthy = new FakeTelemetry((q) => world(q, new Date('2026-09-28T12:15:00Z')));
+  for (const minute of [30, 30, 45]) await buildSummary(healthy, c, noise, state, new Date(`2026-09-29T12:${minute}:00Z`));
+  assert.equal(state.data.rows[first.send[0]!.key]!.cleanPatrols, 2, 'same patrol cannot count twice');
+  await buildSummary(
+    new FakeTelemetry(() => {
+      throw Error('observer down');
+    }),
+    c,
+    noise,
+    state,
+    new Date('2026-09-29T13:00:00Z'),
+  );
+  assert.equal(state.data.rows[first.send[0]!.key]!.cleanPatrols, 2);
+  for (const time of ['13:15', '13:30']) await buildSummary(healthy, c, noise, state, new Date(`2026-09-29T${time}:00Z`));
+  const again = await buildSummary(new FakeTelemetry(world), c, noise, state, new Date('2026-09-29T13:45:00Z'));
+  assert.ok(again.send.every((r) => r.novelty === 'fresh'));
+  assert.equal(again.send.length, 2);
+});
+
+test('uncovered investigations get two bounded attempts, while admission skips remain deferred', async () => {
+  const c = cfg(),
+    state = State.memory(),
+    sink = new CardSink(c.outDir),
+    tel = new FakeTelemetry(world);
+  const m = monitor(
+    c,
+    fakeSession(async function* () {
+      yield ok(0.01);
+    }),
+  );
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, sink, new Date(time), { llm: true, post: false }, m);
+  const a = await pass('2026-09-29T12:15:00Z');
+  assert.ok(a.investigation);
+  assert.ok(a.summary.send.every((r) => state.needsInvestigation(r.key)));
+  const b = await pass('2026-09-29T12:30:00Z');
+  assert.ok(b.investigation, 'known rows are retried without reposting their urgent card');
+  assert.ok(b.cards.some((f) => readFileSync(f, 'utf8').includes('Investigation inconclusive')));
+  const d = await pass('2026-09-29T12:45:00Z');
+  assert.equal(d.investigation, undefined, 'exhausted work is not retried forever');
+  const s = State.memory();
+  const summary = await buildSummary(tel, c, new Noise({}), s, new Date('2026-09-29T12:15:00Z'));
+  s.investigated(summary.send, new Set(), 'daily budget exhausted', false);
+  assert.ok(summary.send.every((r) => s.data.rows[r.key]!.investigation?.attempts === 0 && s.needsInvestigation(r.key)));
 });

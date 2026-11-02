@@ -20,6 +20,7 @@ import { Users, type User } from '../src/mcp/users.js';
 import { fakeSession, fetchResponse, ok, readResponse, say, type Script } from './fake-session.js';
 import { FakeTelemetry, world } from './fake.js';
 import { fakeKeycloak } from './fake-keycloak.js';
+import type { Report } from '../src/investigate/report.js';
 
 const tmp = (p: string) => mkdtempSync(join(tmpdir(), p));
 const lastId = (t: string) => [...t.matchAll(/evidence_id: (E-[0-9a-f]{4}-\d+)/g)].at(-1)?.[1] ?? 'none';
@@ -400,4 +401,81 @@ test('HTTP with the Keycloak sign-in: discovery, challenge, invited company acco
 
   ctx.users.remove('dee');
   assert.equal((await post({ authorization: `Bearer ${kc.token({ email: 'dee@starkfuture.com' })}` })).status, 403, 'removal applies on the next request');
+});
+
+test('historical monitor reports expose evidence, uncertainty and blocking dissent, with existing run visibility', async () => {
+  const { ctx, who } = context(fakeSession());
+  const id = '20261102T100000Z-monitor-abcdef';
+  ctx.engine.store.skipped({
+    id,
+    agent: 'monitor',
+    version: 'abc',
+    trigger: 'patrol',
+    now: new Date(),
+    note: 'fixture',
+  });
+  const dir = join(ctx.engine.runsDir, 'monitor', id);
+  mkdirSync(dir, { recursive: true });
+  const report: Report = {
+    title: 'Authentication errors',
+    severity: 'major',
+    status: 'unclear',
+    started_at: 'unknown',
+    what_broke: 'Authentication returns errors',
+    impact: 'unknown',
+    cause: { hypothesis: 'Pool exhaustion is possible', confidence: 'low' },
+    evidence: [
+      {
+        id: 'E-abcd-1',
+        quote: 'waiting=2',
+        claim: 'Two connections are waiting',
+      },
+    ],
+    suggested_fix: 'Check the database pool',
+    not_checked: ['Customer impact not measured'],
+    rows: ['http|auth|/login|500'],
+  };
+  writeFileSync(join(dir, 'output.json'), JSON.stringify([report]));
+  writeFileSync(
+    join(dir, 'challenge.json'),
+    JSON.stringify({
+      verdict: 'escalate',
+      overall: 'The cause is disputed',
+      blocking: [
+        {
+          claim: 'Pool exhaustion is unproven',
+          failure_scenario: 'Restarting could interrupt requests',
+          settling_check: 'Read pool time series',
+          evidence: ['E-abcd-1'],
+          blocking: true,
+        },
+      ],
+      notes: [],
+      cost: 0.1,
+      turns: 1,
+      toolCalls: 1,
+    }),
+  );
+  const got = (await (await connect(ctx, who('root'))).call('get_run', { run_id: id })).text;
+  for (const phrase of [
+    'Authentication errors',
+    'Customer impact not measured',
+    'Pool exhaustion is unproven',
+    'Restarting could interrupt requests',
+    'Read pool time series',
+    'delivery status unknown',
+  ])
+    assert.ok(got.includes(phrase), got);
+  assert.doesNotMatch(got, /\(no answer\)/);
+  const privateId = '20261102T100000Z-monitor-abcdee';
+  ctx.engine.store.skipped({
+    id: privateId,
+    agent: 'monitor',
+    version: 'abc',
+    trigger: 'manual',
+    user: 'bo',
+    now: new Date(),
+    note: 'private fixture',
+  });
+  assert.match((await (await connect(ctx, who('ana'))).call('get_run', { run_id: privateId })).text, /no run/);
 });
