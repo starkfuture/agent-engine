@@ -9,7 +9,7 @@ const REDACTIONS: Array<[RegExp, string]> = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '<private-key>'],
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '<jwt>'],
   [/https:\/\/hooks\.slack\.com\/[A-Za-z0-9/_-]+/g, '<slack-webhook>'],
-  [/\b(?:sk-ant-[A-Za-z0-9_-]{8,}|[sr]k_(?:live|test)_[A-Za-z0-9]{8,}|glsa_[A-Za-z0-9_]{16,}|glc_[A-Za-z0-9+/=_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{16}|eng_[A-Za-z0-9_-]{20,}|ghs_[A-Za-z0-9]{20,})\b/g, '<secret>'],
+  [/\b(?:sk-ant-[A-Za-z0-9_-]{8,}|[sr]k_(?:live|test)_[A-Za-z0-9]{8,}|glsa_[A-Za-z0-9_]{16,}|glc_[A-Za-z0-9+/=_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{16}|eng_[A-Za-z0-9_-]{20,}|ghs_[A-Za-z0-9]{20,})\b/g, '<secret>'],
   // Credentials in connection strings: postgres://user:pass@host, redis://:pass@host
   [/\b([a-z][a-z0-9+.-]*:\/\/)([^:/\s@]*):([^@\s/]+)@/gi, '$1$2:<secret>@'],
   [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 <secret>'],

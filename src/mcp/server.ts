@@ -94,6 +94,12 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
   const readable = (row: RunRow | undefined): row is RunRow => !!row && (admin || row.requested_by === user.name || sharedAgents(ctx).has(row.agent));
 
   if (ctx.telemetry) s.registerTool('monitoring_coverage', {description:'Current service measurements and blind spots: throughput, non-5xx fraction and p95/p99 latency. Reports configured objectives only; does not invent SLOs or change alerts.',inputSchema:{},annotations:{readOnlyHint:true}},async()=>text(JSON.stringify(await coverage(ctx.telemetry!,ctx.cfg.sources,new Date(),ctx.cfg.windowMinutes),null,2)));
+  if(ctx.cfg.slackBotToken || ctx.cfg.slackWebhookUrl) s.registerTool('notification_status',{description:'Slack queue and interaction status counts. Queued, deferred, digested and sent are distinct; digested originals are represented by a queued digest, not individually delivered.',inputSchema:{},annotations:{readOnlyHint:true}},async()=>{
+    const db=ctx.engine.store.db,out:Record<string,unknown>={};
+    for(const table of ['slack_outbox','slack_inbox']) if(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) out[table]=db.prepare(`SELECT status,count(*) AS n FROM ${table} GROUP BY status`).all();
+    if(admin && db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='slack_inbox'").get()) out.failed_interactions=db.prepare("SELECT id,run_id,status,note FROM slack_inbox WHERE status IN ('failed','expired') ORDER BY created_at DESC LIMIT 20").all();
+    return text(JSON.stringify(out,null,2));
+  });
 
   s.registerTool(
     'list_agents',
@@ -371,6 +377,10 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
         }
       },
     );
+    s.registerTool('bind_slack_user',{description:'Admin: bind an existing engine user to a Slack user id, or unbind them. Never grants an engine invitation or changes roles.',inputSchema:{user:z.string(),slack_id:z.string().regex(/^[UW][A-Z0-9]{5,20}$/).optional()}},async({user:name,slack_id})=>{
+      const denied=notAdminNow();if(denied) return denied;
+      try {return text(ctx.users.bindSlack(name,slack_id)?`${name}: Slack identity ${slack_id?'bound':'removed'}`:`no user ${name}`);}catch(e){return err((e as Error).message);}
+    });
     s.registerTool('remove_user', { description: 'Admin: remove a user (by name or email); they lose access on their next request.', inputSchema: { name: z.string().max(200) } }, async ({ name }) => {
       const denied = notAdminNow();
       if (denied) return denied;

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type { LoadedAgent } from './agent.js';
-import { renderFindings, type Findings } from './output.js';
+import { FindingsShape, renderFindings, type Findings } from './output.js';
 import type { RunResult } from './run.js';
 import { redact, stripImages } from './text.js';
 import { Report } from '../investigate/report.js';
@@ -14,13 +14,15 @@ import { z } from 'zod';
 // still apply. A report being stored does not prove that Slack delivered it.
 export function storedMonitorAnswer(dir: string, row: RunRow): string | undefined {
   if (!existsSync(join(dir, 'output.json'))) return undefined;
-  let reports: Report[];
+  let outputs: unknown;
   try {
-    reports = z.array(Report).parse(JSON.parse(readFileSync(join(dir, 'output.json'), 'utf8')));
+    outputs = JSON.parse(readFileSync(join(dir, 'output.json'), 'utf8'));
   } catch {
     return undefined;
   }
-  if (!reports.length) return undefined;
+  const reports = z.array(Report).safeParse(outputs);
+  const findings = z.array(z.object(FindingsShape)).safeParse(outputs);
+  if ((!reports.success || !reports.data.length) && (!findings.success || !findings.data.length)) return undefined;
   const objection = z.object({
     claim: z.string(),
     failure_scenario: z.string(),
@@ -45,7 +47,10 @@ export function storedMonitorAnswer(dir: string, row: RunRow): string | undefine
   } catch {
     uncertainty = '\nChallenge record could not be read; do not treat this report as upheld.\n';
   }
-  return stripImages(redact(reports.map((r) => reportCard(r, row.started_at, `run ${row.id} · delivery status unknown`, challenge).markdown).join('\n\n') + uncertainty));
+  const footer = `run ${row.id} · delivery status unknown`;
+  const dissent = challenge?.blocking.map(o=>`- ${o.claim}\n  - if acted on: ${o.failure_scenario}\n  - check: ${o.settling_check} (${o.evidence.join(', ')})`) ?? [];
+  const md = reports.success ? reports.data.map(r=>reportCard(r,row.started_at,footer,challenge).markdown).join('\n\n') : findings.success ? findings.data.map(f=>renderFindings(f,`${footer} · challenge ${challenge?.verdict??'not recorded'}`,dissent)).join('\n\n') : '';
+  return stripImages(redact(md + uncertainty));
 }
 
 // The human-readable answer of a findings run, with the challenger's blocking

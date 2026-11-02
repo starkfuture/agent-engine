@@ -7,6 +7,7 @@ export interface EmitSlack {
   kind: PostKind;
   keys: string[]; // the rows this card is about: they pick the Slack thread
   broadcast: boolean; // show it in the channel when it lands in an older thread
+  urgent?: boolean;
 }
 
 // Cards always land on disk; Slack only when an outbox is configured AND the

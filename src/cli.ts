@@ -30,6 +30,7 @@ import { RepoSync } from './mcp/reposync.js';
 import { Metrics, startHealth, startMetrics } from './metrics.js';
 import { sweep } from './engine/retention.js';
 import { coverage } from './patrol/coverage.js';
+import { startSocket } from './slack/socket.js';
 
 const USAGE = `engine <command> [options]
 
@@ -55,6 +56,7 @@ MCP server (several developers, one engine):
   user list | user remove <name>
   user invite <email> [--admin]  let someone sign in with their company account (Keycloak)
   user promote | demote <name>  make a user admin or member (no token is issued)
+  user slack <name> --slack <U…>  bind an existing user to Slack; omit --slack to unbind
 
 Monitor:
   coverage                    current per-service throughput, non-5xx fraction, p95/p99 latency and missing measurements (no LLM)
@@ -275,7 +277,8 @@ async function main() {
   const owners = Owners.load(cfg.ownersFile);
   // The bot when configured (threads, one message per issue), else the webhook.
   const transport = cfg.slackBotToken ? botTransport(cfg.slackBotToken, cfg.slackChannel!) : cfg.slackWebhookUrl ? webhookTransport(cfg.slackWebhookUrl) : undefined;
-  const sink = new CardSink(cfg.outDir, transport ? new SlackOutbox(join(cfg.runsDir, 'engine.db'), transport) : undefined);
+  const slackUsers=cfg.slackInteraction?Users.load(cfg.mcp.usersFile):undefined;
+  const sink = new CardSink(cfg.outDir, transport ? new SlackOutbox(join(cfg.runsDir, 'engine.db'), transport,{controls:!!cfg.slackInteraction&&cmd==='serve'&&a.post,policy:cfg.slackNotifications,destination:`${cfg.slackInteraction?.teamId??''}/${cfg.slackChannel??'webhook'}`,authorize:actor=>slackUsers?.bySlack(actor.slackUser)?.name===actor.engineUser}) : undefined);
   const w = cfg.windowMinutes;
 
   switch (cmd) {
@@ -364,7 +367,8 @@ async function main() {
         console.log(users.setRole(name, role) ? `${name} is now ${role}` : `no user ${name} (invite them first)`);
         return;
       }
-      if (sub !== 'add') throw new Error('usage: user add|list|remove|invite|promote|demote');
+      if(sub==='slack') {console.log(users.bindSlack(name,a.slack)?`${name}: Slack identity ${a.slack?'bound':'removed'}`:`no user ${name}`);return;}
+      if (sub !== 'add') throw new Error('usage: user add|list|remove|invite|promote|demote|slack');
       // Hosted, people sign in through Keycloak; the CLI can't mint a token there.
       if (cfg.mcp.login) throw new Error('the Keycloak sign-in is on: `user invite <email>` instead; then `user promote <name>` for admins');
       const usd = a.usd ? Number(a.usd) : undefined;
@@ -416,7 +420,8 @@ async function main() {
         if (!ctx.users.list().some((u) => u.role === 'admin')) throw new Error('the Keycloak sign-in is on but there is no admin to invite anyone: set ENGINE_ADMINS or `user invite <email> --admin`');
       }
       const server = startHttp(ctx, { host, port });
-      beforeExit = () => (server.close(), shutdown(ctx, 'engine shutting down', 20_000));
+      const socket=cfg.slackInteraction && a.post && sink.outbox ? startSocket({cfg,engine:ctx.engine,users,outbox:sink.outbox,telemetry:ctx.telemetry,log}) : undefined;
+      beforeExit = async () => {server.close();await socket?.stop();await shutdown(ctx, 'engine shutting down', 20_000);};
       log(`MCP on http://${host}:${port}/mcp · sign-in ${ctx.login ? `Keycloak ${cfg.mcp.login!.issuer} (client ${cfg.mcp.login!.clientId})` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
       if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
       const metrics = metricsServer(cfg);

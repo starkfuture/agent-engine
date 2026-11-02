@@ -175,6 +175,23 @@ export class Users {
     return this.users.find((u) => u.email === e);
   }
 
+  bySlack(id: string, now = new Date()): User | undefined {
+    this.refresh();
+    const matches = this.users.filter(u => u.slack_id === id && (!u.token_sha256 || expiresAt(u) > now.getTime()));
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  // Binding is an admin operation at the entry point; it never issues a token
+  // or changes roles. Fail closed on ambiguous identities, including old files.
+  bindSlack(name: string, slackId?: string): boolean {
+    if (slackId && !/^[UW][A-Z0-9]{5,20}$/.test(slackId)) throw new Error('invalid Slack user id');
+    return this.mutate(users => {
+      if (slackId && users.some(u => u.name !== name && u.slack_id === slackId)) throw new Error('Slack identity is already bound to another user');
+      if (!users.some(u => u.name === name)) return {users,result:false};
+      return {users:users.map(u => {if(u.name !== name) return u; const {slack_id: _old,...rest}=u; return slackId?{...rest,slack_id:slackId}:rest;}),result:true};
+    });
+  }
+
   private static fresh(days = MAX_TOKEN_DAYS, now = new Date()): { token: string; fields: { token_sha256: string; added_at: string; expires_at: string } } {
     if (!(days > 0) || days > MAX_TOKEN_DAYS) throw new Error(`tokens last 1 to ${MAX_TOKEN_DAYS} days`);
     const token = `eng_${randomBytes(32).toString('base64url')}`;

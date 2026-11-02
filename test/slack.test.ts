@@ -220,3 +220,21 @@ test('separate flushes and senders share the channel rate limit', async () => {
   await second.flush();
   assert.equal(sentAt[1]! - sentAt[0]!, 1100);
 });
+
+test('chat.update edits the validated root in the configured channel',async()=>{
+  const previous=globalThis.fetch;let url='',body:Record<string,unknown>={};
+  globalThis.fetch=async(input,init)=>{url=String(input);body=JSON.parse(String(init?.body));return new Response(JSON.stringify({ok:true,ts:'1700000000.000001'}),{status:200,headers:{'content-type':'application/json'}});};
+  try {
+    await botTransport('xoxb-test-secret','C01234567').update!('1700000000.000001',msg('Ownership recorded'));
+    assert.equal(url,'https://slack.com/api/chat.update');assert.equal(body.channel,'C01234567');assert.equal(body.ts,'1700000000.000001');
+    assert.equal(body.thread_ts,undefined);
+  } finally {globalThis.fetch=previous;}
+});
+
+test('a pre-feature outbox migrates additively and holds unknown-destination posts for review',async()=>{
+  const file=join(mkdtempSync(join(tmpdir(),'slack-legacy-')),'engine.db');const db=new DatabaseSync(file);
+  db.exec(`CREATE TABLE slack_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT NOT NULL,kind TEXT NOT NULL,keys TEXT NOT NULL,broadcast INTEGER NOT NULL,message TEXT NOT NULL,file TEXT,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,sent_at TEXT,ts TEXT,thread_ts TEXT);`);
+  db.prepare("INSERT INTO slack_outbox(created_at,kind,keys,broadcast,message,status) VALUES(?,?,?,?,?,'pending')").run('2026-11-02T12:00:00Z','report','["legacy"]',1,JSON.stringify(msg('Preserved old report')));db.close();
+  const bot=fakeBot(),box=new SlackOutbox(file,bot,{now:()=>new Date('2026-11-02T12:15:00Z'),destination:'T0/C0',gapMs:0});
+  await box.flush();assert.equal(bot.sent.length,0);assert.deepEqual(box.status(),[{status:'destination_review',n:1}]);
+});
