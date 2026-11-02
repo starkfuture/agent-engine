@@ -1,9 +1,52 @@
-import { writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type { LoadedAgent } from './agent.js';
 import { renderFindings, type Findings } from './output.js';
 import type { RunResult } from './run.js';
 import { redact, stripImages } from './text.js';
+import { Report } from '../investigate/report.js';
+import { reportCard } from '../output/card.js';
+import type { RunRow } from './store.js';
+import { z } from 'zod';
+
+// Older scheduled monitor runs contain output.json, but never wrote answer.md.
+// Read the validated reports in place: retention and get_run's visibility rules
+// still apply. A report being stored does not prove that Slack delivered it.
+export function storedMonitorAnswer(dir: string, row: RunRow): string | undefined {
+  if (!existsSync(join(dir, 'output.json'))) return undefined;
+  let reports: Report[];
+  try {
+    reports = z.array(Report).parse(JSON.parse(readFileSync(join(dir, 'output.json'), 'utf8')));
+  } catch {
+    return undefined;
+  }
+  if (!reports.length) return undefined;
+  const objection = z.object({
+    claim: z.string(),
+    failure_scenario: z.string(),
+    settling_check: z.string(),
+    evidence: z.array(z.string()),
+    blocking: z.boolean(),
+  });
+  const schema = z.object({
+    verdict: z.enum(['upheld', 'escalate', 'error']),
+    overall: z.string(),
+    blocking: z.array(objection),
+    notes: z.array(objection),
+    cost: z.number(),
+    turns: z.number(),
+    toolCalls: z.number(),
+    note: z.string().optional(),
+  });
+  let challenge: z.infer<typeof schema> | undefined;
+  let uncertainty = '';
+  try {
+    if (existsSync(join(dir, 'challenge.json'))) challenge = schema.parse(JSON.parse(readFileSync(join(dir, 'challenge.json'), 'utf8')));
+  } catch {
+    uncertainty = '\nChallenge record could not be read; do not treat this report as upheld.\n';
+  }
+  return stripImages(redact(reports.map((r) => reportCard(r, row.started_at, `run ${row.id} · delivery status unknown`, challenge).markdown).join('\n\n') + uncertainty));
+}
 
 // The human-readable answer of a findings run, with the challenger's blocking
 // objections as dissent. Written to answer.md in the run folder. Images are

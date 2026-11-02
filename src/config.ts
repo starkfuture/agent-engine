@@ -14,6 +14,7 @@ const HttpFamily = z.object({
   // No route label = one row per status for the whole service.
   route_label: z.string().optional(),
   status_label: z.string(),
+  latency_buckets: z.string().optional(), // classic histogram buckets, in seconds
 });
 export type HttpFamily = z.infer<typeof HttpFamily>;
 
@@ -24,9 +25,39 @@ const ErrorCounter = z.object({
 });
 export type ErrorCounter = z.infer<typeof ErrorCounter>;
 
+const Gauge = z
+  .object({
+    id: z.string().regex(/^[a-z][a-z0-9-]*$/),
+    query: z.string().min(1),
+    group_by: z.array(z.string()).min(1),
+    service_label: z.string().optional(),
+    unit: z.string().min(1),
+    direction: z.enum(['above', 'below']),
+    warning: z.number().finite(),
+    critical: z.number().finite().optional(),
+    for_minutes: z.number().int().min(1).max(60),
+  })
+  .refine(
+    (g) => g.critical === undefined || (g.direction === 'above' ? g.critical >= g.warning : g.critical <= g.warning),
+    'critical must be beyond warning in the same direction',
+  );
+export type Gauge = z.infer<typeof Gauge>;
+
 const Sources = z.object({
   http_families: z.array(HttpFamily),
   error_counters: z.array(ErrorCounter).default([]),
+  gauges: z.array(Gauge).max(30).optional(),
+  alerts: z.object({ namespaces: z.string(), health_selector: z.string() }).optional(),
+  objectives: z
+    .array(
+      z.object({
+        family: z.string(),
+        service: z.string(),
+        availability: z.number().gt(0).lt(1),
+        owner: z.string().min(1),
+      }),
+    )
+    .optional(),
   workloads: z.object({ namespaces: z.string() }),
   logs: z.object({
     selector: z.string(),
@@ -34,14 +65,24 @@ const Sources = z.object({
     service_label: z.string(),
     max_lines: z.number().int().positive().max(5000),
   }),
-  traces: z.object({ traceql: z.string(), limit: z.number().int().positive().max(1000) }),
+  traces: z.object({
+    traceql: z.string(),
+    limit: z.number().int().positive().max(1000),
+  }),
 });
 export type Sources = z.infer<typeof Sources>;
 
 export interface Config {
   // In-cluster backends (hosted). When PROMETHEUS_URL is set these are used
   // directly and Grafana is not; locally, Grafana's proxy with a token.
-  direct: { prometheusUrl: string; lokiUrl: string | undefined; lokiOrgId: string | undefined; tempoUrl: string | undefined } | undefined;
+  direct:
+    | {
+        prometheusUrl: string;
+        lokiUrl: string | undefined;
+        lokiOrgId: string | undefined;
+        tempoUrl: string | undefined;
+      }
+    | undefined;
   grafanaUrl: string;
   grafanaTokenFile: string;
   promUid: string;
@@ -83,7 +124,17 @@ export interface Config {
     // Sign-in through Keycloak (KEYCLOAK_ISSUER, ENGINE_PUBLIC_URL); unset = tokens from the CLI.
     // admins: ENGINE_ADMINS, the first admins: seeded into the users file (as invites)
     // at startup while it has no admin. Who may sign in is decided by the file alone.
-    login: { issuer: string; jwksUrl: string; clientId: string; publicUrl: string; domain: string; admins: string[]; scopes: string[] } | undefined;
+    login:
+      | {
+          issuer: string;
+          jwksUrl: string;
+          clientId: string;
+          publicUrl: string;
+          domain: string;
+          admins: string[];
+          scopes: string[];
+        }
+      | undefined;
     reposDir: string | undefined; // where the engine clones `github:` repos (a persistent volume when hosted)
     reposGithub: string | undefined; // ENGINE_REPOS_GITHUB: name=owner/repo[@ref],… (env-only hosts)
     // GitHub App (contents: read) the engine fetches those repos as.
@@ -145,7 +196,10 @@ function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   const jwksUrl = opt(env.KEYCLOAK_JWKS_URL) ?? `${issuer}/protocol/openid-connect/certs`;
   if (!secure(jwksUrl) && !/^http:\/\/[a-z0-9.-]+\.svc(\.cluster\.local)?(:\d+)?\//.test(jwksUrl)) throw new Error('KEYCLOAK_JWKS_URL must be https, in-cluster or localhost');
   const domain = env.ENGINE_LOGIN_DOMAIN || 'starkfuture.com';
-  const admins = (env.ENGINE_ADMINS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const admins = (env.ENGINE_ADMINS ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
   for (const a of admins) if (!a.endsWith(`@${domain}`)) throw new Error(`ENGINE_ADMINS: ${a} is not an @${domain} address`);
   // KEYCLOAK_SCOPES: scopes the protected-resource document advertises, so Claude Code requests them
   // (offline_access = stay signed in for the client's offline cap). Only scopes the Keycloak client
@@ -153,7 +207,15 @@ function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   const scopes = (env.KEYCLOAK_SCOPES ?? '').split(/[\s,]+/).filter(Boolean);
   // RFC 6749 scope-token characters, minus the comma that separates them here.
   for (const s of scopes) if (!/^[\x21\x23-\x2b\x2d-\x5b\x5d-\x7e]+$/.test(s)) throw new Error(`KEYCLOAK_SCOPES: "${s}" is not a scope name`);
-  return { issuer, jwksUrl, clientId: env.ENGINE_KC_CLIENT_ID || 'agent-engine', publicUrl, domain, admins, scopes };
+  return {
+    issuer,
+    jwksUrl,
+    clientId: env.ENGINE_KC_CLIENT_ID || 'agent-engine',
+    publicUrl,
+    domain,
+    admins,
+    scopes,
+  };
 }
 
 export function loadSources(file: string): Sources {
@@ -166,7 +228,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
   if (legacy.length) throw new Error(`${legacy.join(', ')} no longer apply: set model and limits in agents/monitor/agent.yaml and the global cap in ENGINE_DAILY_CAP_USD`);
   return {
     direct: env.PROMETHEUS_URL
-      ? { prometheusUrl: env.PROMETHEUS_URL, lokiUrl: opt(env.LOKI_URL), lokiOrgId: opt(env.LOKI_ORG_ID), tempoUrl: opt(env.TEMPO_URL) }
+      ? {
+          prometheusUrl: env.PROMETHEUS_URL,
+          lokiUrl: opt(env.LOKI_URL),
+          lokiOrgId: opt(env.LOKI_ORG_ID),
+          tempoUrl: opt(env.TEMPO_URL),
+        }
       : undefined,
     grafanaUrl: (env.GRAFANA_URL ?? 'https://monitoring.starkfuture.com').replace(/\/$/, ''),
     grafanaTokenFile: expandHome(env.GRAFANA_TOKEN_FILE ?? '~/.config/golive/grafana-token'),
@@ -198,14 +265,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
       userDailyCapUsd: num(env.ENGINE_USER_DAILY_CAP_USD, 10, 'ENGINE_USER_DAILY_CAP_USD'),
       userMaxRunning: num(env.ENGINE_USER_MAX_RUNNING, 2, 'ENGINE_USER_MAX_RUNNING'),
       notifySlack: env.ENGINE_NOTIFY_SLACK === '1',
-      allowedOrigins: (env.ENGINE_ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
-      agents: env.ENGINE_AGENTS ? env.ENGINE_AGENTS.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+      allowedOrigins: (env.ENGINE_ALLOWED_ORIGINS ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+      agents: env.ENGINE_AGENTS
+        ? env.ENGINE_AGENTS.split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined,
       login: loginConfig(env),
       reposDir: env.ENGINE_REPOS_DIR ? r(env.ENGINE_REPOS_DIR) : undefined,
       reposGithub: opt(env.ENGINE_REPOS_GITHUB),
       githubApp:
         env.GITHUB_APP_ID && env.GITHUB_APP_INSTALLATION_ID && env.GITHUB_APP_PRIVATE_KEY_FILE
-          ? { appId: env.GITHUB_APP_ID, installationId: env.GITHUB_APP_INSTALLATION_ID, privateKeyFile: expandHome(env.GITHUB_APP_PRIVATE_KEY_FILE) }
+          ? {
+              appId: env.GITHUB_APP_ID,
+              installationId: env.GITHUB_APP_INSTALLATION_ID,
+              privateKeyFile: expandHome(env.GITHUB_APP_PRIVATE_KEY_FILE),
+            }
           : undefined,
     },
   };

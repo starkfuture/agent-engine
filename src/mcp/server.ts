@@ -6,10 +6,11 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import type { Config } from '../config.js';
 import { FILE_TOOLS, listAgents, loadAgent, type LoadedAgent } from '../engine/agent.js';
-import { writeAnswer } from '../engine/answer.js';
+import { storedMonitorAnswer, writeAnswer } from '../engine/answer.js';
+import { coverage } from '../patrol/coverage.js';
 import { findingsOutput, type Findings } from '../engine/output.js';
 import { runAgent, type Engine, type Root, type RunResult } from '../engine/run.js';
-import { cleanModelText, redact, safeJson, slackEscape, truncate } from '../engine/text.js';
+import { cleanModelText, redact, safeJson, slackEscape, stripImages, truncate } from '../engine/text.js';
 import type { RunRow } from '../engine/store.js';
 import type { Telemetry } from '../clients/telemetry.js';
 import { monitorTools } from '../investigate/tools.js';
@@ -91,6 +92,8 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
   const runs = active(ctx);
   // Someone else's private run answers like a missing one: its id reveals nothing.
   const readable = (row: RunRow | undefined): row is RunRow => !!row && (admin || row.requested_by === user.name || sharedAgents(ctx).has(row.agent));
+
+  if (ctx.telemetry) s.registerTool('monitoring_coverage', {description:'Current service measurements and blind spots: throughput, non-5xx fraction and p95/p99 latency. Reports configured objectives only; does not invent SLOs or change alerts.',inputSchema:{},annotations:{readOnlyHint:true}},async()=>text(JSON.stringify(await coverage(ctx.telemetry!,ctx.cfg.sources,new Date(),ctx.cfg.windowMinutes),null,2)));
 
   s.registerTool(
     'list_agents',
@@ -204,18 +207,20 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       const row = ctx.engine.store.get(run_id);
       if (!readable(row)) return err(`no run ${run_id}`);
       const dir = runFolder(ctx, row.agent, row.id);
-      const answer = existsSync(join(dir, 'answer.md')) ? readFileSync(join(dir, 'answer.md'), 'utf8') : '';
+      const answer = existsSync(join(dir, 'answer.md')) ? readFileSync(join(dir, 'answer.md'), 'utf8') : storedMonitorAnswer(dir, row) ?? '';
       let challenge = '';
       if (existsSync(join(dir, 'challenge.json'))) {
-        const c = JSON.parse(readFileSync(join(dir, 'challenge.json'), 'utf8')) as { verdict: string; overall: string; notes: Array<{ claim: string }> };
-        challenge = `\n## Challenge: ${c.verdict}\n${c.overall}${c.notes.length ? `\nNotes:\n${c.notes.map((n) => `- ${n.claim}`).join('\n')}` : ''}`;
+        try {
+          const c = JSON.parse(readFileSync(join(dir, 'challenge.json'), 'utf8')) as { verdict: string; overall: string; notes?: Array<{ claim: string }> };
+          challenge = redact(`\n## Challenge: ${c.verdict}\n${c.overall}${c.notes?.length ? `\nNotes:\n${c.notes.map((n) => `- ${n.claim}`).join('\n')}` : ''}`);
+        } catch { challenge = '\nChallenge record unavailable; this run is not verified as upheld.'; }
       }
       const head = [
         `run ${row.id} · ${row.agent}@${row.version} · ${row.status}${row.status === 'running' ? ` (deadline ${row.deadline_at})` : ''}`,
         `asked by ${row.requested_by ?? row.trigger} at ${row.started_at} · engine ${row.build ?? 'unknown'} · cost $${(row.cost ?? row.reserve).toFixed(3)}${row.status === 'running' ? ' reserved' : ''} · ${row.turns ?? 0} turns`,
         ...(row.note ? [`note: ${redact(row.note)}`] : []),
       ].join('\n');
-      return text(`${head}\n\n${answer || (row.status === 'running' ? '(still running)' : '(no answer)')}${challenge}`);
+      return text(stripImages(redact(`${head}\n\n${answer || (row.status === 'running' ? '(still running)' : '(no answer)')}${challenge}`)));
     },
   );
 
