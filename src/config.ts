@@ -67,6 +67,9 @@ export interface Config {
   build: string | undefined; // engine code version (image tag or commit), recorded on every run
   retentionDays: number; // run folders and cards older than this are deleted (serve)
   slackWebhookUrl: string | undefined;
+  // The Slack bot (chat.postMessage, threads); the webhook is the fallback when unset.
+  slackBotToken: string | undefined;
+  slackChannel: string | undefined; // channel id, e.g. C0…
   mcp: {
     usersFile: string; // hashed tokens, one per person (gitignored)
     reposFile: string; // repos the codebase agent may read on this host (gitignored)
@@ -116,6 +119,16 @@ export function loadDotEnv(file = resolve('.env'), env: NodeJS.ProcessEnv = proc
 // tokens would work instead. (ENGINE_PUBLIC_URL and the like alone are allowed:
 // the monitor-only deployment carries them; `serve` refuses a non-loopback
 // bind without the sign-in anyway.)
+// SLACK_BOT_TOKEN needs the channel it posts to; a channel alone means nothing.
+function slackBot(env: NodeJS.ProcessEnv): Pick<Config, 'slackBotToken' | 'slackChannel'> {
+  const token = opt(env.SLACK_BOT_TOKEN);
+  const channel = opt(env.SLACK_CHANNEL_ID);
+  if (token && !/^xoxb-/.test(token)) throw new Error('SLACK_BOT_TOKEN must be a bot token (xoxb-…)');
+  if (token && !channel) throw new Error('SLACK_BOT_TOKEN needs SLACK_CHANNEL_ID, the channel the bot posts to');
+  if (channel && !/^[CG][A-Z0-9]{6,}$/.test(channel)) throw new Error(`SLACK_CHANNEL_ID: "${channel}" is not a channel id`);
+  return { slackBotToken: token, slackChannel: channel };
+}
+
 const LOGIN_VARS = ['KEYCLOAK_JWKS_URL', 'ENGINE_KC_CLIENT_ID', 'KEYCLOAK_SCOPES'];
 function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   const issuer = opt(env.KEYCLOAK_ISSUER)?.replace(/\/+$/, '');
@@ -178,6 +191,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     build: opt(env.ENGINE_BUILD) === 'unknown' ? undefined : opt(env.ENGINE_BUILD),
     retentionDays: num(env.ENGINE_RETENTION_DAYS, 30, 'ENGINE_RETENTION_DAYS'),
     slackWebhookUrl: opt(env.SLACK_WEBHOOK_URL),
+    ...slackBot(env),
     mcp: {
       usersFile: r(env.ENGINE_USERS_FILE ?? 'config/users.local.json'),
       reposFile: r(env.ENGINE_REPOS_FILE ?? 'config/repos.local.yaml'),

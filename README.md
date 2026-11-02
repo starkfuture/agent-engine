@@ -75,11 +75,28 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 4. **Investigate.** Only if something new is big enough to read (a "to look at" row, below), the engine runs the `monitor` agent. Small or still-firing rows on their own don't spend a run. It has read-only telemetry tools and no shell, files or web, and must submit schema-checked reports that cite evidence ids.
 5. **Challenge.** For protected journeys or big spikes (a deterministic gate, never the model's severity), a challenger re-checks the report. Its verdict goes on the card.
 
-**What reaches Slack** (with `--post` and a webhook): the AI decides, except for what it must never hide.
+**What reaches Slack** (with `--post`, and the bot or a webhook): the AI decides, except for what it must never hide.
 
 - **Urgent rows, at once, by code:** a new or worse protected journey (`never_suppress`) or big spike (50+ events and 5× expected). The rows card is posted before the AI starts, with or without it. 6-hour reminders of something already posted are not.
 - **Everything else, only as an AI report rated critical or major.** Minor and noise reports, and the rows card itself, stay on disk, where the MCP answers from them. Report cards mention the owners of the services they cover. In Slack a report reads as a header with its level, then two short paragraphs (what's wrong and impact, likely cause and fix); evidence and what wasn't checked stay in the card's file and the run.
 - **Without the AI** (no `--llm`, no credentials, kill switch, budget spent, crash), only urgent rows are posted.
+
+**How it is posted.** With the Slack bot (`SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID`, app manifest in `slack/`), each issue is one message:
+- **Later news on the same rows goes into its thread:** the AI report on an urgent rows card, a worse count, a recovery ("✅ Back to normal").
+- **Thread replies show in the channel too** (broadcast) only when the thread is more than 30 min old, so the AI's report right after its rows card stays in the thread.
+- **A thread takes replies for 24 h** after its last post; after a quiet day the issue starts a new message.
+
+Every post goes through an outbox in the engine's SQLite file (`slack_outbox`):
+- **Delivered means Slack answered ok.** A failure waits for the next patrol and gives up after a day.
+- **Slack being down never stops a patrol or re-runs the model.**
+- **One message a second per channel.** A `Retry-After` of up to 10 s is waited out; a longer one, or an outage, leaves the rest for the next patrol.
+- **One sender per database, with a renewable lease.** Overlapping patrols cannot flush the same entries concurrently; an abandoned lease expires after a minute. The channel's rate limit is shared across flushes.
+- **Posting off means no delivery**, including messages left queued by an earlier patrol.
+- **Recovery requires healthy observers.** A missing or failed source leaves its issues unresolved; recovery is recorded once when the source returns, including after a restart. Suppressing a signal does not resolve it.
+
+Delivery is at least once: if Slack accepts a message but its response is lost, a retry may duplicate it. The outbox prevents overlapping senders from duplicating a post; it cannot make the remote send and the local receipt one transaction.
+
+The incoming webhook (`SLACK_WEBHOOK_URL`) still works as a fallback, without threads.
 
 The baseline is `min(1 d, 7 d)`, scaled by current traffic, so a one-day incident doesn't become its own baseline the next day. The 1 h window only labels a row "started" or "ongoing".
 
@@ -140,7 +157,8 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 | `src/engine/` | The engine: agent loader, run, session (SDK), evidence, guard, ledger, challenge, generic output. |
 | `agents/` | Agent folders: `monitor`, `research`, `codebase`. |
 | `src/investigate/` | Monitor: telemetry tools, task prompt, report schema. |
-| `src/output/` | Card rendering (Slack Block Kit and Markdown) and the sink. |
+| `src/output/` | Card rendering (Slack Block Kit and Markdown), the sink and the Slack outbox (bot or webhook). |
+| `slack/` | The Slack app (manifest and Slack CLI project). |
 | `src/runner.ts`, `src/cli.ts` | Patrol orchestration (card first, challenge gate) and commands. |
 
 ## Guardrails in code

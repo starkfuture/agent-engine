@@ -45,11 +45,13 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
   // source's signal.
   const sources: SourceHealth[] = [];
   const rows: Row[] = [];
+  const rowSources = new Map<string, string[]>();
   settled.forEach((r, i) => {
     const source = jobs[i]!.source;
     if (r.status === 'fulfilled') {
       sources.push({ source, ok: true });
       rows.push(...r.value);
+      for (const row of r.value) rowSources.set(row.key, [...new Set([...(rowSources.get(row.key) ?? []), source])]);
     } else sources.push({ source, ok: false, error: String((r.reason as Error)?.message ?? r.reason).slice(0, 300) });
   });
   if (!tel.has.loki) sources.push({ source: 'logs', ok: false, error: 'not configured (LOKI_DATASOURCE_UID)' });
@@ -61,19 +63,29 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
   const flagged = new Set<string>();
 
   for (const row of rows) {
+    // Suppression changes delivery, not the observed health of a signal.
+    flagged.add(row.key);
     const rule = noise.suppressedBy(row, at);
     if (rule) {
       suppressed.push({ row, rule });
       continue;
     }
-    flagged.add(row.key);
     const novelty = state.novelty(row, at);
-    state.seen(row, at);
+    state.seen(row, at, rowSources.get(row.key)!);
     const f: FlaggedRow = { ...row, novelty, firstSeen: state.firstSeen(row.key) ?? at.toISOString() };
     (novelty === 'known' ? known : send).push(f);
   }
 
-  const recovered = state.recovered(flagged, at, w);
+  const healthy = new Set(sources.filter(s => s.ok).map(s => s.source));
+  const recovered = state.recovered(flagged, at, w, (key, owners) => {
+    if (owners?.length) return { sources: owners, ok: owners.every(source => healthy.has(source)) };
+    // Conservative migration for state saved before collector ownership was
+    // recorded: all configured collectors for this section must be healthy.
+    const section = key.split('|')[0];
+    const prefix = section === 'http' || section === 'drop' ? 'http:' : section === 'errors' ? 'counter:' : section === 'workload' ? 'workloads' : section;
+    const relevant = sources.filter(s => s.source === prefix || (prefix?.endsWith(':') && s.source.startsWith(prefix)));
+    return { sources: relevant.map(s => s.source), ok: relevant.length > 0 && relevant.every(s => s.ok) };
+  });
   const order = (a: Row, b: Row) => b.score.z - a.score.z;
   return {
     at: at.toISOString(),

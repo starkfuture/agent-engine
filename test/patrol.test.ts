@@ -7,6 +7,7 @@ import type { Config } from '../src/config.js';
 import { checkReport, type Report } from '../src/investigate/report.js';
 import { reportCard } from '../src/output/card.js';
 import { CardSink } from '../src/output/sink.js';
+import { SlackError, SlackOutbox } from '../src/output/slack.js';
 import { Noise } from '../src/patrol/noise.js';
 import { Owners } from '../src/patrol/owners.js';
 import { State } from '../src/patrol/state.js';
@@ -44,6 +45,8 @@ const cfg = (): Config => ({
   agentsDir: join(import.meta.dirname, '..', 'agents'),
   runsDir: mkdtempSync(join(tmpdir(), 'sre-runs-')),
   slackWebhookUrl: undefined,
+  slackBotToken: undefined,
+  slackChannel: undefined,
   direct: undefined,
   memoryDir: undefined,
   build: undefined,
@@ -164,10 +167,13 @@ function monitor(c: Config, session: Session, llmAvailable = true): MonitorAgent
 
 test('the rows card goes out before the AI; reports cite real tool results; protected journeys get challenged', async () => {
   const c = cfg();
+  const sent: string[] = [];
+  const box = new SlackOutbox(':memory:', { threads: true, post: async (m) => { sent.push(m.text); return `ts${sent.length}`; } }, { sleep: async () => {}, gapMs: 0 });
   const noise = new Noise({ never_suppress: [{ section: 'http', route: '.*(reset|signup).*', status: '4..' }] });
   const keys = ['http|backend-production|/v1/auth/password/reset|400', 'http|backend-production|/v1/auth/signup|400'];
   const session = fakeSession(
     async function* (sim) {
+      assert.equal(sent.length, 1, 'the urgent card is delivered before the model starts');
       const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
       const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
       assert.match(out.text, /password\/reset 400 \| 75/);
@@ -184,12 +190,13 @@ test('the rows card goes out before the AI; reports cite real tool results; prot
       yield ok(0.2, 2);
     },
   );
-  const r = await patrolOnce(new FakeTelemetry(world), c, noise, State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false }, monitor(c, session));
+  const r = await patrolOnce(new FakeTelemetry(world), c, noise, State.memory(), new CardSink(c.outDir, box), new Date('2026-09-29T12:15:00Z'), { llm: true, post: true }, monitor(c, session));
   assert.equal(r.investigation?.status, 'ok');
   assert.equal(r.investigation?.challenge?.verdict, 'upheld');
   assert.equal(r.cards.length, 2);
   assert.ok(r.cards[0]!.endsWith('-rows.md'), 'deterministic card first');
   assert.deepEqual(r.slack, r.cards, 'urgent rows and a critical report both go to Slack');
+  assert.equal(sent.length, 2);
   assert.match(readFileSync(r.cards[1]!, 'utf8'), /Challenge: upheld/);
   assert.equal(session.requests[0]!.builtin.length, 0, 'monitor gets no built-in tools');
 });
@@ -230,6 +237,110 @@ test('without the AI only urgent rows reach Slack', async () => {
   assert.equal(small.summary.send.length, 2);
   assert.equal(small.cards.length, 1, 'the rows card is still written');
   assert.deepEqual(small.slack, []);
+});
+
+test('Slack down: the patrol still finishes and marks its rows, and the queued card goes out next patrol', async () => {
+  const c = cfg();
+  const state = State.memory();
+  let down = true;
+  let attempts = 0;
+  const sent: string[] = [];
+  const box = new SlackOutbox(':memory:', { threads: true, post: async (m) => { attempts++; if (down) throw new SlackError('Slack: HTTP 503'); sent.push(m.text); return `ts${sent.length}`; } }, { sleep: async () => {}, gapMs: 0 });
+  const sink = new CardSink(c.outDir, box);
+  const first = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), state, sink, new Date('2026-09-29T12:15:00Z'), { llm: false, post: true });
+  assert.equal(first.slack.length, 1, 'the urgent rows card was queued');
+  assert.deepEqual(sent, []);
+  assert.equal(attempts, 1, 'a failure before the AI is not retried again at patrol finish');
+  assert.deepEqual(box.status(), [{ status: 'pending', n: 1 }]);
+  down = false;
+  const next = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), state, sink, new Date('2026-09-29T12:30:00Z'), { llm: false, post: true });
+  assert.equal(next.summary.send.length, 0, 'rows were marked reported despite the outage: no repeat');
+  assert.equal(sent.length, 1, 'the queued card went out');
+  assert.equal(attempts, 2);
+  assert.match(sent[0]!, /Patrol 2026-09-29 12:15Z/);
+  assert.deepEqual(box.status(), [{ status: 'sent', n: 1 }]);
+});
+
+test('without --post nothing is queued for Slack', async () => {
+  const c = cfg();
+  const box = new SlackOutbox(':memory:', { threads: true, post: async () => 'ts' }, { sleep: async () => {}, gapMs: 0 });
+  await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir, box), new Date('2026-09-29T12:15:00Z'), { llm: false, post: false });
+  assert.deepEqual(box.status(), []);
+});
+
+test('without --post pending messages stay queued on quiet and active patrols', async () => {
+  for (const time of ['2026-09-28T12:15:00Z', '2026-09-29T12:15:00Z']) {
+    const c = cfg();
+    const sent: string[] = [];
+    const box = new SlackOutbox(':memory:', { threads: true, post: async (m) => { sent.push(m.text); return 'ts'; } }, { sleep: async () => {}, gapMs: 0 });
+    box.enqueue({ kind: 'rows', keys: [RESET], broadcast: true, message: { text: 'pending', blocks: [] } });
+    await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir, box), new Date(time), { llm: false, post: false });
+    assert.deepEqual(sent, []);
+    assert.deepEqual(box.status(), [{ status: 'pending', n: 1 }]);
+  }
+});
+
+test('an observer outage never posts recovery, and healthy data resolves once after a restart', async () => {
+  const c = cfg();
+  const sent: string[] = [];
+  const box = new SlackOutbox(':memory:', { threads: true, post: async (m) => { sent.push(m.text); return `ts${sent.length}`; } }, { sleep: async () => {}, gapMs: 0 });
+  const sink = new CardSink(c.outDir, box);
+  let state = State.load(c.stateFile);
+  await patrolOnce(new FakeTelemetry(world), c, new Noise({}), state, sink, new Date('2026-09-29T12:15:00Z'), { llm: false, post: true });
+  const blind = new FakeTelemetry(() => { throw new Error('observer unavailable'); });
+  for (const time of ['2026-09-29T12:30:00Z', '2026-09-29T12:45:00Z']) {
+    const tel = time.endsWith('45:00Z') ? new FakeTelemetry(() => []) : blind;
+    const r = await patrolOnce(tel, c, new Noise({}), state, sink, new Date(time), { llm: false, post: true });
+    assert.deepEqual(r.summary.recovered, [], 'missing observations cannot prove recovery');
+    state = State.load(c.stateFile);
+  }
+  const healthy = new FakeTelemetry((q, at) => world(q, at).map(s => s.labels.route?.includes('/auth/') && s.labels.status_code === '400' ? { ...s, value: 0 } : s));
+  const recovered = await patrolOnce(healthy, c, new Noise({}), state, sink, new Date('2026-09-29T13:00:00Z'), { llm: false, post: true });
+  assert.deepEqual(recovered.summary.recovered.sort(), [RESET, SIGNUP].sort());
+  assert.equal(sent.filter(s => s.includes('Back to normal')).length, 1);
+  state = State.load(c.stateFile);
+  const again = await patrolOnce(healthy, c, new Noise({}), state, sink, new Date('2026-09-29T13:15:00Z'), { llm: false, post: true });
+  assert.deepEqual(again.summary.recovered, []);
+});
+
+test('a failed HTTP family does not prevent recovery observed by a healthy family', async () => {
+  const c = cfg();
+  c.sources.http_families.push({ id: 'other', selector: 'other_requests_total', service: 'other', route_label: 'route', status_label: 'status_code' });
+  const state = State.memory();
+  const answer = (q: string, at: Date) => q.includes('other_requests_total') ? world(q.replaceAll('other_requests_total', 'backend_be_production_http_requests_total'), at) : world(q, at);
+  const start = new Date('2026-09-29T12:15:00Z');
+  const first = await buildSummary(new FakeTelemetry(answer), c, new Noise({}), state, start);
+  for (const row of first.send) state.reported(row, start);
+  const next = await buildSummary(new FakeTelemetry((q, at) => {
+    if (q.includes('backend_be_production_http_requests_total')) throw new Error('legacy observer down');
+    return answer(q, at).map(s => s.labels.route?.includes('/auth/') && s.labels.status_code === '400' ? { ...s, value: 0 } : s);
+  }), c, new Noise({}), state, new Date('2026-09-29T12:30:00Z'));
+  assert.deepEqual(next.recovered.sort(), ['http|other|/v1/auth/password/reset|400', 'http|other|/v1/auth/signup|400']);
+});
+
+test('older state without collector ownership requires healthy observers before recovery', async () => {
+  const c = cfg();
+  const state = new State({ rows: { [RESET]: { firstSeen: '2026-09-29T12:15:00Z', lastSeen: '2026-09-29T12:15:00Z', lastReportedAt: '2026-09-29T12:15:00Z', lastReportedNow: 75 } } });
+  const at = new Date('2026-09-29T12:30:00Z');
+  const blind = await buildSummary(new FakeTelemetry(() => []), c, new Noise({}), state, at);
+  assert.deepEqual(blind.recovered, []);
+  const healthy = new FakeTelemetry((q, time) => world(q, time).map(s => s.labels.status_code === '400' ? { ...s, value: 0 } : s));
+  const restarted = new State(JSON.parse(JSON.stringify(state.data)));
+  const afterOutage = new Date('2026-09-29T13:00:00Z');
+  assert.deepEqual((await buildSummary(healthy, c, new Noise({}), restarted, afterOutage)).recovered, [RESET]);
+  assert.deepEqual((await buildSummary(healthy, c, new Noise({}), restarted, afterOutage)).recovered, []);
+});
+
+test('suppressing a still-firing signal never announces recovery', async () => {
+  const c = cfg();
+  const state = State.memory();
+  const at = new Date('2026-09-29T12:15:00Z');
+  const first = await buildSummary(new FakeTelemetry(world), c, new Noise({}), state, at);
+  for (const row of first.send) state.reported(row, at);
+  const noise = new Noise({ noise: [{ id: 'auth', section: 'http', route: '.*auth.*', reason: 'known issue', expires: '2027-01-01' }] });
+  const next = await buildSummary(new FakeTelemetry(world), c, noise, state, new Date('2026-09-29T12:30:00Z'));
+  assert.equal(next.suppressed.length, 2);
+  assert.deepEqual(next.recovered, []);
 });
 
 test('a 6-hour reminder of an urgent row is not posted again', async () => {
