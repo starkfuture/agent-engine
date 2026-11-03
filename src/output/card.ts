@@ -277,7 +277,7 @@ const rowName = (k: string) => {
 
 export function recoveredCard(keys: string[], at: string, issue?: string): Card {
   // A stalled rollout back to normal is a rollout that completed.
-  const lines = keys.map((k) => (/^rollout\|[^|]+\|stalled\|$/.test(k) ? `${k.split('|')[1]} · rollout complete` : rowName(k)));
+  const lines = keys.map((k) => (/^rollout\|[^|]+\|stalled\|/.test(k) ? `${k.split('|')[1]} · rollout complete` : rowName(k)));
   const head = `✅ Back to normal at ${minute(at).slice(11)}${issue ? ` · ${issue} resolved` : ''}`;
   const text = `${head}: ${lines.length === 1 ? lines[0] : `${lines.length} signals`}`;
   const blocks = [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(redact(`${head}\n${lines.map((l) => `• ${l}`).join('\n')}`)), 2900) }] }];

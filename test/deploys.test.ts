@@ -40,7 +40,8 @@ const KEYCLOAK: Rollout = {
   prevRs: 'keycloak-production-58f6d9c7b2',
   prev: `${ECR}/keycloak:40306405609@sha256:c80fc98a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6`,
 };
-const STALLED = 'rollout|ecom-service-production|stalled|';
+// One deploy's stall: the key carries its ReplicaSet's pod-template-hash.
+const STALLED = 'rollout|ecom-service-production|stalled|7566f689c8';
 
 const outbox = () => {
   const sent: Array<{ text: string; blocks: unknown[] }> = [];
@@ -115,7 +116,7 @@ test('replicas behind for 10 min are an urgent rollout row, posted by code, and 
   assert.match(row.query ?? '', /min_over_time\(\(kube_deployment_spec_replicas\{namespace=~"microservices"\} - kube_deployment_status_replicas_updated\{namespace=~"microservices"\}\)\[10m:1m\]\)/);
   assert.match(renderSummary(stalled.summary), /ecom-service-production: 1\.2645\.5 → 1\.2645\.6 · STALLED \(13 min since it started\)/);
   assert.equal(sent.length, 1, 'the rows card, before and without the AI');
-  assert.match(JSON.stringify(sent[0]!.blocks), /\*ecom-service-production\* · rollout `stalled`/);
+  assert.match(JSON.stringify(sent[0]!.blocks), /\*ecom-service-production\* · rollout `stalled 7566f689c8`/);
 
   const still = await pass('2026-11-03T12:37:00Z');
   assert.deepEqual([still.summary.known.map((r) => r.key), sent.length], [[STALLED], 1], 'still stalled: not posted again');
@@ -171,6 +172,45 @@ test('without kube-state-metrics, deploys are unknown, never "none": in the summ
   const out = (await tools.find((t) => t.name === 'recent_changes')!.handler({ hours: 24 } as never, {})).content[0] as { text: string };
   assert.match(out.text, /- unknown: deployment metrics missing/);
   assert.doesNotMatch(out.text, /- none/);
+});
+
+test("a stall on the next deploy is a new row, urgent again after the first one recovered; one that goes on stays one row", async () => {
+  const c = cfg();
+  const { sent, box } = outbox();
+  const sink = new CardSink(c.outDir, box);
+  const state = State.memory();
+  const NEXT: Rollout = { workload: ECOM.workload, rs: 'ecom-service-production-6b8d4c9f72', created: Date.parse('2026-11-03T12:58:00Z'), image: `${ECR}/ecom-service:1.2645.7`, prevRs: ECOM.rs, prev: ECOM.image };
+  const tel = cluster([{ ...ECOM, done: Date.parse('2026-11-03T12:41:00Z') }, NEXT]);
+  const pass = (iso: string) => patrolOnce(tel, c, new Noise({}), state, sink, new Date(iso), { llm: false, post: true });
+  assert.deepEqual((await pass('2026-11-03T12:30:00Z')).summary.send.map((r) => r.key), [STALLED]);
+  assert.deepEqual((await pass('2026-11-03T12:45:00Z')).summary.recovered, [STALLED]);
+  assert.deepEqual((await pass('2026-11-03T13:00:00Z')).summary.send, [], 'the next deploy rolling for 2 min');
+  const again = await pass('2026-11-03T13:15:00Z');
+  assert.deepEqual(again.summary.send.map((r) => [r.key, r.novelty]), [['rollout|ecom-service-production|stalled|6b8d4c9f72', 'fresh']]);
+  assert.equal(sent.length, 3, 'rows card, recovery, and the second stall\'s rows card');
+  assert.match(JSON.stringify(sent[2]!.blocks), /rollout `stalled 6b8d4c9f72`/);
+  const still = await pass('2026-11-03T13:30:00Z');
+  assert.deepEqual([still.summary.known.map((r) => r.key), sent.length], [['rollout|ecom-service-production|stalled|6b8d4c9f72'], 3], 'still stalled: one row, not posted again');
+});
+
+test('a stalled Deployment whose series disappear is unknown, not complete: it does not recover', async () => {
+  const c = cfg();
+  const state = State.memory();
+  // ecom's status series stop at 12:40; kube-state-metrics still serves every other Deployment.
+  const tel = cluster([{ ...ECOM, gone: Date.parse('2026-11-03T12:40:00Z') }]);
+  await patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir), AT, { llm: false, post: false });
+  const later = await buildSummary(tel, c, new Noise({}), state, new Date('2026-11-03T12:45:00Z'));
+  assert.deepEqual([later.recovered, later.known.map((r) => [r.key, r.detail])], [[], [[STALLED, 'rollout state unknown: no kube-state-metrics series for this Deployment now']]]);
+  assert.ok(later.sources.find((x) => x.source === 'rollouts')?.ok, 'the source is healthy: the rest of the cluster is read');
+});
+
+test('deploy history keeps a deploy whose ReplicaSet was garbage collected within the window', async () => {
+  // Deployed at 10:00, its ReplicaSet collected at 12:00 (revisionHistoryLimit): still a deploy of the last 6 h.
+  const early: Rollout = { ...ECOM, created: Date.parse('2026-11-03T10:00:00Z'), done: Date.parse('2026-11-03T10:04:00Z'), gc: Date.parse('2026-11-03T12:00:00Z') };
+  const tel = cluster([early]);
+  const s = await buildSummary(tel, cfg(), new Noise({}), State.memory(), AT);
+  assert.deepEqual(s.deploys.deploys.map((d) => [d.replicaset, d.at]), [[ECOM.rs, '2026-11-03T10:00:00.000Z']]);
+  assert.match(tel.calls.find((q) => q.includes('kube_replicaset_created') && q.includes('time()'))!, /last_over_time\(kube_replicaset_created\{namespace=~"microservices"\}\[360m\]\).*last_over_time\(kube_replicaset_owner\{namespace=~"microservices",owner_kind="Deployment"\}\[360m\]\)/);
 });
 
 test("a one-replica rollout stalls only by the controller's deadline, and that is a row too", async () => {
@@ -249,7 +289,7 @@ test('the report card carries the deploys line it is given, in the file and in S
   assert.doesNotMatch(reportCard(report(), '2026-09-29T12:15:00Z', 'footer').markdown, /Deploys/);
 });
 
-test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app and a failed sync are urgent rows, and a missing scrape is blind', async () => {
+test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app and a failed sync are urgent rows, the first sync of a phase counts, and a missing scrape is blind', async () => {
   const off = cluster([]);
   const s = await buildSummary(off, cfg(), new Noise({}), State.memory(), AT);
   assert.ok(!off.calls.some((q) => q.includes('argocd')));
@@ -263,13 +303,15 @@ test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app a
     if (q.startsWith('count_over_time(argocd_app_info')) return [{ labels: { ...app, health_status: 'Degraded' }, value: 5 }];
     if (q.includes('argocd_app_sync_total{phase=~"Error|Failed"}')) return [{ labels: { name: ECOM.workload, phase: 'Failed' }, value: 1 }];
     if (q.startsWith('count by (name, sync_status, health_status)')) return [{ labels: { ...app, health_status: 'Degraded' }, value: 1 }];
-    if (q.startsWith('sum by (name, phase) (increase(argocd_app_sync_total{}[360m]))')) return [{ labels: { name: ECOM.workload, phase: 'Failed' }, value: 1 }];
+    // The context's syncs: ecom failed again; keycloak synced for the first time since the controller started (a new series).
+    if (q.startsWith('(sum by (name, phase) (increase(argocd_app_sync_total{}[360m])) > 0'))
+      return [{ labels: { name: ECOM.workload, phase: 'Failed' }, value: 1 }, ...(q.includes(' unless argocd_app_sync_total{} offset 360m') ? [{ labels: { name: 'keycloak-production', phase: 'Succeeded' }, value: 1 }] : [])];
     return world(q, at);
   };
   const on = await buildSummary(cluster([], argo), c, new Noise({}), State.memory(), AT);
   assert.deepEqual(on.send.map((r) => r.key).sort(), ['rollout|ecom-service-production|argocd app|Degraded', 'rollout|ecom-service-production|argocd sync|Failed']);
   assert.ok(on.send.every((r) => urgent(r, new Noise({}))));
-  assert.match(renderSummary(on), /- Argo CD apps not Synced and Healthy now: ecom-service-production Synced\/Degraded\n- Argo CD syncs in the last 6 h: ecom-service-production Failed ×1/);
+  assert.match(renderSummary(on), /- Argo CD apps not Synced and Healthy now: ecom-service-production Synced\/Degraded\n- Argo CD syncs in the last 6 h: ecom-service-production Failed ×1, keycloak-production Succeeded ×1\n/);
   // argocd_app_sync_total has no dest_namespace: it is matched to the apps by name.
   const failed = on.send.find((r) => r.subject === 'argocd sync')!.query!;
   assert.match(failed, /\) and on \(name\) argocd_app_info\{dest_namespace=~"microservices"\}$/);

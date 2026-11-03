@@ -50,11 +50,20 @@ export interface Deploys {
 }
 
 // ---- queries (sources.yaml deploys; section 2.2 of the deploy-watch plan) ----
-// One series per new ReplicaSet: its creation time, and its Deployment as owner_name.
+// One series per new ReplicaSet: its creation time, and its Deployment as
+// owner_name. Read over the whole window: an old ReplicaSet can be garbage
+// collected (revisionHistoryLimit) before the window ends, and its deploy still
+// happened. Aggregated by ReplicaSet, so a kube-state-metrics restart in the
+// window (a second series per ReplicaSet) can't break the join.
 export function createdQuery(src: Sources, hours: number, workload?: string): string {
   const owner = workload ? `,owner_name=${q(workload)}` : '';
-  return `max by (namespace, owner_name, replicaset) ((kube_replicaset_created{${ns(src)}} > time() - ${Math.round(hours * 3600)}) * on (namespace, replicaset) group_left (owner_name) kube_replicaset_owner{${ns(src)},owner_kind="Deployment"${owner}})`;
+  const w = `${Math.round(hours * 60)}m`;
+  return `max by (namespace, owner_name, replicaset) ((max by (namespace, replicaset) (last_over_time(kube_replicaset_created{${ns(src)}}[${w}])) > time() - ${Math.round(hours * 3600)}) * on (namespace, replicaset) group_left (owner_name) max by (namespace, replicaset, owner_name) (last_over_time(kube_replicaset_owner{${ns(src)},owner_kind="Deployment"${owner}}[${w}])))`;
 }
+
+// Each Deployment's newest ReplicaSet now: a stall is about that deploy.
+const newestQuery = (src: Sources) =>
+  `topk by (namespace, owner_name) (1, kube_replicaset_created{${ns(src)}} * on (namespace, replicaset) group_left (owner_name) kube_replicaset_owner{${ns(src)},owner_kind="Deployment"})`;
 
 // Pods per ReplicaSet (owner_name), container and image_spec. image_spec keeps
 // the tag of a digest-pinned image; the image label shows a bare sha256 there.
@@ -68,7 +77,8 @@ export const imagesQuery = (src: Sources) =>
 const remaining = (sel: string) =>
   `max by (namespace, deployment) (clamp_min(kube_deployment_spec_replicas{${sel}} - kube_deployment_status_replicas_updated{${sel}}, 0) + clamp_min(kube_deployment_spec_replicas{${sel}} - kube_deployment_status_replicas_available{${sel}}, 0) + clamp_min(kube_deployment_status_replicas{${sel}} - kube_deployment_status_replicas_updated{${sel}}, 0))`;
 const progressQuery = (src: Sources, workloads: string[]) => remaining(`${ns(src)},deployment=~${q(workloads.map(reEscape).join('|'))}`);
-export const unfinishedQuery = (src: Sources) => `${remaining(ns(src))} > 0`;
+// Every Deployment, complete ones at 0: only an explicit 0 ends a stall.
+export const remainingQuery = (src: Sources) => remaining(ns(src));
 
 // Stalled: replicas not on the new version for every minute of stall_minutes
 // (before the controller gives up), or the controller's own
@@ -96,10 +106,9 @@ const degradedQuery = (src: Sources) => `count_over_time(argocd_app_info{${dest(
 // A sync that ended Error or Failed in the window. A phase's counter appears
 // with its first sync, so a series new in the window counts too: increase()
 // needs two samples and would miss an app's first failure.
-const failedSyncQuery = (src: Sources, windowMin: number) => {
-  const failed = 'argocd_app_sync_total{phase=~"Error|Failed"}';
-  return `(sum by (name, phase) (increase(${failed}[${windowMin}m])) > 0 or sum by (name, phase) (${failed} unless ${failed} offset ${windowMin}m)) and ${inDest(src)}`;
-};
+const syncsQuery = (src: Sources, selector: string, windowMin: number) =>
+  `(sum by (name, phase) (increase(${selector}[${windowMin}m])) > 0 or sum by (name, phase) (${selector} unless ${selector} offset ${windowMin}m)) and ${inDest(src)}`;
+const failedSyncQuery = (src: Sources, windowMin: number) => syncsQuery(src, 'argocd_app_sync_total{phase=~"Error|Failed"}', windowMin);
 
 // ---- rows: stalled rollouts, Argo CD apps (urgent) --------------------------
 // A state, not a rate: each window counts 1 when it held, so moving replica
@@ -113,18 +122,26 @@ function rolloutRow(service: string, subject: string, status: string | undefined
   return { key: rowKey({ section: 'rollout', service, subject, status }), section: 'rollout', service, subject, ...(status ? { status } : {}), counts, score: heldScore(counts), detail, query };
 }
 
-// `flagged(key)`: whether a stalled row is still open from an earlier patrol.
-// A stall ends when its rollout completes (every replica updated and available,
-// the old ones retired), not when its symptom changes: once every pod is
-// updated, new pods that never get ready no longer show as replicas behind.
-export async function collectRollouts(tel: Telemetry, src: Sources, at: Date, flagged: (key: string) => boolean = () => false): Promise<Row[]> {
+// A stalled row is one deploy's stall: its key carries the pod-template-hash
+// of the Deployment's newest ReplicaSet. A stall on the next deploy is a new
+// row (fresh and urgent again), however the first one ended; one that goes on
+// stays one row.
+//
+// `open()`: stalled rows still open from earlier patrols. A stall ends when its
+// rollout completes (every replica updated and available, the old ones
+// retired), not when its symptom changes: once every pod is updated, new pods
+// that never get ready no longer show as replicas behind. Only an explicit 0
+// ends it: a Deployment with no series now is unknown, not complete.
+export async function collectRollouts(tel: Telemetry, src: Sources, at: Date, open: () => string[] = () => []): Promise<Row[]> {
   const query = stallQuery(src);
-  const [cells, unfinished] = await Promise.all([
+  const [cells, left, newest] = await Promise.all([
     fourWay(tel, query, at, (s) => `${s.labels.namespace}\u0000${s.labels.deployment}`),
-    tel.promInstant(unfinishedQuery(src), at),
+    tel.promInstant(remainingQuery(src), at),
+    tel.promInstant(newestQuery(src), at),
     // Without Deployment series a stall would read as complete.
     requireSeries(tel, `kube_deployment_spec_replicas{${ns(src)}}`, at, 'kube-state-metrics deployment'),
   ]);
+  const hashOf = new Map(newest.map((s) => [`${s.labels.namespace}\u0000${s.labels.owner_name}`, RS_HASH.exec(s.labels.replicaset ?? '')?.[0].slice(1)]));
   const rows: Row[] = [];
   for (const [k, { counts, labels }] of cells) {
     if (!(counts.now > 0)) continue;
@@ -132,14 +149,20 @@ export async function collectRollouts(tel: Telemetry, src: Sources, at: Date, fl
     const detail = labels.reason
       ? `the controller gave up on it: Progressing ${labels.reason} (ns ${namespace})`
       : `${Math.round(counts.now)} replica(s) not on the new version for ${src.deploys.stall_minutes}+ min (ns ${namespace})`;
-    rows.push(rolloutRow(deployment, 'stalled', undefined, counts, detail, query));
+    rows.push(rolloutRow(deployment, 'stalled', hashOf.get(k), counts, detail, query));
   }
-  for (const s of unfinished) {
-    const { namespace = '?', deployment = '?' } = s.labels;
-    const k = `${namespace}\u0000${deployment}`;
-    if (cells.get(k)?.counts.now || !flagged(rowKey({ section: 'rollout', service: deployment, subject: 'stalled' }))) continue;
-    const counts = { ...(cells.get(k)?.counts ?? { h1: 0, d1: 0, d7: 0 }), now: 1 };
-    rows.push(rolloutRow(deployment, 'stalled', undefined, counts, `still not complete: ${Math.round(s.value)} replica(s) to update, become available or retire (ns ${namespace})`, unfinishedQuery(src)));
+  const work = new Map<string, { namespace: string; value: number }>();
+  for (const s of left) {
+    const d = s.labels.deployment ?? '?';
+    if (!work.has(d) || s.value > work.get(d)!.value) work.set(d, { namespace: s.labels.namespace ?? '?', value: s.value });
+  }
+  const flagged = new Set(rows.map((r) => r.key));
+  for (const key of open()) {
+    const [, deployment = '?', , status] = key.split('|');
+    const w = work.get(deployment);
+    if (flagged.has(key) || w?.value === 0) continue;
+    const detail = w ? `still not complete: ${Math.round(w.value)} replica(s) to update, become available or retire (ns ${w.namespace})` : 'rollout state unknown: no kube-state-metrics series for this Deployment now';
+    rows.push(rolloutRow(deployment, 'stalled', status || undefined, { now: 1, h1: 0, d1: 0, d7: 0 }, detail, remainingQuery(src)));
   }
   return rows;
 }
@@ -301,7 +324,7 @@ async function argocdContext(tel: Telemetry, src: Sources, at: Date, hours: numb
   const app = workload ? `,name=${q(workload)}` : '';
   const [apps, syncs] = await Promise.all([
     tel.promInstant(`count by (name, sync_status, health_status) (argocd_app_info{${dest(src)}${app},sync_status!="Synced"} or argocd_app_info{${dest(src)}${app},health_status!="Healthy"})`, at),
-    tel.promInstant(`sum by (name, phase) (increase(argocd_app_sync_total{${app.slice(1)}}[${Math.round(hours * 60)}m])) > 0 and ${inDest(src)}`, at),
+    tel.promInstant(syncsQuery(src, `argocd_app_sync_total{${app.slice(1)}}`, Math.round(hours * 60)), at),
   ]);
   return {
     apps: apps.map((s) => `${s.labels.name} ${s.labels.sync_status}/${s.labels.health_status}`).sort(),

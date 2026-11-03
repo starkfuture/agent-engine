@@ -105,27 +105,44 @@ export interface Rollout {
   oneReplica?: boolean; // its new pod counts as updated: only the controller's deadline shows the stall
   updated?: number; // every pod on the new template from then, before they are all available
   brandNew?: boolean; // a new Deployment: no series before `created`
+  gone?: number; // the Deployment's status series stop from then (other Deployments' stay)
+  gc?: number; // the ReplicaSet's own series stop from then (garbage collected)
 }
 
 // Rolling = created and not done. Stalled = replicas behind (rolling, before
 // `updated`) for 10+ min. `base` answers everything else (by default the 29 Sep
-// world, quiet on other days). What is left to do counts old replicas only when
-// the query asks for kube_deployment_status_replicas: a one-replica rollout is
-// otherwise 0 (updated 1, available 1) from its start. min_over_time over a
-// brand-new Deployment's first minutes fires unless the query counts samples.
+// world, quiet on other days). Several rollouts of one workload follow each
+// other. Like Prometheus, the fake answers what each query asks: old replicas
+// count only when the query reads kube_deployment_status_replicas (a one-replica
+// rollout is otherwise 0 from its start); min_over_time over a brand-new
+// Deployment's first minutes fires unless the query counts samples; a
+// garbage-collected ReplicaSet is seen only through last_over_time.
 export function cluster(rollouts: Rollout[], base: (q: string, at: Date) => Sample[] = world): FakeTelemetry {
+  const ns = { namespace: 'microservices' };
   const rolling = (r: Rollout, t: number) => t >= r.created && (r.done === undefined || t < r.done);
+  const shown = (r: Rollout, t: number) => r.gone === undefined || t < r.gone;
   const left = (q: string, r: Rollout, t: number) => (!rolling(r, t) ? 0 : !r.oneReplica ? 2 : q.includes('kube_deployment_status_replicas{') ? 1 : 0);
   const behind = (q: string, r: Rollout, t: number) => rolling(r, t) && !r.oneReplica && (r.updated === undefined || t < r.updated) && (t - r.created >= 10 * MIN || (!!r.brandNew && !q.includes('count_over_time(')));
+  // One value per workload: the most of its rollouts'.
+  const perWorkload = (q: string, t: number, value: (r: Rollout) => number) => {
+    const m = new Map<string, number>();
+    for (const r of rollouts) if (shown(r, t)) m.set(r.workload, Math.max(m.get(r.workload) ?? 0, value(r)));
+    return m;
+  };
   return new FakeTelemetry(
     (q, at) => {
       const t = at.getTime();
-      const ns = { namespace: 'microservices' };
       if (q.startsWith('count(')) return base(q, at); // presence checks
+      if (q.startsWith('topk by (namespace, owner_name) (1, kube_replicaset_created')) {
+        const newest = new Map<string, Rollout>();
+        for (const r of rollouts) if (r.created <= t && (r.gc === undefined || t < r.gc) && (newest.get(r.workload)?.created ?? 0) < r.created) newest.set(r.workload, r);
+        return [...newest.values()].map((r) => ({ labels: { ...ns, owner_name: r.workload, replicaset: r.rs }, value: r.created / 1000 }));
+      }
       if (q.includes('kube_replicaset_created')) {
         const window = Number(/time\(\) - (\d+)/.exec(q)![1]) * 1000;
         const owner = /owner_name="([^"]+)"/.exec(q)?.[1];
-        return rollouts.filter((r) => r.created <= t && r.created > t - window && (!owner || owner === r.workload)).map((r) => ({ labels: { ...ns, owner_name: r.workload, replicaset: r.rs }, value: r.created / 1000 }));
+        const seen = (r: Rollout) => r.gc === undefined || t < r.gc || (q.includes('last_over_time(') && r.gc > t - window);
+        return rollouts.filter((r) => r.created <= t && r.created > t - window && seen(r) && (!owner || owner === r.workload)).map((r) => ({ labels: { ...ns, owner_name: r.workload, replicaset: r.rs }, value: r.created / 1000 }));
       }
       if (q.includes('kube_pod_container_info') && q.includes('kube_pod_owner'))
         return rollouts.flatMap((r) => {
@@ -135,20 +152,20 @@ export function cluster(rollouts: Rollout[], base: (q: string, at: Date) => Samp
         });
       if (q.includes('min_over_time((kube_deployment_spec_replicas'))
         return rollouts.flatMap((r) => {
+          if (!shown(r, t)) return [];
           if (behind(q, r, t)) return [{ labels: { ...ns, deployment: r.workload }, value: 2 }];
           return r.oneReplica && rolling(r, t) && t - r.created >= 10 * MIN ? [{ labels: { ...ns, deployment: r.workload, reason: 'ProgressDeadlineExceeded' }, value: 1 }] : [];
         });
       if (q.includes('clamp_min(kube_deployment_spec_replicas'))
-        return rollouts.filter((r) => left(q, r, t) > 0).map((r) => ({ labels: { ...ns, deployment: r.workload }, value: left(q, r, t) }));
+        return [...perWorkload(q, t, (r) => left(q, r, t))].filter(([, v]) => !q.endsWith(' > 0') || v > 0).map(([deployment, value]) => ({ labels: { ...ns, deployment }, value }));
       return base(q, at);
     },
-    (q, start, end, step) =>
-      q.includes('clamp_min(kube_deployment_spec_replicas')
-        ? rollouts.map((r) => {
-            const points: Array<[number, number]> = [];
-            for (let t = start.getTime(); t <= end.getTime(); t += step * 1000) points.push([t / 1000, r.back !== undefined && t >= r.back && t < r.back + 2 * MIN ? 2 : left(q, r, t)]);
-            return { labels: { namespace: 'microservices', deployment: r.workload }, points };
-          })
-        : [],
+    (q, start, end, step) => {
+      if (!q.includes('clamp_min(kube_deployment_spec_replicas')) return [];
+      const series = new Map<string, Array<[number, number]>>();
+      for (let t = start.getTime(); t <= end.getTime(); t += step * 1000)
+        for (const [deployment, v] of perWorkload(q, t, (r) => (r.back !== undefined && t >= r.back && t < r.back + 2 * MIN ? 2 : left(q, r, t)))) series.set(deployment, [...(series.get(deployment) ?? []), [t / 1000, v]]);
+      return [...series].map(([deployment, points]) => ({ labels: { namespace: 'microservices', deployment }, points }));
+    },
   );
 }
