@@ -7,6 +7,7 @@ A patrol script has already compared the last window of telemetry with the same 
 How to work
 - Group rows that share one cause into one problem. Investigate the most customer-facing problem first (login, sign-up, password reset, checkout, payment, orders).
 - Use the tools. Start with service_overview or route_timeline for HTTP rows, log_search for the error text, workload_state and recent_changes for restarts and rollouts.
+- A rollout row is a rollout that did not finish (stalled) or an Argo CD app that is degraded or failed to sync. workload_state shows why the new pods are not ready; recent_changes shows what was deployed.
 - Find when it started, whether it is still going, who is affected, and the most likely cause.
 - Be efficient: usually 4-10 tool calls per problem. Stop once each row is explained, judged to be noise, or you have hit a wall; say what you could not check.
 

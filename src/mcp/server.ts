@@ -13,6 +13,7 @@ import { cleanModelText, redact, safeJson, slackEscape, stripImages, truncate } 
 import type { RunRow } from '../engine/store.js';
 import type { Telemetry } from '../clients/telemetry.js';
 import { monitorTools } from '../investigate/tools.js';
+import { deployLines, deploysHeading, listDeploys, workloadFor } from '../patrol/deploys.js';
 import { METADATA_PATH, Refused, serverName, type Login } from './login.js';
 import { expiresAt, type User, type Users } from './users.js';
 import type { Issues } from '../patrol/issues.js';
@@ -327,6 +328,30 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       return text(existsSync(f) ? readFileSync(f, 'utf8') : 'none');
     },
   );
+
+  // Code only: kube-state-metrics (and Argo CD when scraped), no AI run, no cost.
+  if (ctx.telemetry)
+    s.registerTool(
+      'deploys',
+      {
+        description:
+          'Deploys in the last N hours (new ReplicaSets; scaling is not a deploy): when, which workload, image old → new, and the rollout state (complete in N min, rolling, stalled, rolled back). Read-only, from kube-state-metrics: no AI run, no cost.',
+        inputSchema: {
+          hours: z.number().int().min(1).max(72).optional().describe('Default 6'),
+          service: z.string().min(1).max(200).optional().describe('One Deployment, or a service name the patrol uses (keycloak, backend-production-mesh)'),
+        },
+        annotations: { readOnlyHint: true },
+      },
+      async ({ hours, service }) => {
+        try {
+          const src = ctx.cfg.sources;
+          const d = await listDeploys(ctx.telemetry!, src, new Date(), hours ?? 6, service && workloadFor(service, src.deploys.aliases));
+          return text(redact([`${deploysHeading(d)}${service ? ` for ${service}` : ''}:`, ...deployLines(d)].join('\n')));
+        } catch (e) {
+          return err(redact((e as Error).message).slice(0, 300));
+        }
+      },
+    );
 
   if (admin) {
     // The identity was checked when the request arrived; an admin removed or

@@ -41,6 +41,19 @@ error_counters:
 workloads:
   namespaces: 'microservices|backend.*'
 
+# Deploys are new ReplicaSets in those namespaces (kube-state-metrics). Scaling
+# is not a deploy: it bumps the generation but creates no ReplicaSet.
+deploys:
+  # Row service -> Deployment where the names differ.
+  aliases:
+    keycloak: keycloak-production
+    backend-production-mesh: backend-production
+  # A starting value: set it from measured rollout durations.
+  stall_minutes: 10
+  # Argo CD app metrics, scraped since argo-cd #1314 (labels verified 2026-11-03).
+  # Off: nothing is read and no blind spot is reported.
+  argocd: true
+
 logs:
   selector: '{namespace="microservices"}'
   # The cheap case-insensitive filter first: the precise regex alone over every

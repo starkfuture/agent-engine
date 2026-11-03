@@ -4,7 +4,7 @@ import type { Config, HttpFamily } from '../config.js';
 import { TEMPO_MAX_MINUTES, type Telemetry } from '../clients/telemetry.js';
 import type { Evidence } from '../engine/evidence.js';
 import type { ToolFactory } from '../engine/run.js';
-import { workloadOf } from '../patrol/collectors.js';
+import { deployLines, deploysHeading, listDeploys } from '../patrol/deploys.js';
 import { fence, redact, templateOf, truncate } from '../engine/text.js';
 
 const H = 3600_000;
@@ -151,7 +151,8 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
           tel.promInstant(`increase(kube_pod_container_status_restarts_total{${ns},${pod}}[6h])`, at),
           tel.promInstant(`kube_pod_container_status_last_terminated_reason{${ns},${pod}}`, at),
           tel.promInstant(`kube_pod_container_status_waiting_reason{${ns},${pod}} > 0`, at),
-          tel.promInstant(`count by (image) (kube_pod_container_info{${ns},${pod}})`, at),
+          // image_spec, not image: for a digest-pinned image, image is a bare sha256.
+          tel.promInstant(`count by (image_spec) (kube_pod_container_info{${ns},${pod}})`, at),
           tel.promInstant(`kube_pod_start_time{${ns},${pod}}`, at),
         ]);
         const out = [
@@ -159,7 +160,7 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
           'restarts (6 h): ' + (restarts.filter((s) => s.value > 0).map((s) => `${s.labels.pod}/${s.labels.container}=${Math.round(s.value)}`).join(', ') || 'none'),
           'last terminated: ' + (term.map((s) => `${s.labels.pod}/${s.labels.container}: ${s.labels.reason}`).join(', ') || 'none'),
           'waiting: ' + (waiting.map((s) => `${s.labels.pod}/${s.labels.container}: ${s.labels.reason}`).join(', ') || 'none'),
-          'images: ' + (images.map((s) => `${s.labels.image} ×${s.value}`).join(', ') || 'none'),
+          'images: ' + (images.map((s) => `${s.labels.image_spec} ×${s.value}`).join(', ') || 'none'),
           'pod starts: ' + (starts.map((s) => `${s.labels.pod} ${new Date(s.value * 1000).toISOString()}`).join(', ') || 'none'),
         ];
         return out.join('\n');
@@ -167,33 +168,11 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
     ),
     tool(
       'recent_changes',
-      'Deployments whose spec changed (rollouts, config changes, restarts) in the last N hours, with times, plus the images they run now.',
+      'Deploys in the last N hours: new ReplicaSets (scaling is not a deploy), with time, image old → new and rollout state (complete in N min, rolling, stalled, rolled back). Also StatefulSets rolling now, and Argo CD syncs when scraped.',
       { hours: z.number().int().min(1).max(72).default(24) },
       guard('recent_changes', async ({ hours }) => {
-        const ns = `namespace=~${q(cfg.sources.workloads.namespaces)}`;
-        const step = 300;
-        const series = await tel.promRange(`max by (namespace, deployment) (kube_deployment_status_observed_generation{${ns}})`, new Date(at.getTime() - hours * H), at, step);
-        const events: string[] = [];
-        for (const s of series)
-          for (let i = 1; i < s.points.length; i++)
-            if (s.points[i]![1] !== s.points[i - 1]![1]) events.push(`${hhmm(s.points[i]![0])}Z ${s.labels.namespace}/${s.labels.deployment} generation ${s.points[i - 1]![1]}→${s.points[i]![1]}`);
-        events.sort();
-        const imgs = await tel.promInstant(`count by (namespace, pod, image) (kube_pod_container_info{${ns}})`, at);
-        const byWorkload = new Map<string, Set<string>>();
-        for (const s of imgs) {
-          const k = `${s.labels.namespace}/${workloadOf(s.labels.pod ?? '?')}`;
-          const set = byWorkload.get(k) ?? new Set();
-          set.add(s.labels.image ?? '?');
-          byWorkload.set(k, set);
-        }
-        const changed = new Set(events.map((e) => e.split(' ')[1]));
-        return [
-          `spec changes in the last ${hours} h (5-min resolution):`,
-          ...(events.length ? events : ['none']),
-          '',
-          'current images of the changed workloads:',
-          ...[...byWorkload.entries()].filter(([k]) => changed.has(k)).map(([k, v]) => `${k}: ${[...v].join(', ')}`),
-        ].join('\n');
+        const d = await listDeploys(tel, cfg.sources, at, hours);
+        return [`${deploysHeading(d)}:`, ...deployLines(d)].join('\n');
       }),
     ),
     tool(

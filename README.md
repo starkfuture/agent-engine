@@ -67,6 +67,7 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 1. **Summary (code, no LLM).** For every source, it compares the last 15 min with the same window **1 h, 1 d and 7 d** earlier:
    - **HTTP:** every route × status that isn't 2xx/3xx, across the V3 services, legacy `/v1`, Keycloak and the mesh, plus traffic drops.
    - **Workloads:** restarts, stuck containers, unavailable replicas.
+   - **Rollouts:** a stalled rollout (replicas not on the new version for 10 min, or the controller's `ProgressDeadlineExceeded`), an Argo CD app Degraded or Missing for 5 min, and a failed Argo CD sync. A rollout row is a state: it is flagged for as long as it holds, and it recovers when the rollout completes.
    - **Error counters:** SQS consumer errors, from every service. A counter has no series until its first error, so an `up` check says whether the services are being scraped. If they are not, the source is blind.
    - **Logs:** error lines grouped into stable templates.
    - **Traces:** error traces by root operation.
@@ -87,7 +88,8 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 
 **What reaches Slack** (with `--post`, and the bot or a webhook): the AI decides, except for what it must never hide.
 
-- **Urgent rows, at once, by code:** a new or worse protected journey (`never_suppress`) or big spike (50+ events and 5× expected). The rows card is posted before the AI starts, with or without it. 6-hour reminders of something already posted are not.
+- **Urgent rows, at once, by code:** a new or worse protected journey (`never_suppress`), a big spike (50+ events and 5× expected) or a rollout row. The rows card is posted before the AI starts, with or without it. 6-hour reminders of something already posted are not. A stalled rollout that completes gets "✅ Back to normal: … · rollout complete" in its thread.
+- **A deploy is never a post by itself.** It is context (below).
 - **Everything else, only as an AI report rated critical or major.** Minor and noise reports, and the rows card itself, stay on disk, where the MCP answers from them. Report cards mention the owners of the services they cover. In Slack a report reads as a header with its level, then two short paragraphs (what's wrong and impact, likely cause and fix); evidence and what wasn't checked stay in the card's file and the run.
 - **Without the AI** (no `--llm`, no credentials, kill switch, budget spent, crash), only urgent rows are posted.
 
@@ -107,6 +109,18 @@ Every post goes through an outbox in the engine's SQLite file (`slack_outbox`):
 Delivery is at least once: if Slack accepts a message but its response is lost, a retry may duplicate it. The outbox prevents overlapping senders from duplicating a post; it cannot make the remote send and the local receipt one transaction.
 
 The incoming webhook (`SLACK_WEBHOOK_URL`) still works as a fallback, without threads.
+
+### Deploys
+
+A deploy is a new ReplicaSet in `microservices|backend.*`, read from kube-state-metrics. It is not a generation change: every service in `microservices` has an HPA, and scaling bumps the generation too. In 48 h on 2026-11-03 there were 82 generation changes and 8 new ReplicaSets. Scaling creates no ReplicaSet.
+
+- **The AI sees the last 6 h** in the patrol summary: time, workload, image before and after (from `image_spec`, so a digest-pinned image shows its tag), and the rollout state: complete in N min, rolling, stalled, rolled back, or replaced by the next deploy.
+- **Rows say when they came after a deploy.** A row whose service deployed in the 2 h before it was first flagged ends with "first flagged 17 min after deploy backend-production 2.2645.0 (11:58Z)". The patrol runs every 15 min, so this is when it was flagged, not when it started. A service maps to its Deployment by name; `deploys.aliases` in `config/sources.yaml` covers the two that differ (`keycloak`, `backend-production-mesh`).
+- **Cards that are posted anyway** get one line: "Deploys in the last 2 h: …".
+- **Argo CD** (scraped since argo-cd #1314; `deploys.argocd` in `config/sources.yaml`, on): app health and syncs, as rows and as context. Off, nothing is read and no blind spot is reported.
+- **`deploys` over MCP** answers "what was deployed" from code, with no AI run and no cost.
+
+A rollback to an older template reuses its old ReplicaSet. It shows on the deploy it undid ("rolled back: 1.2645.5 runs again") while that deploy is in the window.
 
 ### Issues: one cause, one thread
 
@@ -214,7 +228,7 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 | `config/noise.yaml` | Known noise (reason and expiry required) and the never-suppress list. |
 | `config/owners.yaml` | Service → Slack mention on posted cards. Ships with examples only. |
 | `src/clients/telemetry.ts` | Grafana datasource proxy client (Prometheus, Loki, Tempo), plus record and replay. |
-| `src/patrol/` | Collectors, scoring, noise, state, summary, owners, the issue record, and the card digest (ranking, floor, grouping). |
+| `src/patrol/` | Collectors, deploys and rollouts, scoring, noise, state, summary, owners, the issue record, and the card digest (ranking, floor, grouping). |
 | `src/engine/` | The engine: agent loader, run, session (SDK), evidence, guard, ledger, challenge, generic output. |
 | `agents/` | Agent folders: `monitor`, `research`, `codebase`. |
 | `src/investigate/` | Monitor: telemetry tools, task prompt (with the issue list), report schema. |
@@ -283,7 +297,8 @@ claude mcp add --transport http engine http://<host>:8787/mcp --header "Authoriz
 
 Tools: `list_agents`, `list_repos`, `run_agent` (background; `wait_seconds` ≤ 55
 for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
-`proposed_lessons`; admins add `approve_lesson`, `stop_all`, `resume`.
+`proposed_lessons`, `deploys` (code only, read-only: deploys in the last N hours,
+for one service or all); admins add `approve_lesson`, `stop_all`, `resume`.
 
 - Who can read a run: the requester and admins, unless the agent has `visibility: everyone` in agent.yaml (monitor, research and codebase do). Someone else's private run answers like a missing one. Agents that read customer data keep the default.
 - Requests with a browser `Origin` header are refused unless listed in `ENGINE_ALLOWED_ORIGINS`.
@@ -300,7 +315,7 @@ for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 - Retention (`serve`): run folders and cards older than `ENGINE_RETENTION_DAYS` (default 30) are deleted hourly; the SQLite ledger stays. New runs are refused below 200 MB free; `engine_data_free_bytes` feeds an alert.
 - `prod` agent: ask questions about production right now over MCP ("is sign-in failing?", "did the 14:00 deploy go well?"). It gets the monitor's read-only Prometheus/Loki/Tempo tools (`tool_pack: telemetry`), no web, shell or files, and its answers are visible only to the asker. An agent may declare a tool pack only with `sensitive_tools: true`, and never next to web tools.
 - Tempo: regex matches (`=~`, `!~`) are refused; exact matches only.
-- A source that answers with no series at all is reported blind, not healthy: each HTTP family and the workloads source (kube-state-metrics) run a `count(...)` presence check, so a stopped scrape fires the blind-spot alert instead of looking like a quiet system. An error counter has no series until its first error, so it is checked through its `presence` selector instead (`up` for the SQS consumers).
+- A source that answers with no series at all is reported blind, not healthy: each HTTP family, the workloads and rollouts sources (kube-state-metrics) and, when on, Argo CD run a `count(...)` presence check, so a stopped scrape fires the blind-spot alert instead of looking like a quiet system. An error counter has no series until its first error, so it is checked through its `presence` selector instead (`up` for the SQS consumers).
 - Runs are recorded with who asked. Per person: `ENGINE_USER_DAILY_CAP_USD` (default 10)
   and `ENGINE_USER_MAX_RUNNING` (default 2); per agent: `concurrency` in agent.yaml.
 - `ENGINE_NOTIFY_SLACK=1` with `SLACK_WEBHOOK_URL` @-mentions the requester when a run ends. Model text in Slack is escaped, so it can't ping (`<!channel>`) or hide links.

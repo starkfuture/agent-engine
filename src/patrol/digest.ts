@@ -35,7 +35,8 @@ export interface Digest {
 }
 
 // The floor only applies to event counts. Workload rows count pods and
-// restarts, drop rows count traffic (low by definition): their own thresholds hold.
+// restarts, drop rows count traffic (low by definition), rollout rows are a
+// state: their own thresholds hold.
 const EVENTS = new Set<Row['section']>(['http', 'logs', 'traces', 'errors']);
 
 export function bucketOf(r: FlaggedRow, floor: number, prot: boolean): Bucket {
@@ -44,11 +45,12 @@ export function bucketOf(r: FlaggedRow, floor: number, prot: boolean): Bucket {
 }
 
 // Severity for ordering, from the row alone (never the model's opinion):
-// protected journeys, then outages (5xx, traffic drops, workloads), then error
-// counters and traces, then error logs, then client errors (4xx, hang-ups).
+// protected journeys, then outages (5xx, traffic drops, workloads, stalled
+// rollouts), then error counters and traces, then error logs, then client
+// errors (4xx, hang-ups).
 export function tier(r: Row, prot: boolean): number {
   if (prot) return 0;
-  if (r.section === 'drop' || r.section === 'workload' || (r.section === 'http' && /^5/.test(r.status ?? ''))) return 1;
+  if (r.section === 'drop' || r.section === 'workload' || r.section === 'rollout' || (r.section === 'http' && /^5/.test(r.status ?? ''))) return 1;
   if (r.section === 'errors' || r.section === 'traces') return 2;
   if (r.section === 'logs') return 3;
   return 4;

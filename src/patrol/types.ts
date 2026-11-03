@@ -1,6 +1,6 @@
 import type { Counts, Score } from './score.js';
 
-export type Section = 'http' | 'drop' | 'workload' | 'errors' | 'logs' | 'traces';
+export type Section = 'http' | 'drop' | 'workload' | 'rollout' | 'errors' | 'logs' | 'traces';
 
 export interface Row {
   key: string; // stable identity across patrols: section|service|subject|status
@@ -14,12 +14,6 @@ export interface Row {
   detail?: string; // redacted sample line, termination reason, …
   query?: string; // to reproduce in Grafana
   truncated?: boolean; // counts are lower bounds (log line limit hit)
-}
-
-export interface Change {
-  namespace: string;
-  workload: string;
-  changes: number; // generation bumps in the lookback window
 }
 
 export interface SourceHealth {
