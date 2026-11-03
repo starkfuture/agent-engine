@@ -81,6 +81,11 @@ export class State {
     return this.data.rows[key]?.firstSeen;
   }
 
+  // Set once a reported row is seen healthy again; cleared when it fires again.
+  recoveredAt(key: string): string | undefined {
+    return this.data.rows[key]?.recoveredAt;
+  }
+
   // Missing observations leave an issue open, even across several patrols or
   // a restart. Only a successful observation can resolve it, once. Older state
   // has no source/lifecycle markers: consider only the previous patrol's rows.

@@ -6,7 +6,9 @@ import type { FlushResult, PostKind, SlackOutbox } from './slack.js';
 export interface EmitSlack {
   kind: PostKind;
   keys: string[]; // the rows this card is about: they pick the Slack thread
-  broadcast: boolean; // show it in the channel when it lands in an older thread
+  broadcast: boolean; // show it in the channel when it lands in an older thread (in an issue's thread: exactly as given)
+  issue?: string | undefined; // the issue it is about: its thread wins over the rows'
+  repeat?: boolean | undefined; // a quiet reply in the issue's thread, or not posted at all
 }
 
 // Cards always land on disk; Slack only when an outbox is configured AND the

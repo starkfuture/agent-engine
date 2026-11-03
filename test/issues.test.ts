@@ -1,0 +1,407 @@
+import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
+import type { Sample } from '../src/clients/telemetry.js';
+import type { Config } from '../src/config.js';
+import { loadAgent } from '../src/engine/agent.js';
+import type { Session } from '../src/engine/session.js';
+import { Store } from '../src/engine/store.js';
+import { monitorTask } from '../src/investigate/prompt.js';
+import { checkReport, type Report } from '../src/investigate/report.js';
+import { buildServer, type McpContext } from '../src/mcp/server.js';
+import { Users } from '../src/mcp/users.js';
+import { CardSink } from '../src/output/sink.js';
+import { SlackOutbox, type Transport } from '../src/output/slack.js';
+import { Issues } from '../src/patrol/issues.js';
+import { Noise } from '../src/patrol/noise.js';
+import { State } from '../src/patrol/state.js';
+import { patrolOnce, type MonitorAgent, type PatrolResult } from '../src/runner.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { fakeSession, ok } from './fake-session.js';
+import { FakeTelemetry, H, testConfig } from './fake.js';
+
+// ---- the world: legacy /v1 routes whose 400s fire on a schedule -----------------
+
+type Schedule = Record<string, (t: number) => number>; // route → 400s in the window at time t
+const T0 = Date.parse('2026-11-02T08:00:00Z');
+const at = (hours: number) => new Date(T0 + hours * H);
+const between = (from: number, to: number, n = 30) => (t: number) => (t >= T0 + from * H && t < T0 + to * H ? n : 0);
+const key = (route: string) => `http|backend-production|${route}|400`;
+
+function schedule(s: Schedule) {
+  return new FakeTelemetry((query: string, when: Date): Sample[] => {
+    if (query.startsWith('count(kube_pod_container_status_restarts_total')) return [{ labels: {}, value: 120 }];
+    if (!query.includes('backend_be_production_http_requests_total')) return [];
+    return Object.entries(s).flatMap(([route, f]) => [
+      { labels: { route, status_code: '200' }, value: 1000 },
+      { labels: { route, status_code: '400' }, value: f(when.getTime()) },
+    ]);
+  });
+}
+
+// ---- the model: links or not, as the test decides ------------------------------
+
+interface Seen {
+  prompt: string;
+  rows: string[]; // the row keys the task asks it to cover
+  issues: Array<{ id: string; resolved: boolean }>; // the issue list it was shown
+}
+type Decide = (s: Seen) => Partial<Report> & { expectRejected?: RegExp };
+
+const report = (over: Partial<Report> = {}): Report => ({
+  title: 'Sign-in rejects emails with a trailing space',
+  severity: 'major',
+  status: 'active',
+  started_at: '2026-11-02T08:00:00Z',
+  what_broke: 'POST /v1/auth/login returns 400 for valid accounts',
+  impact: '30 failed sign-ins in 15 min',
+  cause: { hypothesis: 'email validation rejects a trailing space', confidence: 'medium' },
+  evidence: [{ id: 'E-abcd-1', quote: 'x', claim: 'the route returns 400' }],
+  suggested_fix: 'trim the email before validating it',
+  not_checked: [],
+  rows: [],
+  issue: 'new',
+  ...over,
+});
+
+function parse(prompt: string): Seen {
+  const rows: string[] = [];
+  let inRows = false;
+  for (const l of prompt.split('\n')) {
+    if (l.startsWith('Row keys to cover')) inRows = true;
+    else if (inRows && l.startsWith('- ')) rows.push(l.slice(2));
+    else if (inRows) inRows = false;
+  }
+  const issues = [...prompt.matchAll(/^- (I-[0-9a-f]{4,6}) · (open|RESOLVED)/gm)].map((m) => ({ id: m[1]!, resolved: m[2] === 'RESOLVED' }));
+  return { prompt, rows, issues };
+}
+
+// One fake investigation per patrol: read one tool result, cite it, submit
+// one report covering every row, as decided. A challenger (big spikes) agrees.
+function model(decide: Decide): Session & { seen: Seen[] } {
+  const seen: Seen[] = [];
+  const session = (req: Parameters<Session>[0]) =>
+    fakeSession(async function* (sim) {
+      if (sim.req.tools.some((t) => t.name === 'submit_challenge')) {
+        await sim.mcp('submit_challenge', { objections: [], overall: 'Holds up: the counts match the evidence.' });
+        yield ok(0.05, 1);
+        return;
+      }
+      const s = parse(sim.req.prompt);
+      seen.push(s);
+      const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+      const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+      const quote = /^\S+ 400 \| [1-9]\d*/m.exec(out.text)![0];
+      const { expectRejected, ...over } = decide(s);
+      const r = await sim.mcp('submit_report', report({ evidence: [{ id, quote, claim: 'the route returns 400' }], rows: s.rows, ...over }));
+      if (expectRejected) {
+        assert.equal(r.isError, true);
+        assert.match(r.text, expectRejected);
+        const again = await sim.mcp('submit_report', report({ evidence: [{ id, quote, claim: 'the route returns 400' }], rows: s.rows, ...over, issue: 'new' }));
+        assert.equal(again.isError, false, again.text);
+      } else assert.equal(r.isError, false, r.text);
+      yield ok(0.1, 3);
+    })(req);
+  return Object.assign(session, { seen });
+}
+
+// The same cause, linked whenever an issue is listed (open or resolved).
+const linker = (over: Partial<Report> = {}): Decide => (s) => ({ ...over, issue: s.issues[0]?.id ?? 'new' });
+
+type Sent = { text: string; thread_ts?: string | undefined; reply_broadcast?: boolean | undefined };
+function bot(): Transport & { sent: Sent[] } {
+  const sent: Sent[] = [];
+  return {
+    threads: true,
+    sent,
+    async post(m) {
+      sent.push({ text: m.text, ...(m.thread_ts ? { thread_ts: m.thread_ts, reply_broadcast: m.reply_broadcast } : {}) });
+      return `1700000000.${String(sent.length).padStart(6, '0')}`;
+    },
+  };
+}
+function webhook(): Transport & { sent: Sent[] } {
+  const sent: Sent[] = [];
+  return { threads: false, sent, post: async (m) => void sent.push({ text: m.text }) };
+}
+
+// A patrol world with one engine.db for the issues and the outbox, as in production.
+function setup(transport: Transport, decide: Decide, o: { issues?: boolean } = {}) {
+  const c: Config = testConfig();
+  const db = join(c.runsDir, 'engine.db');
+  const clock = { now: new Date(T0) };
+  const box = new SlackOutbox(db, transport, { now: () => clock.now, sleep: async () => {}, gapMs: 0 });
+  const sink = new CardSink(c.outDir, box);
+  const issues = o.issues === false ? undefined : new Issues(db);
+  const session = model(decide);
+  const monitor: MonitorAgent = {
+    engine: { store: new Store(db), runsDir: c.runsDir, stopFile: join(c.runsDir, 'STOP'), session, dailyCapUsd: 1000, llmAvailable: true },
+    agent: loadAgent(join(c.agentsDir, 'monitor')),
+  };
+  const state = State.memory();
+  const logs: string[] = [];
+  const patrol = async (tel: FakeTelemetry, hours: number): Promise<PatrolResult> => {
+    clock.now = at(hours);
+    return patrolOnce(tel, c, new Noise({}), state, sink, at(hours), { llm: true, post: true, log: (s) => logs.push(s), issues }, monitor);
+  };
+  return { c, db, box, issues, session, patrol, logs, state };
+}
+
+// ---- the posting rule ---------------------------------------------------------------
+
+test('a linked report replies in the issue thread without broadcast, also more than 24 h later', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(2, 40), '/v1/auth/signup': between(26, 40) });
+  const t = bot();
+  const w = setup(t, linker());
+  const first = await w.patrol(tel, 0);
+  assert.equal(first.filed[0]?.action, 'opened');
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  assert.match(id, /^I-[0-9a-f]{4}$/);
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.sent[0]!.thread_ts, undefined, 'a new issue is a new message');
+  assert.match(JSON.stringify(t.sent[0]), /Major: Sign-in rejects emails/);
+
+  const sibling = await w.patrol(tel, 2); // another flow, same cause
+  assert.equal(sibling.filed[0]?.action, 'linked');
+  assert.deepEqual(w.session.seen[1]!.issues, [{ id, resolved: false }], 'the investigator was shown the open issue');
+  assert.deepEqual(t.sent[1], { text: `🟠 Update on ${id}: Sign-in rejects emails with a trailing space`, thread_ts: '1700000000.000001', reply_broadcast: false });
+
+  const nextDay = await w.patrol(tel, 26); // the rows' 24 h Slack window is over; the issue is still open
+  assert.equal(nextDay.filed[0]?.action, 'linked');
+  assert.deepEqual(t.sent.slice(2), [{ text: `🟠 Update on ${id}: Sign-in rejects emails with a trailing space`, thread_ts: '1700000000.000001', reply_broadcast: false }]);
+  assert.deepEqual(w.issues!.get(id)!.rows, [key('/v1/auth/login'), key('/v1/auth/signup'), key('/v1/ownership/transfer')], "the linked reports' rows joined the issue");
+  assert.ok(w.logs.includes(`report 1 linked to ${id} (no broadcast)`));
+  const card = readFileSync(nextDay.cards.at(-1)!, 'utf8');
+  assert.match(card, new RegExp(`^## 🟠 Update on ${id}: Sign-in rejects emails with a trailing space\\n\\*\\*Issue:\\*\\* ${id} \\(same cause\\)`));
+});
+
+test('an issue id that was not in the list is rejected; the investigator fixes it', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(1, 40) });
+  const t = bot();
+  const w = setup(t, (s) => (s.issues.length ? { issue: 'I-dead', expectRejected: /issue I-dead is not in the issue list/ } : { issue: 'new' }));
+  await w.patrol(tel, 0);
+  const r = await w.patrol(tel, 1);
+  assert.equal(r.filed[0]?.action, 'opened', 'resubmitted as "new"');
+  assert.match(checkReport(report({ issue: 'I-0000', rows: ['k'] }), new Set(['k']), new Set(['I-1234'])).join(), /not in the issue list/);
+  assert.deepEqual(checkReport(report({ issue: 'I-1234', rows: ['k'] }), new Set(['k']), new Set(['I-1234'])), []);
+});
+
+test('a severity rise on an open issue is broadcast', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(1, 40) });
+  const t = bot();
+  const w = setup(t, (s) => (s.issues.length ? { issue: s.issues[0]!.id, severity: 'critical' } : { issue: 'new' }));
+  await w.patrol(tel, 0);
+  const r = await w.patrol(tel, 1);
+  assert.equal(r.filed[0]?.action, 'raised');
+  const id = r.filed[0]!.action === 'raised' ? r.filed[0]!.issue.id : '';
+  assert.deepEqual(t.sent[1], { text: `🔴 Update on ${id}: Sign-in rejects emails with a trailing space`, thread_ts: '1700000000.000001', reply_broadcast: true });
+  assert.equal(w.issues!.get(id)!.severity, 'critical');
+  assert.deepEqual(w.issues!.events(id).map((e) => e.type), ['opened', 'report_linked', 'severity_raised']);
+  assert.ok(w.logs.includes(`report 1 linked to ${id}: severity major → critical (broadcast)`));
+  assert.match(readFileSync(r.cards.at(-1)!, 'utf8'), /\*\*Issue:\*\* I-[0-9a-f]{4} \(severity raised from major\)/);
+});
+
+test('linking to a resolved issue reopens it and is broadcast', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 0.25), '/v1/ownership/transfer': between(3, 40) });
+  const t = bot();
+  const w = setup(t, linker());
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  const back = await w.patrol(tel, 0.25);
+  assert.deepEqual(back.resolved, [id]);
+  assert.equal(w.issues!.get(id)!.status, 'resolved');
+  const again = await w.patrol(tel, 3);
+  assert.deepEqual(w.session.seen[1]!.issues, [{ id, resolved: true }], 'shown as resolved');
+  assert.match(w.session.seen[1]!.prompt, new RegExp(`<<<issues \\(untrusted data[^\\n]*\\n- ${id} · RESOLVED at 2026-11-02T08:15Z · major · Sign-in rejects emails with a trailing space\\n  first seen 2026-11-02T08:00Z · last report 2026-11-02T08:00Z\\n  rows: ${key('/v1/auth/login').replaceAll('|', '\\|')}\\n  latest cause: email validation rejects a trailing space\\n>>>`));
+  assert.equal(again.filed[0]?.action, 'reopened');
+  assert.equal(w.issues!.get(id)!.status, 'open');
+  assert.deepEqual(w.issues!.events(id).map((e) => e.type), ['opened', 'resolved', 'reopened', 'report_linked']);
+  assert.deepEqual(t.sent, [
+    { text: '🟠 Major: Sign-in rejects emails with a trailing space' },
+    { text: `✅ Back to normal at 08:15Z · ${id} resolved: backend-production · /v1/auth/login 400`, thread_ts: '1700000000.000001', reply_broadcast: false },
+    { text: `🟠 Update on ${id}: Sign-in rejects emails with a trailing space`, thread_ts: '1700000000.000001', reply_broadcast: true },
+  ]);
+  assert.ok(w.logs.includes(`report 1 reopened ${id}: it came back (broadcast)`));
+});
+
+test('an issue resolves when every row is back, with one recovery note in its thread', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 0.25), '/v1/ownership/transfer': between(0, 0.5) });
+  const t = bot();
+  const w = setup(t, linker());
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  assert.deepEqual(first.filed[0]!.action === 'opened' && first.filed[0]!.issue.rows, [key('/v1/auth/login'), key('/v1/ownership/transfer')]);
+  const partly = await w.patrol(tel, 0.25);
+  assert.deepEqual(partly.summary.recovered, [key('/v1/auth/login')]);
+  assert.deepEqual(partly.resolved, []);
+  assert.equal(t.sent.length, 1, 'no recovery note while a row of the issue still fires');
+  assert.ok(w.logs.includes(`${id}: 1 of 2 row(s) back to normal, still open`));
+  const all = await w.patrol(tel, 0.5);
+  assert.deepEqual(all.resolved, [id]);
+  assert.equal(t.sent.filter((s) => s.text.includes('Back to normal')).length, 1);
+  assert.deepEqual(t.sent[1], { text: `✅ Back to normal at 08:30Z · ${id} resolved: 2 signals`, thread_ts: '1700000000.000001', reply_broadcast: false });
+  assert.equal(w.issues!.get(id)!.resolved_at, '2026-11-02T08:30:00.000Z');
+  await w.patrol(tel, 0.75);
+  assert.equal(t.sent.length, 2, 'resolved once');
+});
+
+test('webhook: a repeat is not posted (the card and the run keep it); news still is', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(1, 40), '/v1/auth/signup': between(2, 40) });
+  const t = webhook();
+  let n = 0;
+  const w = setup(t, (s) => ({ issue: s.issues[0]?.id ?? 'new', severity: ++n === 3 ? 'critical' : 'major' }));
+  await w.patrol(tel, 0);
+  const repeat = await w.patrol(tel, 1);
+  assert.equal(repeat.filed[0]?.action, 'linked');
+  const id = repeat.filed[0]!.action === 'linked' ? repeat.filed[0]!.issue.id : '';
+  await w.patrol(tel, 2); // major → critical: news
+  assert.deepEqual(t.sent.map((s) => s.text), ['🟠 Major: Sign-in rejects emails with a trailing space', `🔴 Update on ${id}: Sign-in rejects emails with a trailing space`]);
+  assert.ok(w.logs.some((l) => /slack: report post \d+ about I-[0-9a-f]{4} not sent: a repeat, and there is no thread to reply in/.test(l)));
+  assert.ok(existsSync(repeat.cards.at(-1)!), 'the card stays on disk');
+  const answer = readFileSync(join(repeat.investigation!.dir!, 'answer.md'), 'utf8');
+  assert.match(answer, new RegExp(`### Report 1 · linked to ${id} \\(no broadcast\\)`));
+});
+
+test('"new" behaves as before: a new message (in its rows card thread when there is one), and minor is not posted', async () => {
+  // A big spike: the rows card goes first, the AI report lands in its thread unbroadcast, as before.
+  const tel = schedule({ '/v1/auth/login': between(0, 40, 300), '/v1/ownership/transfer': between(1, 40, 20) });
+  const t = bot();
+  let n = 0;
+  const w = setup(t, () => ({ issue: 'new', severity: ++n === 1 ? 'major' : 'minor' }));
+  const first = await w.patrol(tel, 0);
+  assert.deepEqual(t.sent.map((s) => [s.thread_ts ?? 'root', s.reply_broadcast]), [['root', undefined], ['1700000000.000001', false]]);
+  const blocks = JSON.stringify(t.sent);
+  assert.match(blocks, /🟠 Major: Sign-in rejects emails/, 'the header is unchanged');
+  assert.match(readFileSync(first.cards[1]!, 'utf8'), /\*\*Issue:\*\* I-[0-9a-f]{4} \(new issue\)/);
+  const minor = await w.patrol(tel, 1);
+  assert.deepEqual(minor.filed, [{ action: 'none' }], 'a minor "new" report opens no issue');
+  assert.equal(t.sent.length, 2, 'and is not posted');
+  assert.equal(w.issues!.openIssues().length, 1);
+});
+
+test('the new-issue card shows its id in Slack', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const t = bot();
+  const posted: unknown[] = [];
+  const w = setup({ threads: true, post: async (m) => (posted.push(m.blocks), t.post(m)) }, linker());
+  const r = await w.patrol(tel, 0);
+  const id = r.filed[0]!.action === 'opened' ? r.filed[0]!.issue.id : '';
+  assert.match(JSON.stringify(posted[0]), new RegExp(`"text":"New issue ${id} · \\*active\\* since 08:00Z`));
+});
+
+test('get_run shows the issue a monitor report went to', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const w = setup(bot(), linker());
+  const r = await w.patrol(tel, 0);
+  const id = r.filed[0]!.action === 'opened' ? r.filed[0]!.issue.id : '';
+  const users = Users.load(join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json'));
+  users.add('root', { admin: true });
+  const engine = { store: new Store(w.db), runsDir: w.c.runsDir, stopFile: join(w.c.runsDir, 'STOP'), session: w.session, dailyCapUsd: 1000, llmAvailable: true };
+  const ctx: McpContext = { cfg: { ...w.c, mcp: { ...w.c.mcp, usersFile: users.file } }, engine, users, repos: new Map() };
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await buildServer(ctx, users.list().find((u) => u.name === 'root')!).connect(st);
+  const client = new Client({ name: 't', version: '1' });
+  await client.connect(ct);
+  const got = (await client.callTool({ name: 'get_run', arguments: { run_id: r.investigation!.runId } })) as { content: Array<{ text: string }> };
+  assert.match(got.content[0]!.text, new RegExp(`### Report 1 · opened ${id} \\(major\\)`));
+});
+
+// ---- the record and its migration ------------------------------------------------
+
+test('issues: short stable ids, append-only events, the listing is capped and drops old resolved ones', () => {
+  const issues = Issues.memory();
+  const filed = (title: string) => ({ title, severity: 'major' as const, rows: [`k-${title}`], hypothesis: 'h' });
+  for (let i = 0; i < 25; i++) issues.open(filed(`problem ${i}`), new Date(T0 + i * 60_000));
+  const listed = issues.listed(new Date(T0 + H));
+  assert.equal(listed.issues.length, 20);
+  assert.equal(listed.more, 5);
+  assert.equal(listed.issues[0]!.title, 'problem 24', 'most recently reported first');
+  const ids = new Set(issues.openIssues().map((i) => i.id));
+  assert.equal(ids.size, 25);
+  for (const id of ids) assert.match(id, /^I-[0-9a-f]{4,6}$/);
+  const old = listed.issues[0]!.id;
+  issues.resolve(old, new Date(T0 + H));
+  assert.equal(issues.listed(new Date(T0 + 24.5 * H)).issues.some((i) => i.id === old), true, 'resolved less than 24 h ago: still listed');
+  assert.equal(issues.listed(new Date(T0 + 25.5 * H)).issues.some((i) => i.id === old), false, 'resolved a day ago: gone');
+  assert.equal(issues.holding(['k-problem 3'])?.title, 'problem 3');
+  assert.equal(issues.holding(['k-problem 3', 'k-problem 4']), undefined, 'rows of two issues: none holds them all');
+  const db = (issues as unknown as { db: DatabaseSync }).db;
+  assert.throws(() => db.exec(`UPDATE issue_events SET type = 'x'`), /append-only/);
+  assert.throws(() => db.exec(`DELETE FROM issue_events`), /append-only/);
+  assert.match(monitorTask(['k'], { issues: [], more: 0 }), /none open or resolved in the last 24 h, so every report is "issue": "new"/);
+});
+
+test('a fresh engine.db and one from before issues both migrate, and a queued post still goes out', async () => {
+  const fresh = join(mkdtempSync(join(tmpdir(), 'engine-fresh-')), 'engine.db');
+  new Store(fresh);
+  new SlackOutbox(fresh, bot());
+  new Issues(fresh);
+  const tables = (f: string) => (new DatabaseSync(f).prepare(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`).all() as Array<{ name: string }>).map((r) => r.name);
+  const want = ['issue_events', 'issue_rows', 'issues', 'runs', 'slack_issue_threads', 'slack_outbox', 'slack_sender', 'slack_threads'];
+  assert.deepEqual(tables(fresh).filter((n) => n !== 'sqlite_sequence'), want);
+
+  // The schema as shipped before this change, with a post still queued.
+  const old = join(mkdtempSync(join(tmpdir(), 'engine-old-')), 'engine.db');
+  new Store(old);
+  const db = new DatabaseSync(old);
+  db.exec(`
+    CREATE TABLE slack_outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, kind TEXT NOT NULL,
+      keys TEXT NOT NULL, broadcast INTEGER NOT NULL, message TEXT NOT NULL, file TEXT,
+      status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+      sent_at TEXT, ts TEXT, thread_ts TEXT
+    );
+    CREATE INDEX slack_outbox_pending ON slack_outbox (status) WHERE status = 'pending';
+    CREATE TABLE slack_threads (key TEXT PRIMARY KEY, ts TEXT NOT NULL, opened_at TEXT NOT NULL, last_at TEXT NOT NULL);
+    CREATE TABLE slack_sender (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, expires_at TEXT NOT NULL, last_attempt_at INTEGER);
+  `);
+  db.prepare(`INSERT INTO slack_outbox (created_at, kind, keys, broadcast, message, status) VALUES (?, 'rows', '["k"]', 1, ?, 'pending')`).run(new Date().toISOString(), JSON.stringify({ text: 'queued before the upgrade', blocks: [] }));
+  db.close();
+  const t = bot();
+  for (let i = 0; i < 2; i++) new SlackOutbox(old, t, { sleep: async () => {}, gapMs: 0 }); // twice: idempotent
+  new Issues(old);
+  new Issues(old);
+  assert.deepEqual(tables(old).filter((n) => n !== 'sqlite_sequence'), want);
+  const box = new SlackOutbox(old, t, { sleep: async () => {}, gapMs: 0 });
+  assert.equal((await box.flush()).sent, 1);
+  assert.deepEqual(t.sent.map((s) => s.text), ['queued before the upgrade']);
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: false, issue: 'I-abcd', repeat: true, message: { text: 'repeat of an issue never posted: its first post', blocks: [] } });
+  assert.equal((await box.flush()).sent, 1);
+});
+
+// ---- 11-02/03, simulated --------------------------------------------------------
+
+// 21 h of one cause (an email with a trailing space fails validation) reaching
+// different flows at different times, plus rows coming back "worse". The real
+// shadow channel got 6 separate "Major" posts for it. Each patrol here hands
+// the fake investigator only its own rows, like production.
+const NOV2: Schedule = {
+  '/v1/auth/login': (t) => (t >= T0 && t < T0 + 21 * H ? (t >= T0 + 9 * H ? 45 : 20) : 0), // worse at +9 h
+  '/v1/ownership/transfer': (t) => (t >= T0 + 1.5 * H && t < T0 + 21 * H ? (t >= T0 + 17 * H ? 45 : 20) : 0), // worse at +17 h
+  '/v1/auth/signup': between(4, 21, 20),
+  '/v1/auth/password/reset': between(12, 21, 20),
+  '/v1/account/email': between(14.5, 21, 20),
+};
+const SIM_HOURS = Array.from({ length: 21 * 4 }, (_, i) => i / 4);
+
+test('11-02/03 simulated: seven reports on one cause give one message and six quiet replies', async () => {
+  const run = async (issues: boolean) => {
+    const t = bot();
+    const w = setup(t, linker(), { issues });
+    for (const h of SIM_HOURS) await w.patrol(schedule(NOV2), h);
+    return { t, w };
+  };
+  const before = await run(false);
+  const after = await run(true);
+  assert.equal(before.w.session.seen.length, 7, 'seven AI runs either way: this does not change what triggers a run');
+  assert.equal(after.w.session.seen.length, 7);
+  const visible = (s: Sent[]) => s.filter((x) => !x.thread_ts || x.reply_broadcast).length;
+  assert.equal(visible(before.t.sent), 7, 'before: every report showed in the channel');
+  assert.deepEqual(after.t.sent.map((s) => [s.thread_ts ?? 'root', s.reply_broadcast]), [['root', undefined], ...Array(6).fill(['1700000000.000001', false])]);
+  assert.equal(after.w.issues!.openIssues().length, 1);
+  assert.equal(after.w.issues!.openIssues()[0]!.rows.length, 5);
+});
