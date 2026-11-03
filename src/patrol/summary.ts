@@ -123,7 +123,8 @@ export function renderSummary(s: Summary): string {
   }
   if (s.known.length) out.push('', `## Still firing, already reported (${s.known.length})`, ...s.known.map((r) => `- ${rowLine(r)}`));
   if (s.recovered.length) out.push('', `## Recovered since last patrol (${s.recovered.length})`, ...s.recovered.map((k) => `- ${k}`));
-  if (s.changes.length) out.push('', '## Rollouts in the last 2 h', ...s.changes.map((c) => `- ${c.namespace}/${c.workload}: ${c.changes} generation change(s)`));
+  // A generation change is any spec change (a restart, a config edit, a scale), not proof of a deploy.
+  if (s.changes.length) out.push('', '## Workload generation changes in the last 2 h (context, not proof of a deployment)', ...s.changes.map((c) => `- ${c.namespace}/${c.workload}: ${c.changes} generation change(s)`));
   const down = s.sources.filter((x) => !x.ok);
   if (down.length) out.push('', '## Blind spots (sources that failed this patrol)', ...down.map((x) => `- ${x.source}: ${x.error}`));
   if (s.suppressed.length) out.push('', `## Dropped as known noise (${s.suppressed.length})`, ...s.suppressed.map(({ row, rule }) => `- ${row.key} (rule ${rule.id})`));

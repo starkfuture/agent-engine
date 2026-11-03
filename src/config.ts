@@ -21,6 +21,9 @@ const ErrorCounter = z.object({
   id: z.string(),
   selector: z.string(),
   group_by: z.array(z.string()).min(1),
+  // A counter has no series until its first error, so its silence proves
+  // nothing. This selector (an `up` check) must match, or the source is blind.
+  presence: z.string().optional(),
 });
 export type ErrorCounter = z.infer<typeof ErrorCounter>;
 

@@ -502,3 +502,30 @@ test('the patrol loop runs with or without a metrics listener', async () => {
     if (listen) assert.deepEqual(passes.map((d) => d.toISOString()), ['2026-09-29T12:15:00.000Z', '2026-09-29T12:15:00.000Z']);
   }
 });
+
+// ---- error counters and the summary ----------------------------------------------
+
+test('an error counter is blind while its services are not scraped', async () => {
+  const c = cfg();
+  c.sources.error_counters.push({ id: 'sqs', selector: '{__name__=~".+_sqs_message_errors_total"}', group_by: ['app', 'queue'], presence: 'up{job="svc"} == 1' });
+  // No consumer errors in either case: the counter has no series.
+  const up = (n: number) => new FakeTelemetry((q, at) => (q === 'count(up{job="svc"} == 1)' ? (n ? [{ labels: {}, value: n }] : []) : world(q, at)));
+  const source = async (n: number) => (await buildSummary(up(n), c, new Noise({}), State.memory(), new Date('2026-09-28T12:15:00Z'))).sources.find((s) => s.source === 'counter:sqs');
+  assert.deepEqual(await source(3), { source: 'counter:sqs', ok: true });
+  assert.match((await source(0))?.error ?? '', /^no live scrape target series for up\{job="svc"\} == 1 \(missing data, not a quiet system\)$/);
+});
+
+test("the shipped SQS counter reads every service's consumer errors, and checks the services are up", async () => {
+  const { loadConfig } = await import('../src/config.js');
+  const sqs = loadConfig({}).sources.error_counters.find((x) => x.id === 'sqs-consumer-errors')!;
+  const name = new RegExp(`^(?:${/__name__=~"([^"]+)"/.exec(sqs.selector)![1]})$`); // PromQL regexes are anchored
+  for (const metric of ['erp_broker_svc_sqs_message_errors_total', 'app_svc_sqs_message_errors_total']) assert.match(metric, name);
+  assert.deepEqual(sqs.group_by, ['app', 'queue', 'error_type']);
+  assert.match(sqs.presence ?? '', /^up\{.+\} == 1$/);
+});
+
+test('the summary calls generation changes what they are, not rollouts', () => {
+  const s = { at: '2026-09-29T12:15:00.000Z', windowMinutes: 15, send: [], known: [], suppressed: [], recovered: [], changes: [{ namespace: 'microservices', workload: 'auth-service', changes: 2 }], sources: [] };
+  assert.match(renderSummary(s), /\n## Workload generation changes in the last 2 h \(context, not proof of a deployment\)\n- microservices\/auth-service: 2 generation change\(s\)/);
+  assert.doesNotMatch(renderSummary(s), /Rollouts/);
+});

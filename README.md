@@ -67,7 +67,7 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 1. **Summary (code, no LLM).** For every source, it compares the last 15 min with the same window **1 h, 1 d and 7 d** earlier:
    - **HTTP:** every route × status that isn't 2xx/3xx, across the V3 services, legacy `/v1`, Keycloak and the mesh, plus traffic drops.
    - **Workloads:** restarts, stuck containers, unavailable replicas.
-   - **Error counters:** for example SQS consumer errors.
+   - **Error counters:** SQS consumer errors, from every service. A counter has no series until its first error, so an `up` check says whether the services are being scraped. If they are not, the source is blind.
    - **Logs:** error lines grouped into stable templates.
    - **Traces:** error traces by root operation.
 2. **Filter.** Steady rows, known noise (`config/noise.yaml`) and already-reported rows are dropped. A quiet patrol ends here and costs $0.
@@ -117,7 +117,7 @@ What a report posts:
 
 The rows of a linked report join the issue. Urgent rows that all belong to one open issue are posted in its thread, still shown in the channel. When every row of an open issue is back to normal (healthy observers required, as for any recovery), the issue is resolved and its thread gets one "✅ Back to normal · I-7f3a resolved" note; its rows get no recovery note of their own, also while some of them still fire.
 
-Patrol logs say what each report did (`report 1 linked to I-7f3a (no broadcast)`, `I-7f3a resolved: all 3 row(s) back to normal`); `get_run` on a monitor run shows each report with its issue. A linked repeat still costs an AI run: this changes what is posted, not what triggers a run. The buttons below do cut runs.
+Patrol logs say what each report did (`report 1 linked to I-7f3a (no broadcast)`, `I-7f3a resolved: all 3 row(s) back to normal`); `get_run` on a monitor run shows each report with its issue. Runs from before `answer.md` was written show their reports from `output.json`. Slack delivery shows as unknown: a run isn't linked to its posts yet. A linked repeat still costs an AI run: this changes what is posted, not what triggers a run. The buttons below do cut runs.
 
 ### The buttons: On it and Not an issue
 
@@ -290,7 +290,7 @@ for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 - Retention (`serve`): run folders and cards older than `ENGINE_RETENTION_DAYS` (default 30) are deleted hourly; the SQLite ledger stays. New runs are refused below 200 MB free; `engine_data_free_bytes` feeds an alert.
 - `prod` agent: ask questions about production right now over MCP ("is sign-in failing?", "did the 14:00 deploy go well?"). It gets the monitor's read-only Prometheus/Loki/Tempo tools (`tool_pack: telemetry`), no web, shell or files, and its answers are visible only to the asker. An agent may declare a tool pack only with `sensitive_tools: true`, and never next to web tools.
 - Tempo: regex matches (`=~`, `!~`) are refused; exact matches only.
-- A source that answers with no series at all is reported blind, not healthy: each HTTP family and the workloads source (kube-state-metrics) run a `count(...)` presence check, so a stopped scrape fires the blind-spot alert instead of looking like a quiet system. Error counters are exempt: a labelled counter has no series until its first error.
+- A source that answers with no series at all is reported blind, not healthy: each HTTP family and the workloads source (kube-state-metrics) run a `count(...)` presence check, so a stopped scrape fires the blind-spot alert instead of looking like a quiet system. An error counter has no series until its first error, so it is checked through its `presence` selector instead (`up` for the SQS consumers).
 - Runs are recorded with who asked. Per person: `ENGINE_USER_DAILY_CAP_USD` (default 10)
   and `ENGINE_USER_MAX_RUNNING` (default 2); per agent: `concurrency` in agent.yaml.
 - `ENGINE_NOTIFY_SLACK=1` with `SLACK_WEBHOOK_URL` @-mentions the requester when a run ends. Model text in Slack is escaped, so it can't ping (`<!channel>`) or hide links.

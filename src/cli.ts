@@ -239,6 +239,7 @@ async function doctor(cfg: Config) {
       const have = new Set(res.flatMap((s) => Object.keys(s.labels)));
       const missing = c.group_by.filter((l) => !have.has(l));
       console.log(`  counter ${c.id}: ${res.length ? 'OK' : 'NO SERIES'}${missing.length ? `  MISSING LABELS: ${missing.join(', ')}` : ''}${res[0] ? `  labels: ${[...have].sort().join(', ')}` : ''}`);
+      if (c.presence) console.log(`    presence ${c.presence}: ${(await tel.promInstant(`count(${c.presence})`, now))[0]?.value ?? 'NO SERIES (the source would be blind)'}`);
     } catch (e) {
       console.log(`  counter ${c.id}: ERROR ${(e as Error).message}`);
     }

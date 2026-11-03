@@ -31,9 +31,12 @@ http_families:
 
 # Counters where any increase is bad, compared against the same baselines.
 error_counters:
+  # Every service's consumer errors (erp-broker's are erp_broker_svc_…).
   - id: sqs-consumer-errors
-    selector: 'app_svc_sqs_message_errors_total'
-    group_by: [app, queue]       # queue label UNVERIFIED
+    selector: '{__name__=~".+_sqs_message_errors_total"}'
+    group_by: [app, queue, error_type] # verified against live series 2026-11-02
+    # No errors is also what a stopped scrape looks like: the services must be up.
+    presence: 'up{job="backend-microservices"} == 1' # job seen on microservices targets 2026-11-02; doctor shows the count
 
 workloads:
   namespaces: 'microservices|backend.*'

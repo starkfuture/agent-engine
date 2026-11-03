@@ -1,8 +1,13 @@
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { z } from 'zod';
+import { Report } from '../investigate/report.js';
+import { reportCard } from '../output/card.js';
 import type { LoadedAgent } from './agent.js';
+import type { ChallengeResult } from './challenge.js';
 import { renderFindings, type Findings } from './output.js';
 import type { RunResult } from './run.js';
+import type { RunRow } from './store.js';
 import { redact, stripImages } from './text.js';
 
 // The human-readable answer of a findings run, with the challenger's blocking
@@ -18,4 +23,43 @@ export function writeAnswer(agent: LoadedAgent, r: RunResult<Findings>): string 
   const md = stripImages(redact(renderFindings(f, `${agent.spec.name}@${agent.version} · run ${r.runId} · $${r.cost.toFixed(2)}${verdict}${read}`, dissent)));
   if (r.dir) writeFileSync(join(r.dir, 'answer.md'), md + '\n');
   return md;
+}
+
+// A monitor run's reports, from its output.json; undefined for any other run.
+// Reports from before the issue record have no `issue`.
+const StoredReports = z.array(Report.partial({ issue: true })).min(1);
+export type StoredReport = z.infer<typeof StoredReports>[number];
+
+export function monitorReports(dir: string): StoredReport[] | undefined {
+  try {
+    return StoredReports.parse(JSON.parse(readFileSync(join(dir, 'output.json'), 'utf8')));
+  } catch {
+    return undefined;
+  }
+}
+
+const Objection = z.object({ claim: z.string(), failure_scenario: z.string(), settling_check: z.string(), evidence: z.array(z.string()), blocking: z.boolean() });
+const StoredChallenge = z.object({
+  verdict: z.enum(['upheld', 'escalate', 'error']),
+  overall: z.string(),
+  blocking: z.array(Objection),
+  notes: z.array(Objection),
+  cost: z.number(),
+  turns: z.number(),
+  toolCalls: z.number(),
+  note: z.string().optional(),
+});
+
+// get_run's answer for a monitor run from before answer.md was written: its
+// reports, rendered as their cards were. A challenge.json that can't be read
+// leaves the cards unchallenged; get_run says so separately.
+export function storedMonitorAnswer(dir: string, row: RunRow, reports: StoredReport[]): string {
+  let challenge: ChallengeResult | undefined;
+  try {
+    challenge = StoredChallenge.parse(JSON.parse(readFileSync(join(dir, 'challenge.json'), 'utf8')));
+  } catch {
+    /* no challenge, or an unreadable one */
+  }
+  const cards = reports.flatMap((r, i) => [`### Report ${i + 1}`, '', reportCard({ ...r, issue: r.issue ?? 'new' }, row.started_at, `run ${row.id}`, challenge).markdown, '']);
+  return stripImages(redact([`# Monitor reports · run started ${row.started_at}`, '', ...cards].join('\n')));
 }
