@@ -276,3 +276,45 @@ test('turning the buttons on keeps the destination: open threads keep their repl
   assert.deepEqual(updates, ['1700000000.000001'], 'the open issue gets its buttons on its first message');
   assert.deepEqual(after.status(), [{ status: 'sent', n: 4 }]);
 });
+
+test('a message update waiting for Retry-After keeps waiting when a newer click replaces it', async () => {
+  const c = clock('2026-10-31T10:00:00Z');
+  let updates = 0;
+  const t: Transport = {
+    threads: true,
+    post: async () => '1700000000.000001',
+    update: async () => {
+      if (++updates === 1) throw new SlackError('Slack: rate limited', 120);
+    },
+  };
+  const box = new SlackOutbox(':memory:', t, { now: c.now, sleep: async () => {}, gapMs: 0, controls: () => [{ type: 'actions', elements: [] }] });
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('new issue, with its buttons') });
+  await box.flush();
+  box.updateRoot('I-abcd'); // a click
+  await box.flush();
+  assert.equal(updates, 1, 'rate limited for 120 s');
+  box.updateRoot('I-abcd'); // another click replaces the waiting update
+  await box.flush();
+  assert.equal(updates, 1, "the newer update waits for Slack's Retry-After too");
+  c.advance(2.1);
+  assert.deepEqual(await box.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
+  assert.equal(updates, 2);
+  assert.deepEqual(box.status(), [{ status: 'sent', n: 2 }, { status: 'superseded', n: 1 }]);
+});
+
+test('posts sent before in_channel existed count for the reminder clock when they were top-level or broadcast', async () => {
+  const bot = fakeBot();
+  const { box, c } = outbox(bot);
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('new issue') });
+  await box.flush();
+  c.advance(20 * 60);
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('raised: shown in the channel') });
+  await box.flush();
+  c.advance(60);
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: false, issue: 'I-abcd', repeat: true, message: msg('the same cause, quietly') });
+  await box.flush();
+  assert.equal(box.newsAt('I-abcd'), '2026-11-01T06:00:00.000Z');
+  // The same rows as an older image left them: no in_channel.
+  (box as unknown as { db: DatabaseSync }).db.exec(`UPDATE slack_outbox SET in_channel = NULL`);
+  assert.equal(box.newsAt('I-abcd'), '2026-11-01T06:00:00.000Z', 'the broadcast reply counts, the quiet one does not');
+});

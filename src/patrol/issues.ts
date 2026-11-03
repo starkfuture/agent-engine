@@ -80,6 +80,7 @@ export type Click = Disposition['kind'] | 'undo';
 export type Clicked =
   | { result: 'unknown' }
   | { result: 'resolved'; issue: Issue }
+  | { result: 'stale'; issue: Issue } // this click, or a later one, is already recorded
   | { result: 'unchanged' | 'changed'; issue: Issue; now?: Disposition | undefined };
 
 // A noise-rule candidate: an issue someone marked Not an issue (an Undo takes
@@ -246,24 +247,30 @@ export class Issues {
   // A click on the issue's Slack message. Only an open issue changes, and the
   // same click again changes nothing (so Slack is updated once). A later click
   // replaces an earlier one: the last person to say On it is on it.
-  click(id: string, click: Click, by: string, at: Date): Clicked {
+  // `actionTs` is Slack's time of the click: a click Slack delivers again, or
+  // one older than a click already recorded, changes nothing.
+  click(id: string, click: Click, by: string, at: Date, actionTs?: string): Clicked {
     return this.tx((): Clicked => {
       const row = this.row(id);
       if (!row) return { result: 'unknown' };
       const issue = this.full(row);
       if (row.status !== 'open') return { result: 'resolved', issue };
+      // Slack's times compare as text: ten digits, a dot, six digits.
+      if (actionTs && this.db.prepare(`SELECT 1 FROM issue_events WHERE issue_id = ? AND type IN ('acknowledged', 'dismissed', 'undone') AND (json_extract(data, '$.action_ts') > ? OR (json_extract(data, '$.action_ts') = ? AND json_extract(data, '$.by') = ?))`).get(id, actionTs, actionTs, by))
+        return { result: 'stale', issue };
       const before = this.disposition(id, at);
+      const ts = actionTs ? { action_ts: actionTs } : {};
       if (click === 'undo') {
         if (!before) return { result: 'unchanged', issue };
         this.clear(id);
-        this.event(id, 'undone', at, { by, was: before.kind, was_by: before.by });
+        this.event(id, 'undone', at, { by, ...ts, was: before.kind, was_by: before.by });
         return { result: 'changed', issue };
       }
       if (before?.kind === click && before.by === by) return { result: 'unchanged', issue, now: before };
       const now: Disposition = { kind: click, by, at: at.toISOString(), ...(click === 'dismissed' ? { until: new Date(at.getTime() + MUTE_DAYS * DAY).toISOString() } : {}) };
       this.db.prepare(`UPDATE issues SET disposition = ?, disposed_by = ?, disposed_at = ?, muted_until = ? WHERE id = ?`).run(now.kind, by, now.at, now.until ?? null, id);
       // A dismissal is a noise-rule candidate: it keeps the rows it was about.
-      this.event(id, click, at, { by, ...(now.until ? { until: now.until, rows: issue.rows } : {}) });
+      this.event(id, click, at, { by, ...ts, ...(now.until ? { until: now.until, rows: issue.rows } : {}) });
       return { result: 'changed', issue, now };
     });
   }

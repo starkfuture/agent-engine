@@ -234,14 +234,21 @@ export class SlackOutbox {
   // When the channel last saw a post about this issue, by Slack's answer, not
   // by when it was queued: the issue's first message (or the rows card it
   // started under), or a later post shown in the channel. The reminder clock.
+  // Posts sent before in_channel existed count when top-level or broadcast.
   newsAt(issue: string): string | undefined {
     const r = this.db
       .prepare(
         `SELECT MAX(at) AS at FROM (SELECT opened_at AS at FROM slack_issue_threads WHERE issue = ?
-         UNION ALL SELECT sent_at FROM slack_outbox WHERE issue = ? AND status = 'sent' AND kind <> 'root' AND (in_channel = 1 OR (in_channel IS NULL AND thread_ts IS NULL)))`,
+         UNION ALL SELECT sent_at FROM slack_outbox WHERE issue = ? AND status = 'sent' AND kind <> 'root' AND (in_channel = 1 OR (in_channel IS NULL AND (thread_ts IS NULL OR broadcast = 1))))`,
       )
       .get(issue, issue) as { at: string | null };
     return r.at ?? undefined;
+  }
+
+  // News about this issue for the channel (top-level or broadcast) still
+  // queued: Slack hasn't taken it yet, so a reminder would only add to it.
+  newsPending(issue: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM slack_outbox WHERE issue = ? AND status = 'pending' AND broadcast = 1 AND kind <> 'recovered'`).get(issue);
   }
 
   // Show the issue's first message again with its buttons as they now stand
@@ -252,10 +259,12 @@ export class SlackOutbox {
     if (!this.o.controls) return;
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      // The update it replaces may be waiting for Slack's Retry-After: so does this one.
+      const was = this.db.prepare(`SELECT attempts, next_attempt_at FROM slack_outbox WHERE kind = 'root' AND issue = ? AND status = 'pending_update' ORDER BY id DESC LIMIT 1`).get(issue) as { attempts: number; next_attempt_at: string | null } | undefined;
       this.db.prepare(`UPDATE slack_outbox SET status = 'superseded' WHERE kind = 'root' AND issue = ? AND status = 'pending_update'`).run(issue);
       this.db
-        .prepare(`INSERT INTO slack_outbox (created_at, kind, keys, broadcast, message, status, issue) VALUES (?, 'root', '[]', 0, '{"text":"","blocks":[]}', 'pending_update', ?)`)
-        .run(this.o.now().toISOString(), issue);
+        .prepare(`INSERT INTO slack_outbox (created_at, kind, keys, broadcast, message, status, issue, attempts, next_attempt_at) VALUES (?, 'root', '[]', 0, '{"text":"","blocks":[]}', 'pending_update', ?, ?, ?)`)
+        .run(this.o.now().toISOString(), issue, was?.attempts ?? 0, was?.next_attempt_at ?? null);
       this.db.exec('COMMIT');
     } catch (e) {
       this.db.exec('ROLLBACK');

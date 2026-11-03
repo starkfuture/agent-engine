@@ -110,7 +110,7 @@ What a report posts:
 |---|---|---|
 | `new`, critical or major | a new message (or a reply on its urgent rows card, as before); opens the issue | a message |
 | same issue, same or lower severity | a reply in the issue's thread, **not** shown in the channel, also after 24 h | nothing (the card and `get_run` keep it) |
-| same issue, but the channel has heard nothing about it for 24 h (no new, raised, reopened or reminder post, and no urgent rows card in its thread, counted when Slack accepted it, not when it was queued) | a reply in its thread, also shown in the channel (at most once a day per open issue, so a chronic one isn't hidden for good) | a message |
+| same issue, but the channel has heard nothing about it for 24 h (no new, raised, reopened or reminder post, and no urgent rows card in its thread, counted when Slack accepted it, not when it was queued) | a reply in its thread, also shown in the channel (at most once a day per open issue, so a chronic one isn't hidden for good; not while news about it is still queued) | a message |
 | same issue, severity rises (major → critical) | a reply in its thread, also shown in the channel | a message |
 | a resolved issue (it came back) | reopens it; a reply in its thread, also shown in the channel | a message |
 | minor or noise | not posted, as before; a linked one's rows still join the issue | nothing |
@@ -135,7 +135,7 @@ With Socket Mode on (`SLACK_APP_TOKEN`; setup in `slack/README.md`), an issue's 
 | it never resolves | On it stays | the mute ends after 7 days |
 
 - **Undo** takes either back. Not an issue asks to confirm first.
-- **The latest click wins**, and the same click twice changes nothing. Two clicks before Slack is reached make one update.
+- **The latest click wins**, by Slack's click time, and the same click twice changes nothing. A click Slack delivers again, or one older than a click already recorded, changes nothing. Two clicks before Slack is reached make one update.
 - **Not an issue is a noise-rule candidate**, recorded with its rows, who and when. Admins read the list with the MCP tool `noise_candidates`. A rule that hides rows for good stays a reviewed change to `config/noise.yaml`.
 - **Every click is checked:** our app, our workspace, our channel, and a message that is an open issue's first message. Anything else gets a reply that nothing changed.
 - **The click is recorded before Slack is acknowledged**, in `issues` and the append-only `issue_events` (acknowledged, dismissed, undone, mute_lifted, worse_noted). The message update goes through the outbox, after any post queued before it.

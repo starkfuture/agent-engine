@@ -78,6 +78,7 @@ export interface FileOptions {
   // When the channel last saw a post about the issue, once Slack accepted it
   // (the outbox). Unset, or nothing delivered yet: the record's queued news.
   newsAt?: ((issue: string) => string | undefined) | undefined;
+  newsPending?: ((issue: string) => boolean) | undefined; // news for the channel about it still queued: no reminder on top
   breaksMute?: ((key: string) => boolean) | undefined; // a row Not an issue can't silence (see breaksMute)
 }
 
@@ -97,7 +98,7 @@ export function fileReport(issues: Issues, r: Report, at: Date, run?: string, o:
   if (d?.kind === 'dismissed' && !r.rows.some((k) => o.breaksMute?.(k))) return { action: 'muted', issue: l.issue };
   // Someone is on it: no reminder in the channel.
   const news = o.newsAt?.(l.issue.id) ?? l.lastNewsAt;
-  if (POSTED.has(r.severity) && d?.kind !== 'acknowledged' && news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000) {
+  if (POSTED.has(r.severity) && d?.kind !== 'acknowledged' && news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000 && !o.newsPending?.(l.issue.id)) {
     issues.remind(l.issue.id, at, run);
     return { action: 'reminded', issue: l.issue };
   }
@@ -332,6 +333,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     let quiet = 0;
     const filing: FileOptions = {
       newsAt: o.post && sink.outbox ? (id) => sink.outbox!.newsAt(id) : undefined,
+      newsPending: o.post && sink.outbox ? (id) => sink.outbox!.newsPending(id) : undefined,
       breaksMute: (k) => !!byKey.get(k) && breaksMute(byKey.get(k)!, noise),
     };
     for (const [i, r] of inv.outputs.entries()) {

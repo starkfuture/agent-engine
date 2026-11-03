@@ -122,7 +122,10 @@ const OPEN = [ACTION.acknowledged, ACTION.dismissed];
 
 const IDS: ButtonIds = { app: 'A0TESTAPP', team: 'T0TESTTEAM', channel: 'C0TEST123' };
 const RESPONSE = 'https://hooks.slack.com/actions/T0TESTTEAM/1700000100/AbCdEf';
-function payload(action: string, issue: string, o: { user?: string; ts?: string; app?: string; team?: string; channel?: string } = {}) {
+// Each click has its own time from Slack (action_ts), later than the one before.
+let clicks = 0;
+const nextActionTs = () => `1700000100.${String(++clicks).padStart(6, '0')}`;
+function payload(action: string, issue: string, o: { user?: string; ts?: string; app?: string; team?: string; channel?: string; actionTs?: string } = {}) {
   const channel = o.channel ?? IDS.channel;
   return {
     type: 'block_actions',
@@ -133,7 +136,7 @@ function payload(action: string, issue: string, o: { user?: string; ts?: string;
     container: { type: 'message', message_ts: o.ts ?? ROOT, channel_id: channel, is_ephemeral: false },
     response_url: RESPONSE,
     trigger_id: '1.2.3',
-    actions: [{ action_id: action, block_id: 'issue_buttons', value: issue, type: 'button', action_ts: '1700000100.000100' }],
+    actions: [{ action_id: action, block_id: 'issue_buttons', value: issue, type: 'button', action_ts: o.actionTs ?? nextActionTs() }],
   };
 }
 
@@ -368,6 +371,29 @@ test('a click from elsewhere or on a message that is not an issue gets a reply a
   assert.deepEqual(w.issues.events(id).map((e) => e.type), ['opened']);
   assert.deepEqual(w.t.updates, []);
   assert.equal(w.t.sent.length, 1);
+});
+
+test('a click Slack delivers again, or one older than a recorded click, changes nothing', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const w = setup();
+  const id = opened(await w.patrol(tel, 0));
+  const ctx = { issues: w.issues, outbox: w.box, ids: IDS, now: () => w.clock.now };
+  const dismiss = payload(ACTION.dismissed, id, { user: 'U0BOB' });
+  onClick(dismiss, ctx);
+  await w.box.flush();
+  await w.click('undo', id, { user: 'U0BOB' });
+  // The same envelope again, after a lost acknowledgement: no new mute.
+  const replay = onClick(dismiss, ctx);
+  assert.equal(replay.reply, `${id} has a later click than this one. Nothing changed.`);
+  assert.equal(replay.updated, undefined);
+  assert.equal(w.issues.disposition(id, w.clock.now), undefined);
+  // Out of order: Alice clicked On it before Bob's Not an issue, and arrives after it.
+  const alice = payload(ACTION.acknowledged, id, { user: 'U0ALICE' });
+  const bob = payload(ACTION.dismissed, id, { user: 'U0BOB' });
+  onClick(bob, ctx);
+  assert.equal(onClick(alice, ctx).updated, undefined);
+  assert.equal(w.issues.disposition(id, w.clock.now)?.kind, 'dismissed');
+  assert.deepEqual(w.issues.events(id).map((e) => e.type), ['opened', 'dismissed', 'undone', 'dismissed']);
 });
 
 test('a duplicate click makes one update; two clicks before a flush make one too', async () => {

@@ -47,7 +47,7 @@ export function controlsFor(issues: Issues, now: () => Date = () => new Date()):
 }
 
 // The parts of a block_actions payload we read. Anything else is ignored.
-const TS = /^\d{9,}\.\d{6}$/;
+const TS = /^\d{10}\.\d{6}$/;
 const Payload = z.object({
   type: z.literal('block_actions'),
   api_app_id: z.string(),
@@ -56,7 +56,7 @@ const Payload = z.object({
   channel: z.object({ id: z.string() }).nullish(),
   container: z.object({ type: z.string(), message_ts: z.string().optional(), channel_id: z.string().optional(), is_ephemeral: z.boolean().optional() }),
   response_url: z.string().max(500).optional(),
-  actions: z.array(z.object({ action_id: z.string(), value: z.string().max(20).optional() })).length(1),
+  actions: z.array(z.object({ action_id: z.string(), value: z.string().max(20).optional(), action_ts: z.string().regex(TS) })).length(1),
 });
 
 // Ephemeral replies go to the response_url Slack sent with the click, and nowhere else.
@@ -92,8 +92,9 @@ export function onClick(body: unknown, o: { issues: Issues; outbox: SlackOutbox;
   const id = ts ? o.outbox.issueAt(ts) : undefined;
   if (!id || a.value !== id) return nothing("This message isn't an issue the engine tracks.");
   const now = (o.now ?? (() => new Date()))();
-  const r = o.issues.click(id, click, b.user.id, now);
+  const r = o.issues.click(id, click, b.user.id, now, a.action_ts);
   if (r.result === 'unknown') return nothing("This message isn't an issue the engine tracks.");
+  if (r.result === 'stale') return nothing(`${id} has a later click than this one.`);
   if (r.result === 'resolved') return nothing(`${id} is resolved.`);
   if (r.result === 'unchanged')
     return nothing(click === 'undo' ? `${id} has no On it or Not an issue to undo.` : `${id} is already marked ${click === 'acknowledged' ? 'On it' : 'Not an issue'} by you.`);

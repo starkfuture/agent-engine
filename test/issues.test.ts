@@ -312,6 +312,25 @@ test('the reminder clock counts what Slack accepted: a rows card it refused is n
   assert.deepEqual([t.sent.at(-1)!.thread_ts, t.sent.at(-1)!.reply_broadcast], ['1700000000.000001', true]);
 });
 
+test('a reminder Slack has not taken yet holds the next one: no pile of broadcasts when it comes back', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/auth/signup': between(25, 40), '/v1/auth/reset': between(26, 40) });
+  const t = bot();
+  let down = false;
+  // Slack refuses replies shown in the channel for a while; the rest goes out.
+  const flaky: Transport = { threads: true, post: async (m) => (down && m.reply_broadcast ? Promise.reject(new SlackError('Slack: HTTP 503')) : t.post(m)) };
+  const w = setup(flaky, linker());
+  await w.patrol(tel, 0);
+  down = true;
+  const late = await w.patrol(tel, 25); // the channel last saw the issue 25 h ago
+  assert.equal(late.filed[0]?.action, 'reminded');
+  const next = await w.patrol(tel, 26);
+  assert.equal(next.filed[0]?.action, 'linked', 'the first reminder is still queued: no second one');
+  down = false;
+  await w.patrol(tel, 26.25);
+  assert.equal(t.sent.filter((s) => s.reply_broadcast).length, 1, 'one reminder in the channel');
+  assert.deepEqual(w.box.status(), [{ status: 'sent', n: 3 }]);
+});
+
 test("a new cause on an open issue's rows gets its own message, not that issue's thread", async () => {
   const login = (t: number) => (t >= T0 && t < T0 + 40 * H ? (t >= T0 + 0.25 * H ? 45 : 20) : 0);
   const tel = schedule({ '/v1/auth/login': login });
