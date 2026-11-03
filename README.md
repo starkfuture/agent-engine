@@ -72,8 +72,17 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
    - **Traces:** error traces by root operation.
 2. **Filter.** Steady rows, known noise (`config/noise.yaml`) and already-reported rows are dropped. A quiet patrol ends here and costs $0.
 3. **Card first.** The rows card goes to `out/cards/` before any AI runs. If the investigator crashes, the rows are still marked reported.
-4. **Investigate.** Only if something new is big enough to read (a "to look at" row, below), the engine runs the `monitor` agent. Small or still-firing rows on their own don't spend a run. It has read-only telemetry tools and no shell, files or web, and must submit schema-checked reports that cite evidence ids.
+4. **Investigate.** Only if a row the investigator still owes an answer is big enough to read (a "to look at" row, below), the engine runs the `monitor` agent. Small rows on their own don't spend a run. It has read-only telemetry tools and no shell, files or web, and must submit schema-checked reports that cite evidence ids.
 5. **Challenge.** For protected journeys or big spikes (a deterministic gate, never the model's severity), a challenger re-checks the report. Its verdict goes on the card.
+
+**What a run covers.** A row is owed an answer until an AI report covers it. The state file keeps this per row.
+- New and worse rows join the next run. So do rows an earlier run didn't cover. A patrol with only such older rows writes no card: its run is the record.
+- A row that a run leaves uncovered gets one more try. After two tries it is given up. The patrol log says so; nothing is posted.
+- A run that never started (a spend cap reached, kill switch on, the engine's database locked) or was stopped (kill switch, cancel) doesn't count as a try. The rows wait for the next run.
+- While the same cap or the kill switch holds, the patrol records one skipped run for the whole hold, not one per patrol. The rows run as soon as it lifts. A daily cap's hold ends with its UTC day.
+- A 6-hour reminder of a row already explained doesn't join a run, so it isn't reported again. It stays on the card as still ongoing.
+- A row that recovered and fired again is a new episode. It is investigated at its reminder, as before (or sooner if worse), with fresh tries, and its report can reopen its issue. A row that flickers isn't investigated every time it comes back. Tries still owed when a row recovers end there.
+- Rows saved before this was recorded get one investigation at their next reminder.
 
 **What reaches Slack** (with `--post`, and the bot or a webhook): the AI decides, except for what it must never hide.
 

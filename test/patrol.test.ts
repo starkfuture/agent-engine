@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { test } from 'node:test';
 import type { Config } from '../src/config.js';
@@ -17,7 +17,7 @@ import type { Engine } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
 import type { FlaggedRow } from '../src/patrol/summary.js';
 import { needsChallenge, patrolOnce, type MonitorAgent, patrolLoop } from '../src/runner.js';
-import { fakeSession, ok } from './fake-session.js';
+import { fakeSession, ok, say, type Script } from './fake-session.js';
 import { DAY, FakeTelemetry, H, INCIDENT_START, testConfig as cfg, world } from './fake.js';
 
 test('incident rows are flagged, steady noise is not', async () => {
@@ -501,6 +501,215 @@ test('the patrol loop runs with or without a metrics listener', async () => {
     assert.ok(queries > 0, `patrol queried telemetry (listener: ${listen})`);
     if (listen) assert.deepEqual(passes.map((d) => d.toISOString()), ['2026-09-29T12:15:00.000Z', '2026-09-29T12:15:00.000Z']);
   }
+});
+
+// ---- what the investigator still owes an answer ----------------------------------
+
+const LOGIN = 'http|backend-production|/v1/auth/login|400';
+
+// 20 400s a window on each route from its start time: worth a look, not urgent.
+const firing = (since: Record<string, string>) =>
+  new FakeTelemetry((q, at) => {
+    if (q.startsWith('count(kube_pod_container_status_restarts_total')) return [{ labels: {}, value: 120 }];
+    if (!q.includes('backend_be_production_http_requests_total')) return [];
+    return Object.entries(since).flatMap(([route, from]) => [
+      { labels: { route, status_code: '200' }, value: 1000 },
+      { labels: { route, status_code: '400' }, value: at.getTime() >= Date.parse(from) ? 20 : 0 },
+    ]);
+  });
+
+// One investigation: notes the row keys it was asked to cover, and files a
+// minor report (recorded, not posted) on the ones `cover` picks.
+function investigator(asked: string[][], cover: (rows: string[]) => string[] = (rows) => rows): Script {
+  return async function* (sim) {
+    const lines = sim.req.prompt.split('\n');
+    const start = lines.indexOf('Row keys to cover (copy exactly into reports):') + 1;
+    const rows = lines.slice(start, lines.indexOf('', start)).map((l) => l.slice(2));
+    asked.push(rows);
+    if (cover(rows).length) {
+      const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+      const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+      const quote = /^\S+ 400 \| [1-9]\d*/m.exec(out.text)![0];
+      const r = await sim.mcp('submit_report', report({ severity: 'minor', rows: cover(rows), evidence: [{ id, quote, claim: 'the route returns 400' }] }));
+      assert.equal(r.isError, false, r.text);
+    }
+    yield ok(0.1);
+  };
+}
+
+test('a 6-hour reminder of a row already explained does not join the next run', async () => {
+  const c = cfg();
+  const state = State.memory();
+  const asked: string[][] = [];
+  const m = monitor(c, fakeSession(investigator(asked), investigator(asked)));
+  const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z', '/v1/auth/signup': '2026-09-29T18:15:00Z' });
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir), new Date(time), { llm: true, post: false }, m);
+  await pass('2026-09-29T12:15:00Z');
+  const later = await pass('2026-09-29T18:30:00Z'); // login is due its reminder; signup is new
+  assert.ok(later.summary.send.some((r) => r.key === LOGIN && r.novelty === 'reminder'), 'still listed as ongoing on the card');
+  assert.deepEqual(asked, [[LOGIN], [SIGNUP]], 'the second run covers only the new row');
+});
+
+test('rows no report covers get one more attempt, then are given up: in the log, never in Slack', async () => {
+  const c = cfg();
+  const state = State.memory();
+  const asked: string[][] = [];
+  const logs: string[] = [];
+  const sent: string[] = [];
+  const box = new SlackOutbox(':memory:', { threads: true, post: async (m) => (sent.push(m.text), `ts${sent.length}`) }, { sleep: async () => {}, gapMs: 0 });
+  const m = monitor(c, fakeSession(investigator(asked, (rows) => rows.filter((k) => k === LOGIN)), investigator(asked, () => [])));
+  const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z', '/v1/auth/signup': '2026-09-29T12:00:00Z' });
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir, box), new Date(time), { llm: true, post: true, log: (s) => logs.push(s) }, m);
+  await pass('2026-09-29T12:15:00Z'); // the report covers login only
+  assert.equal(state.data.rows[LOGIN]!.investigation?.status, 'complete');
+  assert.deepEqual([state.data.rows[SIGNUP]!.investigation?.status, state.data.rows[SIGNUP]!.investigation?.attempts], ['pending', 1]);
+  const retry = await pass('2026-09-29T12:30:00Z'); // nothing new, but signup is still owed an answer
+  assert.equal(retry.summary.send.length, 0);
+  assert.deepEqual(asked[1], [SIGNUP], 'the retry covers only the uncovered row');
+  assert.deepEqual([state.data.rows[SIGNUP]!.investigation?.status, state.data.rows[SIGNUP]!.investigation?.attempts], ['gave_up', 2]);
+  assert.ok(logs.includes(`gave up on 1 row(s) after 2 attempts: ${SIGNUP}`));
+  const after = await pass('2026-09-29T12:45:00Z');
+  assert.equal(after.investigation, undefined, 'not retried again');
+  assert.equal(after.cards.length, 0, 'a quiet patrol');
+  assert.deepEqual(sent, [], 'no rows were urgent and the reports were minor: no "inconclusive" notice either');
+});
+
+test('the kill switch defers the work: pressed during a run or before one, it is not an attempt', async () => {
+  const c = cfg();
+  const state = State.memory();
+  const asked: string[][] = [];
+  const stop = join(c.runsDir, 'STOP');
+  const pressed: Script = async function* () {
+    writeFileSync(stop, 'test'); // while the model works
+    yield say();
+  };
+  const m = monitor(c, fakeSession(pressed, investigator(asked)));
+  const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z' });
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir), new Date(time), { llm: true, post: false }, m);
+  const during = await pass('2026-09-29T12:15:00Z');
+  assert.equal(during.investigation?.status, 'stopped');
+  assert.deepEqual([state.data.rows[LOGIN]!.investigation?.status, state.data.rows[LOGIN]!.investigation?.attempts], ['pending', 0]);
+  const before = await pass('2026-09-29T12:30:00Z'); // still on: the run is not admitted
+  assert.equal(before.investigation?.status, 'skipped');
+  assert.deepEqual([state.data.rows[LOGIN]!.investigation?.status, state.data.rows[LOGIN]!.investigation?.attempts], ['pending', 0]);
+  rmSync(stop);
+  await pass('2026-09-29T12:45:00Z');
+  assert.deepEqual(asked, [[LOGIN]]);
+  assert.deepEqual([state.data.rows[LOGIN]!.investigation?.status, state.data.rows[LOGIN]!.investigation?.attempts], ['complete', 1]);
+});
+
+test('while a cap or the kill switch holds, the patrol records one skipped run, and owed rows run once it lifts', async () => {
+  const c = cfg();
+  const state = State.memory();
+  const asked: string[][] = [];
+  const logs: string[] = [];
+  const m = monitor(c, fakeSession(investigator(asked)));
+  const runs = () => (m.engine.store.db.prepare(`SELECT status, note FROM runs ORDER BY rowid`).all() as Array<{ status: string; note: string | null }>).map((r) => ({ status: r.status, note: r.note }));
+  const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z', '/v1/auth/signup': '2026-09-29T12:30:00Z', '/v1/auth/password/reset': '2026-09-29T13:15:00Z' });
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir), new Date(time), { llm: true, post: false, log: (s) => logs.push(s) }, m);
+  m.engine.dailyCapUsd = 0; // spent for the day
+  await pass('2026-09-29T12:15:00Z');
+  await pass('2026-09-29T12:30:00Z'); // a new row: its card is written, the run is still refused
+  const owedOnly = await pass('2026-09-29T12:45:00Z');
+  assert.deepEqual(runs(), [{ status: 'skipped', note: 'global daily cap $0 reached' }], 'one skipped run for three refused patrols');
+  assert.deepEqual(owedOnly.cards, [], 'only owed rows: no card');
+  assert.match(owedOnly.skippedLlm ?? '', /^deferred: global daily cap \$0 reached \(since \S+, run \S+-monitor-[0-9a-f]{6}\)$/);
+  assert.ok(state.needsInvestigation(LOGIN) && state.needsInvestigation(SIGNUP), 'deferred, not attempted');
+  m.engine.dailyCapUsd = 20; // the cap lifts
+  const lifted = await pass('2026-09-29T13:00:00Z');
+  assert.equal(lifted.investigation?.status, 'ok');
+  assert.deepEqual(asked.map((rows) => [...rows].sort()), [[LOGIN, SIGNUP].sort()], 'the owed rows run as soon as it lifts');
+  assert.equal(state.data.held, undefined);
+  writeFileSync(join(c.runsDir, 'STOP'), 'test'); // a new hold
+  await pass('2026-09-29T13:15:00Z');
+  await pass('2026-09-29T13:30:00Z');
+  assert.deepEqual(runs().map((r) => r.status), ['skipped', 'ok', 'skipped'], 'one skipped run for the kill switch too');
+  assert.equal(logs.filter((l) => l.startsWith('deferred: kill switch is on')).length, 1);
+});
+
+test('a daily cap holds until its UTC day ends: the next day starts a new hold', async () => {
+  const c = cfg();
+  const m = monitor(c, fakeSession());
+  m.engine.dailyCapUsd = 0;
+  let clock = '2026-09-29T23:50:00Z';
+  m.engine.now = () => new Date(clock);
+  const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z' });
+  const state = State.memory();
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir), new Date(time), { llm: true, post: false }, m);
+  await pass('2026-09-29T12:15:00Z');
+  await pass('2026-09-29T12:30:00Z');
+  clock = '2026-09-30T00:05:00Z';
+  await pass('2026-09-29T12:45:00Z');
+  await pass('2026-09-29T13:00:00Z');
+  const days = (m.engine.store.db.prepare(`SELECT day FROM runs WHERE status = 'skipped' ORDER BY rowid`).all() as Array<{ day: string }>).map((r) => r.day);
+  assert.deepEqual(days, ['2026-09-29', '2026-09-30']);
+});
+
+test('a store error before admission is a deferral; a failure after it is an attempt', async () => {
+  const c = cfg();
+  const state = State.memory();
+  const asked: string[][] = [];
+  const m = monitor(c, fakeSession(investigator(asked, () => [])));
+  const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z' });
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir), new Date(time), { llm: true, post: false }, m);
+  const work = () => [state.data.rows[LOGIN]!.investigation?.status, state.data.rows[LOGIN]!.investigation?.attempts];
+  const { admit, settle } = m.engine.store;
+  m.engine.store.admit = () => {
+    throw new Error('database is locked');
+  };
+  for (const time of ['2026-09-29T12:15:00Z', '2026-09-29T12:30:00Z']) assert.match((await pass(time)).skippedLlm ?? '', /^investigator crashed: database is locked/);
+  assert.deepEqual(work(), ['pending', 0], 'twice locked out, still owed with no attempt spent');
+  m.engine.store.admit = admit;
+  m.engine.store.settle = () => {
+    throw new Error('disk I/O error');
+  };
+  assert.match((await pass('2026-09-29T12:45:00Z')).skippedLlm ?? '', /^investigator crashed: disk I\/O error/);
+  m.engine.store.settle = settle;
+  assert.equal(asked.length, 1, 'the model ran');
+  assert.deepEqual(work(), ['pending', 1], 'a failure after admission costs an attempt');
+});
+
+test('work still owed when a row recovers ends there: back within 6 h, it waits for its reminder, then gets fresh attempts', async () => {
+  const c = cfg();
+  const state = State.memory();
+  const asked: string[][] = [];
+  const m = monitor(c, fakeSession(investigator(asked, () => []), investigator(asked, () => [])));
+  // 400s from 12:00, none from 12:20 to 12:40, then back.
+  const tel = new FakeTelemetry((q, at) => {
+    if (q.startsWith('count(kube_pod_container_status_restarts_total')) return [{ labels: {}, value: 120 }];
+    if (!q.includes('backend_be_production_http_requests_total')) return [];
+    const t = at.getTime();
+    const on = t >= Date.parse('2026-09-29T12:00:00Z') && !(t >= Date.parse('2026-09-29T12:20:00Z') && t < Date.parse('2026-09-29T12:40:00Z'));
+    return [{ labels: { route: '/v1/auth/login', status_code: '200' }, value: 1000 }, { labels: { route: '/v1/auth/login', status_code: '400' }, value: on ? 20 : 0 }];
+  });
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir), new Date(time), { llm: true, post: false }, m);
+  const work = () => [state.data.rows[LOGIN]!.investigation?.status, state.data.rows[LOGIN]!.investigation?.attempts];
+  await pass('2026-09-29T12:15:00Z'); // not covered: one attempt used
+  assert.deepEqual(work(), ['pending', 1]);
+  assert.deepEqual((await pass('2026-09-29T12:30:00Z')).summary.recovered, [LOGIN]);
+  const back = await pass('2026-09-29T12:45:00Z'); // back, not worse, 30 min after its report
+  assert.equal(back.investigation, undefined, 'not retried at once');
+  assert.equal(asked.length, 1);
+  await pass('2026-09-29T18:30:00Z'); // its reminder
+  assert.equal(asked.length, 2);
+  assert.deepEqual(work(), ['pending', 1], 'a fresh allowance: one attempt used, one left');
+});
+
+test('a row reported before investigations were recorded gets one at its next reminder', async () => {
+  const c = cfg();
+  const asked: string[][] = [];
+  const m = monitor(c, fakeSession(investigator(asked)));
+  const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z' });
+  // As the state file was saved before: reported, and nothing about an investigation.
+  const reported = '2026-09-29T12:15:00.000Z';
+  const state = new State({ rows: { [LOGIN]: { firstSeen: reported, lastSeen: reported, lastReportedAt: reported, lastReportedNow: 20, sources: ['http:legacy-v1'] } } });
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir), new Date(time), { llm: true, post: false }, m);
+  assert.equal((await pass('2026-09-29T12:30:00Z')).investigation, undefined, 'not before its reminder');
+  const reminder = await pass('2026-09-29T18:30:00Z');
+  assert.deepEqual(asked, [[LOGIN]]);
+  assert.equal(reminder.investigation?.status, 'ok');
+  assert.equal(state.data.rows[LOGIN]!.investigation?.status, 'complete');
+  assert.equal((await pass('2026-09-30T00:45:00Z')).investigation, undefined, 'explained: its next reminder stays out of runs');
 });
 
 // ---- error counters and the summary ----------------------------------------------
