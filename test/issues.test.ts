@@ -14,7 +14,7 @@ import { checkReport, type Report } from '../src/investigate/report.js';
 import { buildServer, type McpContext } from '../src/mcp/server.js';
 import { Users } from '../src/mcp/users.js';
 import { CardSink } from '../src/output/sink.js';
-import { SlackOutbox, webhookTransport, type SlackMessage, type Transport } from '../src/output/slack.js';
+import { SlackError, SlackOutbox, webhookTransport, type SlackMessage, type Transport } from '../src/output/slack.js';
 import { Issues } from '../src/patrol/issues.js';
 import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
@@ -423,6 +423,33 @@ test("one patrol mentions the on-call once: a report on the rows card's rows doe
     const r = await w.patrol(schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(0, 40) }), 0);
     assert.equal(r.filed[0]?.action, 'opened');
     assert.deepEqual(t.sent.map((m) => [m.text.startsWith('Patrol') ? 'rows' : 'report', pinged(m)]), [['rows', true], ['report', again]], rows.join(' + '));
+  }
+});
+
+test("the rows card's mention holds back the report's only when Slack took the card or still has it queued", async () => {
+  const LOGIN = key('/v1/auth/login');
+  const TRANSFER = key('/v1/ownership/transfer');
+  for (const [rejection, again] of [[new SlackError('Slack: invalid_blocks', undefined, true), true], [new SlackError('Slack: HTTP 503'), false]] as const) {
+    const sent: Posted[] = [];
+    let down = true;
+    const t: Transport = {
+      threads: true,
+      post: async (m) => {
+        if (down && m.text.startsWith('Patrol')) throw rejection;
+        sent.push(m);
+        return `1700000000.${String(sent.length).padStart(6, '0')}`;
+      },
+    };
+    const w = setup(t, () => ({ issue: 'new', severity: 'critical', rows: [LOGIN, TRANSFER] }), { oncall: ONCALL });
+    w.rules.noise = new Noise({ never_suppress: [{ section: 'http', route: '/v1/auth/login', status: '4..' }] });
+    await w.patrol(schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(0, 40) }), 0);
+    down = false;
+    await w.box.flush(); // the next patrol's send
+    const posted = sent.map((m) => [m.text.startsWith('Patrol') ? 'rows' : 'report', pinged(m)]);
+    if (rejection.permanent) {
+      assert.deepEqual(w.box.status(), [{ status: 'failed', n: 1 }, { status: 'sent', n: 1 }]);
+      assert.deepEqual(posted, [['report', true]], 'the rows card never reached Slack: the report pages');
+    } else assert.deepEqual(posted, [['rows', true], ['report', false]], 'the queued rows card pages when it goes out');
   }
 });
 

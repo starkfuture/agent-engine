@@ -316,6 +316,11 @@ export class SlackOutbox {
     return out;
   }
 
+  // Where the latest post of a card (by its file) stands: pending, sent, failed, gave_up or skipped.
+  statusOf(file: string): string | undefined {
+    return (this.db.prepare(`SELECT status FROM slack_outbox WHERE file = ? ORDER BY id DESC LIMIT 1`).get(file) as { status: string } | undefined)?.status;
+  }
+
   // For get_run and the daily status line.
   status(): Array<{ status: string; n: number }> {
     return (this.db.prepare(`SELECT status, COUNT(*) AS n FROM slack_outbox GROUP BY status ORDER BY status`).all() as Array<{ status: string; n: number }>).map((r) => ({ status: r.status, n: Number(r.n) }));
