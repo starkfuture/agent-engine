@@ -136,9 +136,10 @@ export class Issues {
       CREATE TRIGGER IF NOT EXISTS issue_events_no_update BEFORE UPDATE ON issue_events BEGIN SELECT RAISE(ABORT, 'issue_events is append-only'); END;
       CREATE TRIGGER IF NOT EXISTS issue_events_no_delete BEFORE DELETE ON issue_events BEGIN SELECT RAISE(ABORT, 'issue_events is append-only'); END;
     `);
-    // The current click on an open issue (On it or Not an issue); its history is in issue_events.
+    // The current click on an open issue (On it or Not an issue); its history is
+    // in issue_events. click_ts: Slack's time of the latest click, even one that changed nothing.
     const cols = new Set((this.db.prepare(`PRAGMA table_info(issues)`).all() as Array<{ name: string }>).map((c) => c.name));
-    for (const c of ['disposition', 'disposed_by', 'disposed_at', 'muted_until']) if (!cols.has(c)) this.db.exec(`ALTER TABLE issues ADD COLUMN ${c} TEXT`);
+    for (const c of ['disposition', 'disposed_by', 'disposed_at', 'muted_until', 'click_ts']) if (!cols.has(c)) this.db.exec(`ALTER TABLE issues ADD COLUMN ${c} TEXT`);
   }
 
   static memory(): Issues {
@@ -256,8 +257,13 @@ export class Issues {
       const issue = this.full(row);
       if (row.status !== 'open') return { result: 'resolved', issue };
       // Slack's times compare as text: ten digits, a dot, six digits.
-      if (actionTs && this.db.prepare(`SELECT 1 FROM issue_events WHERE issue_id = ? AND type IN ('acknowledged', 'dismissed', 'undone') AND (json_extract(data, '$.action_ts') > ? OR (json_extract(data, '$.action_ts') = ? AND json_extract(data, '$.by') = ?))`).get(id, actionTs, actionTs, by))
-        return { result: 'stale', issue };
+      if (actionTs) {
+        const mark = (this.db.prepare(`SELECT click_ts FROM issues WHERE id = ?`).get(id) as { click_ts: string | null }).click_ts;
+        const recorded = this.db.prepare(`SELECT 1 FROM issue_events WHERE issue_id = ? AND type IN ('acknowledged', 'dismissed', 'undone') AND (json_extract(data, '$.action_ts') > ? OR (json_extract(data, '$.action_ts') = ? AND json_extract(data, '$.by') = ?))`).get(id, actionTs, actionTs, by);
+        if ((mark && mark > actionTs) || recorded) return { result: 'stale', issue };
+        // The mark older clicks must beat, also when this one changes nothing.
+        this.db.prepare(`UPDATE issues SET click_ts = ? WHERE id = ?`).run(actionTs, id);
+      }
       const before = this.disposition(id, at);
       const ts = actionTs ? { action_ts: actionTs } : {};
       if (click === 'undo') {

@@ -170,6 +170,9 @@ function makeEngine(cfg: Config, runsDir = cfg.runsDir): Engine {
 function monitorAgent(cfg: Config): MonitorAgent {
   return { engine: makeEngine(cfg), agent: loadAgent(join(cfg.agentsDir, 'monitor'), cfg.memoryDir) };
 }
+// The buttons (On it, Not an issue) are on: Socket Mode and the bot. Off, the
+// clicks already recorded are kept and ignored.
+const buttonsOn = (cfg: Config) => !!(cfg.slackApp && cfg.slackBotToken);
 // The issue record lives in the engine's SQLite file, next to the Slack outbox.
 // A fresh look (--fresh) starts from no issues too.
 const issueRecord = (cfg: Config, fresh = false) => (fresh ? Issues.memory() : new Issues(join(cfg.runsDir, 'engine.db')));
@@ -186,7 +189,7 @@ async function patrolEvery(cfg: Config, noise: Noise, owners: Owners, sink: Card
     state: State.load(cfg.stateFile),
     sink,
     windowMin: w,
-    opts: { llm: a.llm, post: a.post, log, owners, issues: issueRecord(cfg) },
+    opts: { llm: a.llm, post: a.post, log, owners, issues: issueRecord(cfg), buttons: buttonsOn(cfg) },
     monitor: a.llm ? monitorAgent(cfg) : undefined,
     onPass: metrics ? (at, r) => metrics.patrol(at, r) : undefined,
   });
@@ -308,7 +311,7 @@ async function main() {
       if (!name) throw new Error('usage: run <agent> --task "<text>"');
       if (name === 'monitor') {
         const state = a.fresh ? State.memory() : State.load(cfg.stateFile);
-        const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, align(new Date(), w), { llm: true, post: a.post, log, owners, issues: issueRecord(cfg, a.fresh) }, monitorAgent(cfg));
+        const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, align(new Date(), w), { llm: true, post: a.post, log, owners, issues: issueRecord(cfg, a.fresh), buttons: buttonsOn(cfg) }, monitorAgent(cfg));
         for (const c of r.cards) console.log(`card: ${c}`);
         return;
       }
@@ -482,7 +485,7 @@ async function main() {
     case 'patrol': {
       const state = a.fresh ? State.memory() : State.load(cfg.stateFile);
       const at = align(a.at ? date(a.at, 'at') : new Date(), w);
-      const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log, owners, issues: issueRecord(cfg, a.fresh) }, a.llm ? monitorAgent(cfg) : undefined);
+      const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log, owners, issues: issueRecord(cfg, a.fresh), buttons: buttonsOn(cfg) }, a.llm ? monitorAgent(cfg) : undefined);
       for (const row of r.summary.send) console.log(rowLine(row));
       for (const c of r.cards) console.log(`card: ${c}`);
       return;

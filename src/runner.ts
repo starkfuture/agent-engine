@@ -24,6 +24,10 @@ export interface PatrolOptions {
   log?: (s: string) => void;
   owners?: Owners | undefined; // Slack mentions on posted cards; absent = none
   issues?: Issues | undefined; // the issue record (engine.db); absent = every report stands alone, as before
+  // The buttons are on (SLACK_APP_TOKEN with the bot): On it and Not an issue
+  // change what is posted and investigated. Off: clicks stay in the record,
+  // ignored until they are back on.
+  buttons?: boolean | undefined;
 }
 
 export interface PatrolResult {
@@ -79,6 +83,7 @@ export interface FileOptions {
   // (the outbox). Unset, or nothing delivered yet: the record's queued news.
   newsAt?: ((issue: string) => string | undefined) | undefined;
   newsPending?: ((issue: string) => boolean) | undefined; // news for the channel about it still queued: no reminder on top
+  clicks?: boolean | undefined; // the buttons are on: On it and Not an issue apply
   breaksMute?: ((key: string) => boolean) | undefined; // a row Not an issue can't silence (see breaksMute)
 }
 
@@ -89,7 +94,7 @@ export function fileReport(issues: Issues, r: Report, at: Date, run?: string, o:
   const l = issues.link(r.issue, filed, at, { reopen: POSTED.has(r.severity) });
   if (l.reopenedFrom) return { action: 'reopened', issue: l.issue };
   // The buttons: On it and Not an issue last until the issue resolves.
-  const d = issues.disposition(l.issue.id, at);
+  const d = o.clicks ? issues.disposition(l.issue.id, at) : undefined;
   if (l.raisedFrom) {
     // A rise to critical ends Not an issue: it is news again.
     if (d?.kind === 'dismissed') issues.liftMute(l.issue.id, at, run);
@@ -231,7 +236,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     return result;
   };
   // A Not an issue mute ends after MUTE_DAYS even if the issue never resolves.
-  if (o.issues)
+  if (o.issues && o.buttons)
     for (const id of record('ending mutes', () => o.issues!.endMutes(at), [])) {
       log(`${id}: Not an issue ended after ${MUTE_DAYS} days; its rows are investigated again`);
       if (o.post) sink.outbox?.updateRoot(id);
@@ -240,7 +245,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
 
   // The buttons: rows of an issue someone is on, or said is not an issue, are
   // left out of the AI run and of the rows card (see claimedRows).
-  const claims = record('reading the buttons', () => claimedRows(o.issues, summary.send, noise, at), new Map());
+  const claims = record('reading the buttons', () => claimedRows(o.buttons ? o.issues : undefined, summary.send, noise, at), new Map());
   const send = claims.size ? summary.send.filter((r) => !claims.has(r.key)) : summary.send;
   const shown = claims.size ? { ...summary, send } : summary; // for the rows card and the investigator
   const byIssue = new Map<string, FlaggedRow[]>();
@@ -334,6 +339,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     const filing: FileOptions = {
       newsAt: o.post && sink.outbox ? (id) => sink.outbox!.newsAt(id) : undefined,
       newsPending: o.post && sink.outbox ? (id) => sink.outbox!.newsPending(id) : undefined,
+      clicks: o.buttons,
       breaksMute: (k) => !!byKey.get(k) && breaksMute(byKey.get(k)!, noise),
     };
     for (const [i, r] of inv.outputs.entries()) {

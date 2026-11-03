@@ -359,8 +359,12 @@ export class SlackOutbox {
         continue; // the same post again, once the wait is over
       }
       // Rate limited for long, or Slack unreachable: not again before its backoff.
+      // A message update a click replaced while it was out hands that wait to its replacement.
       const attempts = p.attempts + 1;
-      this.db.prepare(`UPDATE slack_outbox SET next_attempt_at = ? WHERE id = ?`).run(new Date(this.o.now().getTime() + retryDelayMs(attempts, err.retryAfterSec)).toISOString(), p.id);
+      const waiting = p.kind === 'root' ? (this.db.prepare(`SELECT id FROM slack_outbox WHERE kind = 'root' AND issue = ? AND status = 'pending_update' AND id >= ? ORDER BY id DESC LIMIT 1`).get(p.issue, p.id) as { id: number } | undefined) : undefined;
+      this.db
+        .prepare(`UPDATE slack_outbox SET next_attempt_at = ?, attempts = MAX(attempts, ?) WHERE id = ?`)
+        .run(new Date(this.o.now().getTime() + retryDelayMs(attempts, err.retryAfterSec)).toISOString(), attempts, waiting?.id ?? p.id);
       break;
     }
     out.pending = this.pendingCount();
@@ -383,9 +387,12 @@ export class SlackOutbox {
     }
   }
 
-  // A failure is recorded; a permanent one is final ('done'), the others are returned for a retry.
+  // A failure is recorded; a permanent one is final ('done'), the others are
+  // returned for a retry. A message update replaced while it was out stays replaced.
   private failed(p: Pending, err: SlackError, out: FlushResult, log: (s: string) => void): 'done' | SlackError {
-    this.db.prepare(`UPDATE slack_outbox SET status = ?, attempts = attempts + 1, last_error = ? WHERE id = ?`).run(err.permanent ? 'failed' : p.kind === 'root' ? 'pending_update' : 'pending', err.message.slice(0, 300), p.id);
+    this.db
+      .prepare(`UPDATE slack_outbox SET status = CASE WHEN status = 'superseded' THEN status ELSE ? END, attempts = attempts + 1, last_error = ? WHERE id = ?`)
+      .run(err.permanent ? 'failed' : p.kind === 'root' ? 'pending_update' : 'pending', err.message.slice(0, 300), p.id);
     log(`slack: ${p.kind} post ${p.id} ${err.permanent ? 'failed' : 'will retry'}: ${err.message.slice(0, 160)}`);
     if (!err.permanent) return err;
     out.failed++;

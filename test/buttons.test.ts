@@ -156,9 +156,10 @@ function setup(o: { decide?: Decide; buttons?: boolean; noise?: Noise } = {}) {
   };
   const state = State.memory();
   const logs: string[] = [];
+  const flags = { buttons: o.buttons !== false }; // SLACK_APP_TOKEN set, as the patrol sees it
   const patrol = async (tel: FakeTelemetry, hours: number): Promise<PatrolResult> => {
     clock.now = at(hours);
-    return patrolOnce(tel, c, o.noise ?? new Noise({}), state, sink, at(hours), { llm: true, post: true, log: (s) => logs.push(s), issues }, monitor);
+    return patrolOnce(tel, c, o.noise ?? new Noise({}), state, sink, at(hours), { llm: true, post: true, log: (s) => logs.push(s), issues, buttons: flags.buttons }, monitor);
   };
   // A click, recorded, then the outbox flushed as the socket does after the ack.
   const click = async (what: Click, issue: string, by: Parameters<typeof payload>[2] = {}, hours?: number) => {
@@ -167,7 +168,7 @@ function setup(o: { decide?: Decide; buttons?: boolean; noise?: Noise } = {}) {
     await box.flush();
     return r;
   };
-  return { c, db, t, box, issues, session, patrol, click, logs, clock };
+  return { c, db, t, box, issues, session, patrol, click, logs, clock, flags };
 }
 const opened = (r: PatrolResult) => (r.filed[0]?.action === 'opened' ? r.filed[0].issue.id : assert.fail(`not opened: ${r.filed[0]?.action}`));
 
@@ -396,6 +397,42 @@ test('a click Slack delivers again, or one older than a recorded click, changes 
   assert.deepEqual(w.issues.events(id).map((e) => e.type), ['opened', 'dismissed', 'undone', 'dismissed']);
 });
 
+test('a delayed older click loses to a newer one, also when the newer one changed nothing', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const w = setup();
+  const id = opened(await w.patrol(tel, 0));
+  const ctx = { issues: w.issues, outbox: w.box, ids: IDS, now: () => w.clock.now };
+  const t = (n: number) => `1700000200.${String(n).padStart(6, '0')}`;
+  // An Undo with nothing to undo, then an On it clicked before it arrives late.
+  assert.equal(onClick(payload(ACTION.undo, id, { user: 'U0ALICE', actionTs: t(6) }), ctx).reply, `${id} has no On it or Not an issue to undo. Nothing changed.`);
+  assert.equal(onClick(payload(ACTION.acknowledged, id, { user: 'U0ALICE', actionTs: t(4) }), ctx).updated, undefined);
+  assert.equal(w.issues.disposition(id, w.clock.now), undefined);
+  // On it, On it again (no change), then a delayed Undo from between the two.
+  assert.equal(onClick(payload(ACTION.acknowledged, id, { user: 'U0ALICE', actionTs: t(10) }), ctx).updated, id);
+  assert.equal(onClick(payload(ACTION.acknowledged, id, { user: 'U0ALICE', actionTs: t(30) }), ctx).updated, undefined, 'no second update');
+  assert.equal(onClick(payload(ACTION.undo, id, { user: 'U0ALICE', actionTs: t(20) }), ctx).updated, undefined);
+  assert.equal(w.issues.disposition(id, w.clock.now)?.kind, 'acknowledged');
+  await w.box.flush();
+  assert.equal(w.t.updates.length, 1);
+});
+
+test('with the buttons off, recorded clicks are kept and ignored: posting is as before, and they apply again when the buttons are back', async () => {
+  const tel = schedule({ '/v1/auth/login': doubles(0, 9), '/v1/ownership/transfer': between(2, 40), '/v1/auth/signup': between(12, 40) });
+  const w = setup();
+  const id = opened(await w.patrol(tel, 0));
+  await w.click('dismissed', id, { user: 'U0BOB' }, 0.25);
+  w.flags.buttons = false; // SLACK_APP_TOKEN removed
+  const sibling = await w.patrol(tel, 2);
+  assert.equal(sibling.filed[0]?.action, 'linked');
+  assert.deepEqual([w.t.sent.at(-1)!.thread_ts, w.t.sent.at(-1)!.reply_broadcast], [ROOT, false], 'posted in its thread, as before');
+  await w.patrol(tel, 9);
+  assert.equal(w.session.seen.length, 3, 'the worse row is investigated');
+  assert.equal(w.issues.disposition(id, at(9))?.kind, 'dismissed', 'the click is kept');
+  w.flags.buttons = true;
+  const back = await w.patrol(tel, 12);
+  assert.equal(back.filed[0]?.action, 'muted');
+});
+
 test('a duplicate click makes one update; two clicks before a flush make one too', async () => {
   const tel = schedule({ '/v1/auth/login': between(0, 0.25) });
   const w = setup();
@@ -465,6 +502,7 @@ test('Socket Mode: the workspace comes from the bot, and a click from another on
   const client: SocketClient = { on: (e, f) => handlers.set(e, f), start: async () => {}, disconnect: async () => {} };
   const replies: string[] = [];
   let calls = 0;
+  const waits: number[] = [];
   const socket = startButtons({
     appToken: 'xapp-1-A0TESTAPP-1-abcdef',
     appId: IDS.app,
@@ -475,10 +513,11 @@ test('Socket Mode: the workspace comes from the bot, and a click from another on
     log: () => {},
     client: () => client,
     respond: async (_url, text) => void replies.push(text),
-    retryMs: 1,
+    sleep: async (ms) => void waits.push(ms),
   });
   await socket.ready;
   assert.equal(calls, 2, 'auth.test retried');
+  assert.deepEqual(waits, [60_000], 'after a minute');
   let acked = false;
   handlers.get('interactive')!({ body: payload(ACTION.dismissed, id), ack: async () => void (acked = true) });
   for (let i = 0; i < 50 && !replies.length; i++) await new Promise((r) => setTimeout(r, 5));

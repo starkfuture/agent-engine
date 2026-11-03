@@ -29,6 +29,8 @@ export interface ButtonsOptions {
   respond?: (url: string, text: string) => Promise<void>; // tests
   now?: () => Date;
   retryMs?: number; // between attempts to learn the workspace
+  // Waits between attempts. The default timer doesn't keep the process alive.
+  sleep?: (ms: number) => Promise<void>;
 }
 
 // A reply only the clicker sees, through the click's response_url.
@@ -85,7 +87,7 @@ export function startButtons(o: ButtonsOptions): { ready: Promise<void>; stop():
         return;
       } catch (e) {
         o.log(`buttons: not started (${redact((e as Error).message).slice(0, 160)}); trying again in ${Math.round(wait / 1000)} s. Monitoring continues.`);
-        await new Promise((r) => setTimeout(r, wait).unref());
+        await (o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref())))(wait);
       }
     }
   })();

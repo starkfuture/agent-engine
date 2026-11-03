@@ -318,3 +318,29 @@ test('posts sent before in_channel existed count for the reminder clock when the
   (box as unknown as { db: DatabaseSync }).db.exec(`UPDATE slack_outbox SET in_channel = NULL`);
   assert.equal(box.newsAt('I-abcd'), '2026-11-01T06:00:00.000Z', 'the broadcast reply counts, the quiet one does not');
 });
+
+test('a message update a click replaces while it is out stays replaced, and its Retry-After holds for the replacement', async () => {
+  const c = clock('2026-10-31T10:00:00Z');
+  let updates = 0;
+  let box!: SlackOutbox;
+  const t: Transport = {
+    threads: true,
+    post: async () => '1700000000.000001',
+    update: async () => {
+      if (++updates > 1) return;
+      box.updateRoot('I-abcd'); // a click while chat.update is out
+      throw new SlackError('Slack: rate limited', 120);
+    },
+  };
+  box = new SlackOutbox(':memory:', t, { now: c.now, sleep: async () => {}, gapMs: 0, controls: () => [{ type: 'actions', elements: [] }] });
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('new issue, with its buttons') });
+  await box.flush();
+  box.updateRoot('I-abcd');
+  await box.flush();
+  assert.deepEqual(box.status(), [{ status: 'pending_update', n: 1 }, { status: 'sent', n: 1 }, { status: 'superseded', n: 1 }], 'one update waiting, not two');
+  await box.flush();
+  assert.equal(updates, 1, "the replacement waits for Slack's Retry-After");
+  c.advance(2.1);
+  assert.deepEqual(await box.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
+  assert.equal(updates, 2);
+});
