@@ -153,8 +153,8 @@ function setup(transport: Transport, decide: Decide, o: { issues?: boolean } = {
 
 // ---- the posting rule ---------------------------------------------------------------
 
-test('a linked report replies in the issue thread without broadcast, also more than 24 h later', async () => {
-  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(2, 40), '/v1/auth/signup': between(26, 40) });
+test('a linked report replies in the issue thread without broadcast; after 24 h with no news it is shown once', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(2, 40), '/v1/auth/signup': between(26, 40), '/v1/auth/reset': between(28, 40) });
   const t = bot();
   const w = setup(t, linker());
   const first = await w.patrol(tel, 0);
@@ -170,13 +170,21 @@ test('a linked report replies in the issue thread without broadcast, also more t
   assert.deepEqual(w.session.seen[1]!.issues, [{ id, resolved: false }], 'the investigator was shown the open issue');
   assert.deepEqual(t.sent[1], { text: `🟠 Update on ${id}: Sign-in rejects emails with a trailing space`, thread_ts: '1700000000.000001', reply_broadcast: false });
 
-  const nextDay = await w.patrol(tel, 26); // the rows' 24 h Slack window is over; the issue is still open
-  assert.equal(nextDay.filed[0]?.action, 'linked');
-  assert.deepEqual(t.sent.slice(2), [{ text: `🟠 Update on ${id}: Sign-in rejects emails with a trailing space`, thread_ts: '1700000000.000001', reply_broadcast: false }]);
-  assert.deepEqual(w.issues!.get(id)!.rows, [key('/v1/auth/login'), key('/v1/auth/signup'), key('/v1/ownership/transfer')], "the linked reports' rows joined the issue");
-  assert.ok(w.logs.includes(`report 1 linked to ${id} (no broadcast)`));
+  // The rows' 24 h Slack window is over and the issue is still open. The
+  // channel last heard of it 26 h ago, so this one is shown there once.
+  const nextDay = await w.patrol(tel, 26);
+  assert.equal(nextDay.filed[0]?.action, 'reminded');
+  assert.deepEqual(t.sent.slice(2), [{ text: `🟠 Update on ${id}: Sign-in rejects emails with a trailing space`, thread_ts: '1700000000.000001', reply_broadcast: true }]);
+  assert.ok(w.logs.includes(`report 1 linked to ${id}: open with no news in the channel for 24 h (broadcast)`));
+  assert.deepEqual(w.issues!.events(id).map((e) => e.type), ['opened', 'report_linked', 'report_linked', 'reminded']);
   const card = readFileSync(nextDay.cards.at(-1)!, 'utf8');
   assert.match(card, new RegExp(`^## 🟠 Update on ${id}: Sign-in rejects emails with a trailing space\\n\\*\\*Issue:\\*\\* ${id} \\(same cause\\)`));
+
+  const after = await w.patrol(tel, 28); // quiet again for the next 24 h
+  assert.equal(after.filed[0]?.action, 'linked');
+  assert.deepEqual(t.sent.slice(3), [{ text: `🟠 Update on ${id}: Sign-in rejects emails with a trailing space`, thread_ts: '1700000000.000001', reply_broadcast: false }]);
+  assert.deepEqual(w.issues!.get(id)!.rows, [key('/v1/auth/login'), key('/v1/auth/reset'), key('/v1/auth/signup'), key('/v1/ownership/transfer')], "the linked reports' rows joined the issue");
+  assert.ok(w.logs.includes(`report 1 linked to ${id} (no broadcast)`));
 });
 
 test('an issue id that was not in the list is rejected; the investigator fixes it', async () => {

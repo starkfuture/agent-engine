@@ -65,7 +65,13 @@ export type Filing =
   | { action: 'opened'; issue: Issue }
   | { action: 'linked'; issue: Issue } // same cause, same or lower severity; or not posted
   | { action: 'raised'; issue: Issue; from: Severity }
-  | { action: 'reopened'; issue: Issue }; // it was resolved and came back
+  | { action: 'reopened'; issue: Issue } // it was resolved and came back
+  | { action: 'reminded'; issue: Issue }; // same cause, but the channel has heard nothing about it for REMIND_HOURS
+
+// An open issue whose rows never all recover (a chronic one) would otherwise
+// hide every later report in its thread for good: at most once in this many
+// hours, a report linked to it is shown in the channel again.
+export const REMIND_HOURS = 24;
 
 export function fileReport(issues: Issues, r: Report, at: Date, run?: string): Filing {
   const filed = { title: r.title, severity: r.severity, rows: r.rows, hypothesis: r.cause.hypothesis, run };
@@ -74,6 +80,10 @@ export function fileReport(issues: Issues, r: Report, at: Date, run?: string): F
   const l = issues.link(r.issue, filed, at, { reopen: POSTED.has(r.severity) });
   if (l.reopenedFrom) return { action: 'reopened', issue: l.issue };
   if (l.raisedFrom) return { action: 'raised', issue: l.issue, from: l.raisedFrom };
+  if (POSTED.has(r.severity) && l.lastNewsAt && at.getTime() - Date.parse(l.lastNewsAt) >= REMIND_HOURS * 3600_000) {
+    issues.remind(l.issue.id, at, run);
+    return { action: 'reminded', issue: l.issue };
+  }
   return { action: 'linked', issue: l.issue };
 }
 
@@ -88,7 +98,7 @@ export function postFor(f: Filing, r: Report): EmitSlack | undefined {
 }
 
 const issueRef = (f: Filing): IssueRef | undefined =>
-  f.action === 'none' ? undefined : { id: f.issue.id, title: f.issue.title, change: f.action === 'opened' ? 'new' : f.action === 'linked' ? 'update' : f.action, ...(f.action === 'raised' ? { from: f.from } : {}) };
+  f.action === 'none' ? undefined : { id: f.issue.id, title: f.issue.title, change: f.action === 'opened' ? 'new' : f.action === 'linked' || f.action === 'reminded' ? 'update' : f.action, ...(f.action === 'raised' ? { from: f.from } : {}) };
 
 function filingNote(f: Filing, r: Report): string {
   switch (f.action) {
@@ -102,6 +112,8 @@ function filingNote(f: Filing, r: Report): string {
       return `linked to ${f.issue.id}: severity ${f.from} → ${r.severity} (broadcast)`;
     case 'reopened':
       return `reopened ${f.issue.id}: it came back (broadcast)`;
+    case 'reminded':
+      return `linked to ${f.issue.id}: open with no news in the channel for ${REMIND_HOURS} h (broadcast)`;
   }
 }
 
