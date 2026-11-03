@@ -230,3 +230,134 @@ test('separate flushes and senders share the channel rate limit', async () => {
   await second.flush();
   assert.equal(sentAt[1]! - sentAt[0]!, 1100);
 });
+
+test('a failed post waits for its backoff: Retry-After holds across flushes, then 30 s and more after a second failure', async () => {
+  let calls = 0;
+  const c = clock('2026-10-31T10:00:00Z');
+  const t: Transport = {
+    threads: true,
+    async post() {
+      calls++;
+      if (calls === 1) throw new SlackError('Slack: rate limited', 120);
+      if (calls === 3 || calls === 4) throw new SlackError('Slack: HTTP 503');
+      return `ts${calls}`;
+    },
+  };
+  const box = new SlackOutbox(':memory:', t, { now: c.now, sleep: async () => {}, gapMs: 0 });
+  box.enqueue({ kind: 'rows', keys: ['a'], broadcast: true, message: msg('a') });
+  box.enqueue({ kind: 'report', keys: ['a'], broadcast: true, message: msg('a, analysed') });
+  assert.deepEqual(await box.flush(), { sent: 0, pending: 2, failed: 0, skipped: 0 });
+  c.advance(1); // a click flushes a minute later
+  assert.deepEqual(await box.flush(), { sent: 0, pending: 2, failed: 0, skipped: 0 });
+  assert.equal(calls, 1, "not before Slack's Retry-After, and the reply behind it waits too");
+  c.advance(1.05);
+  assert.deepEqual(await box.flush(), { sent: 1, pending: 1, failed: 0, skipped: 0 }); // the reply fails once (503)
+  assert.deepEqual(await box.flush(), { sent: 0, pending: 1, failed: 0, skipped: 0 }); // its first retry may go at once, and fails
+  assert.equal(calls, 4);
+  assert.deepEqual(await box.flush(), { sent: 0, pending: 1, failed: 0, skipped: 0 });
+  assert.equal(calls, 4, 'after a second failure it waits');
+  c.advance(1);
+  assert.deepEqual(await box.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
+});
+
+test('turning the buttons on keeps the destination: open threads keep their replies and queued posts go out', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'outbox-switch-')), 'engine.db');
+  const updates: string[] = [];
+  const bot = Object.assign(fakeBot(), { update: async (ts: string) => void updates.push(ts) });
+  const before = new SlackOutbox(file, bot, { sleep: async () => {}, gapMs: 0 });
+  before.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('new issue') });
+  await before.flush();
+  before.enqueue({ kind: 'rows', keys: ['k2'], broadcast: true, message: msg('queued before the switch') });
+  // Socket Mode on: the same database and channel, now with buttons.
+  const after = new SlackOutbox(file, bot, { sleep: async () => {}, gapMs: 0, controls: () => [{ type: 'actions', elements: [] }] });
+  after.enqueue({ kind: 'report', keys: ['k'], broadcast: false, issue: 'I-abcd', repeat: true, message: msg('same cause') });
+  assert.deepEqual(await after.flush(), { sent: 3, pending: 0, failed: 0, skipped: 0 });
+  assert.deepEqual(bot.sent.map((s) => [s.text, s.thread_ts]), [['new issue', undefined], ['queued before the switch', undefined], ['same cause', '1700000000.000001']]);
+  assert.deepEqual(updates, ['1700000000.000001'], 'the open issue gets its buttons on its first message');
+  assert.deepEqual(after.status(), [{ status: 'sent', n: 4 }]);
+});
+
+test('a message update waiting for Retry-After keeps waiting when a newer click replaces it', async () => {
+  const c = clock('2026-10-31T10:00:00Z');
+  let updates = 0;
+  const t: Transport = {
+    threads: true,
+    post: async () => '1700000000.000001',
+    update: async () => {
+      if (++updates === 1) throw new SlackError('Slack: rate limited', 120);
+    },
+  };
+  const box = new SlackOutbox(':memory:', t, { now: c.now, sleep: async () => {}, gapMs: 0, controls: () => [{ type: 'actions', elements: [] }] });
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('new issue, with its buttons') });
+  await box.flush();
+  box.updateRoot('I-abcd'); // a click
+  await box.flush();
+  assert.equal(updates, 1, 'rate limited for 120 s');
+  box.updateRoot('I-abcd'); // another click replaces the waiting update
+  await box.flush();
+  assert.equal(updates, 1, "the newer update waits for Slack's Retry-After too");
+  c.advance(2.1);
+  assert.deepEqual(await box.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
+  assert.equal(updates, 2);
+  assert.deepEqual(box.status(), [{ status: 'sent', n: 2 }, { status: 'superseded', n: 1 }]);
+});
+
+test('posts sent before in_channel existed count for the reminder clock when they were top-level or broadcast', async () => {
+  const bot = fakeBot();
+  const { box, c } = outbox(bot);
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('new issue') });
+  await box.flush();
+  c.advance(20 * 60);
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('raised: shown in the channel') });
+  await box.flush();
+  c.advance(60);
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: false, issue: 'I-abcd', repeat: true, message: msg('the same cause, quietly') });
+  await box.flush();
+  assert.equal(box.newsAt('I-abcd'), '2026-11-01T06:00:00.000Z');
+  // The same rows as an older image left them: no in_channel.
+  (box as unknown as { db: DatabaseSync }).db.exec(`UPDATE slack_outbox SET in_channel = NULL`);
+  assert.equal(box.newsAt('I-abcd'), '2026-11-01T06:00:00.000Z', 'the broadcast reply counts, the quiet one does not');
+});
+
+test('a message update a click replaces while it is out stays replaced, and its Retry-After holds for the replacement', async () => {
+  const c = clock('2026-10-31T10:00:00Z');
+  let updates = 0;
+  let box!: SlackOutbox;
+  const t: Transport = {
+    threads: true,
+    post: async () => '1700000000.000001',
+    update: async () => {
+      if (++updates > 1) return;
+      box.updateRoot('I-abcd'); // a click while chat.update is out
+      throw new SlackError('Slack: rate limited', 120);
+    },
+  };
+  box = new SlackOutbox(':memory:', t, { now: c.now, sleep: async () => {}, gapMs: 0, controls: () => [{ type: 'actions', elements: [] }] });
+  box.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('new issue, with its buttons') });
+  await box.flush();
+  box.updateRoot('I-abcd');
+  await box.flush();
+  assert.deepEqual(box.status(), [{ status: 'pending_update', n: 1 }, { status: 'sent', n: 1 }, { status: 'superseded', n: 1 }], 'one update waiting, not two');
+  await box.flush();
+  assert.equal(updates, 1, "the replacement waits for Slack's Retry-After");
+  c.advance(2.1);
+  assert.deepEqual(await box.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
+  assert.equal(updates, 2);
+});
+
+test('a sender without the buttons leaves message updates queued for the one that has them', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'outbox-oneshot-')), 'engine.db');
+  const updates: string[] = [];
+  const bot = Object.assign(fakeBot(), { update: async (ts: string) => void updates.push(ts) });
+  const loop = new SlackOutbox(file, bot, { sleep: async () => {}, gapMs: 0, controls: () => [{ type: 'actions', elements: [] }] });
+  loop.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('new issue, with its buttons') });
+  await loop.flush();
+  loop.updateRoot('I-abcd'); // a click
+  // A one-shot `patrol --post` on the same database, without the app token.
+  const oneShot = new SlackOutbox(file, bot, { sleep: async () => {}, gapMs: 0 });
+  oneShot.enqueue({ kind: 'rows', keys: ['k2'], broadcast: true, message: msg('a one-shot patrol card') });
+  assert.deepEqual(await oneShot.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
+  assert.deepEqual(updates, [], 'not sent without the buttons');
+  assert.deepEqual(await loop.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
+  assert.deepEqual(updates, ['1700000000.000001']);
+});

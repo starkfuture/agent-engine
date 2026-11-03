@@ -26,7 +26,20 @@ export interface Issue {
   hypothesis: string; // the latest report's likely cause, one line
 }
 
-export type IssueEventType = 'opened' | 'report_linked' | 'severity_raised' | 'resolved' | 'reopened' | 'reminded' | 'rows_posted';
+export type IssueEventType =
+  | 'opened'
+  | 'report_linked'
+  | 'severity_raised'
+  | 'resolved'
+  | 'reopened'
+  | 'reminded'
+  | 'rows_posted'
+  // The buttons on the issue's Slack message (see Disposition), and what they did.
+  | 'acknowledged'
+  | 'dismissed'
+  | 'undone'
+  | 'mute_lifted'
+  | 'worse_noted';
 export interface IssueEvent {
   id: number;
   issue_id: string;
@@ -48,10 +61,38 @@ export interface Linked {
   issue: Issue;
   raisedFrom?: Severity; // set when this report raised the severity
   reopenedFrom?: string; // when it reopened a resolved issue: its resolved_at
-  lastNewsAt?: string; // before this report: when the channel last heard about it (opened, raised, reopened, reminded, urgent rows)
+  lastNewsAt?: string; // before this report: when the record last sent the channel news (opened, raised, reopened, reminded, urgent rows), queued, not delivered
+}
+
+// What a person said with the buttons on the issue's Slack message, for this
+// episode: "On it" (acknowledged) or "Not an issue" (dismissed: a mute, which
+// ends at `until` at the latest). One at a time; resolving the issue ends it.
+export interface Disposition {
+  kind: 'acknowledged' | 'dismissed';
+  by: string; // Slack user id
+  at: string;
+  until?: string | undefined;
+}
+export const MUTE_DAYS = 7;
+
+// A click: On it, Not an issue, or Undo (back to nobody).
+export type Click = Disposition['kind'] | 'undo';
+export type Clicked =
+  | { result: 'unknown' }
+  | { result: 'resolved'; issue: Issue }
+  | { result: 'stale'; issue: Issue } // this click, or a later one, is already recorded
+  | { result: 'unchanged' | 'changed'; issue: Issue; now?: Disposition | undefined };
+
+// A noise-rule candidate: an issue someone marked Not an issue (an Undo takes
+// the click back). A permanent rule stays a reviewed noise.yaml change.
+export interface Dismissal {
+  by: string;
+  at: string;
+  rows: string[];
 }
 
 const H = 3600_000;
+const DAY = 24 * H;
 export const ISSUE_ID = /^I-[0-9a-f]{4,6}$/;
 
 // Model text is stored redacted and on one line; the cards clean it again for Slack.
@@ -76,7 +117,7 @@ export class Issues {
   constructor(file: string) {
     if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
-    // Additive: new tables only. issue_events is append-only.
+    // Additive: new tables and columns only. issue_events is append-only.
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA busy_timeout = 5000;
@@ -95,6 +136,10 @@ export class Issues {
       CREATE TRIGGER IF NOT EXISTS issue_events_no_update BEFORE UPDATE ON issue_events BEGIN SELECT RAISE(ABORT, 'issue_events is append-only'); END;
       CREATE TRIGGER IF NOT EXISTS issue_events_no_delete BEFORE DELETE ON issue_events BEGIN SELECT RAISE(ABORT, 'issue_events is append-only'); END;
     `);
+    // The current click on an open issue (On it or Not an issue); its history is
+    // in issue_events. click_ts: Slack's time of the latest click, even one that changed nothing.
+    const cols = new Set((this.db.prepare(`PRAGMA table_info(issues)`).all() as Array<{ name: string }>).map((c) => c.name));
+    for (const c of ['disposition', 'disposed_by', 'disposed_at', 'muted_until', 'click_ts']) if (!cols.has(c)) this.db.exec(`ALTER TABLE issues ADD COLUMN ${c} TEXT`);
   }
 
   static memory(): Issues {
@@ -182,16 +227,156 @@ export class Issues {
     this.event(id, 'reminded', at, run ? { run } : {});
   }
 
-  // The urgent rows card went to the channel in this issue's thread.
+  // The urgent rows card was queued for the channel in this issue's thread.
+  // (The reminder clock counts what Slack accepted, from the outbox; this and
+  // the other queued news only count where nothing was delivered.)
   rowsPosted(id: string, at: Date, rows: string[]): void {
     this.event(id, 'rows_posted', at, { rows });
   }
 
+  // Resolving ends the episode, and with it On it or Not an issue.
   resolve(id: string, at: Date): void {
     this.tx(() => {
       const changed = this.db.prepare(`UPDATE issues SET status = 'resolved', resolved_at = ? WHERE id = ? AND status = 'open'`).run(at.toISOString(), id).changes;
-      if (changed) this.event(id, 'resolved', at, { rows: this.rowsOf(id) });
+      if (!changed) return;
+      const d = this.current(id);
+      this.clear(id);
+      this.event(id, 'resolved', at, { rows: this.rowsOf(id), ...(d ? { ended: d.kind } : {}) });
     });
+  }
+
+  // A click on the issue's Slack message. Only an open issue changes, and the
+  // same click again changes nothing (so Slack is updated once). A later click
+  // replaces an earlier one: the last person to say On it is on it.
+  // `actionTs` is Slack's time of the click: a click Slack delivers again, or
+  // one not newer than the latest click, changes nothing. `alongside`: more
+  // writes to engine.db that commit with a change, or not at all (its Slack
+  // message update).
+  click(id: string, click: Click, by: string, at: Date, actionTs?: string, alongside?: (db: DatabaseSync) => void): Clicked {
+    return this.tx((): Clicked => {
+      const row = this.row(id);
+      if (!row) return { result: 'unknown' };
+      const issue = this.full(row);
+      if (row.status !== 'open') return { result: 'resolved', issue };
+      // Slack's times compare as text: ten digits, a dot, six digits.
+      if (actionTs) {
+        const mark = (this.db.prepare(`SELECT click_ts FROM issues WHERE id = ?`).get(id) as { click_ts: string | null }).click_ts;
+        const recorded = this.db.prepare(`SELECT 1 FROM issue_events WHERE issue_id = ? AND type IN ('acknowledged', 'dismissed', 'undone') AND (json_extract(data, '$.action_ts') > ? OR (json_extract(data, '$.action_ts') = ? AND json_extract(data, '$.by') = ?))`).get(id, actionTs, actionTs, by);
+        if ((mark && mark >= actionTs) || recorded) return { result: 'stale', issue };
+        // The mark older clicks must beat, also when this one changes nothing.
+        this.db.prepare(`UPDATE issues SET click_ts = ? WHERE id = ?`).run(actionTs, id);
+      }
+      const before = this.disposition(id, at);
+      const ts = actionTs ? { action_ts: actionTs } : {};
+      if (click === 'undo') {
+        if (!before) return { result: 'unchanged', issue };
+        this.clear(id);
+        this.event(id, 'undone', at, { by, ...ts, was: before.kind, was_by: before.by });
+        alongside?.(this.db);
+        return { result: 'changed', issue };
+      }
+      if (before?.kind === click && before.by === by) return { result: 'unchanged', issue, now: before };
+      const now: Disposition = { kind: click, by, at: at.toISOString(), ...(click === 'dismissed' ? { until: new Date(at.getTime() + MUTE_DAYS * DAY).toISOString() } : {}) };
+      this.db.prepare(`UPDATE issues SET disposition = ?, disposed_by = ?, disposed_at = ?, muted_until = ? WHERE id = ?`).run(now.kind, by, now.at, now.until ?? null, id);
+      // A dismissal is a noise-rule candidate: it keeps the rows it was about.
+      this.event(id, click, at, { by, ...ts, ...(now.until ? { until: now.until, rows: issue.rows } : {}) });
+      alongside?.(this.db);
+      return { result: 'changed', issue, now };
+    });
+  }
+
+  private current(id: string): Disposition | undefined {
+    const d = this.db.prepare(`SELECT disposition AS kind, disposed_by AS actor, disposed_at AS at, muted_until AS until FROM issues WHERE id = ?`).get(id) as { kind: Disposition['kind'] | null; actor: string; at: string; until: string | null } | undefined;
+    return d?.kind ? { kind: d.kind, by: d.actor, at: d.at, ...(d.until ? { until: d.until } : {}) } : undefined;
+  }
+
+  private clear(id: string): void {
+    this.db.prepare(`UPDATE issues SET disposition = NULL, disposed_by = NULL, disposed_at = NULL, muted_until = NULL WHERE id = ?`).run(id);
+  }
+
+  // On it or Not an issue, as it stands at `at`: a mute past its end is over.
+  disposition(id: string, at: Date): Disposition | undefined {
+    const d = this.current(id);
+    return d && !(d.until && Date.parse(d.until) <= at.getTime()) ? d : undefined;
+  }
+
+  // A rise to critical ends Not an issue: the channel hears about it again.
+  liftMute(id: string, at: Date, run?: string): void {
+    this.tx(() => {
+      if (this.current(id)?.kind !== 'dismissed') return;
+      this.clear(id);
+      this.event(id, 'mute_lifted', at, { reason: 'critical', ...(run ? { run } : {}) });
+    });
+  }
+
+  // Mutes past their hard end (MUTE_DAYS), ended now. The issues they were on.
+  endMutes(at: Date): string[] {
+    return this.tx(() => {
+      const ids = (this.db.prepare(`SELECT id FROM issues WHERE disposition = 'dismissed' AND muted_until <= ? ORDER BY id`).all(at.toISOString()) as Array<{ id: string }>).map((r) => r.id);
+      for (const id of ids) {
+        this.clear(id);
+        this.event(id, 'mute_lifted', at, { reason: `${MUTE_DAYS} days` });
+      }
+      return ids;
+    });
+  }
+
+  // Rows of an issue someone is on got worse: code wrote one line in its thread
+  // instead of an AI run.
+  noteWorse(id: string, at: Date, rows: string[]): void {
+    this.event(id, 'worse_noted', at, { rows });
+  }
+
+  // Of these rows, those that belong only to open issues someone clicked, with
+  // that click: On it, or Not an issue while its mute lasts. A row that is also
+  // in an open issue nobody clicked is not claimed. On it wins over Not an issue.
+  claims(keys: string[], at: Date): Map<string, Disposition & { issue: string }> {
+    const out = new Map<string, Disposition & { issue: string }>();
+    if (!keys.length) return out;
+    const rows = this.db
+      .prepare(
+        `SELECT r.row_key AS key, i.id AS issue, CASE WHEN i.disposition = 'acknowledged' OR i.muted_until > ? THEN i.disposition END AS kind,
+         i.disposed_by AS actor, i.disposed_at AS at, i.muted_until AS until
+         FROM issue_rows r JOIN issues i ON i.id = r.issue_id AND i.status = 'open'
+         WHERE r.row_key IN (${keys.map(() => '?').join(',')}) ORDER BY i.id`,
+      )
+      .all(at.toISOString(), ...keys) as Array<{ key: string; issue: string; kind: Disposition['kind'] | null; actor: string | null; at: string | null; until: string | null }>;
+    const free = new Set(rows.filter((r) => !r.kind).map((r) => r.key));
+    for (const r of rows) {
+      if (free.has(r.key) || !r.kind || out.get(r.key)?.kind === 'acknowledged') continue;
+      out.set(r.key, { issue: r.issue, kind: r.kind, by: r.actor!, at: r.at!, ...(r.until ? { until: r.until } : {}) });
+    }
+    return out;
+  }
+
+  // Not an issue clicks that stand (an Undo right after one takes it back).
+  dismissals(id?: string): Array<Dismissal & { issue: string }> {
+    const events = this.db
+      .prepare(`SELECT issue_id, type, at, data FROM issue_events WHERE type IN ('dismissed', 'undone') ${id ? 'AND issue_id = ?' : ''} ORDER BY id`)
+      .all(...(id ? [id] : [])) as Array<{ issue_id: string; type: string; at: string; data: string }>;
+    const kept: Array<Dismissal & { issue: string }> = [];
+    for (const e of events) {
+      const d = JSON.parse(e.data) as { by?: string; rows?: string[]; was?: string };
+      if (e.type === 'dismissed') kept.push({ issue: e.issue_id, by: String(d.by), at: e.at, rows: d.rows ?? [] });
+      else if (d.was === 'dismissed') {
+        const i = kept.findLastIndex((k) => k.issue === e.issue_id);
+        if (i >= 0) kept.splice(i, 1);
+      }
+    }
+    return kept;
+  }
+
+  // For an admin: issues marked Not an issue, most often first. The rows are
+  // the ones the latest click was about.
+  noiseCandidates(): Array<{ issue: string; title: string; status: Issue['status']; rows: string[]; dismissals: Dismissal[] }> {
+    const by = new Map<string, Dismissal[]>();
+    for (const d of this.dismissals()) by.set(d.issue, [...(by.get(d.issue) ?? []), d]);
+    return [...by]
+      .map(([id, ds]) => {
+        const i = this.row(id)!;
+        return { issue: id, title: i.title, status: i.status, rows: ds.at(-1)!.rows, dismissals: ds.map(({ by, at, rows }) => ({ by, at, rows })) };
+      })
+      .sort((a, b) => b.dismissals.length - a.dismissals.length || b.dismissals.at(-1)!.at.localeCompare(a.dismissals.at(-1)!.at));
   }
 
   private row(id: string): IssueRow | undefined {
@@ -205,7 +390,8 @@ export class Issues {
   private full(r: IssueRow): Issue {
     const last = this.db.prepare(`SELECT data FROM issue_events WHERE issue_id = ? AND type IN ('opened', 'report_linked') ORDER BY id DESC LIMIT 1`).get(r.id) as { data: string } | undefined;
     const hypothesis = last ? String((JSON.parse(last.data) as { hypothesis?: unknown }).hypothesis ?? '') : '';
-    return { ...r, rows: this.rowsOf(r.id), hypothesis };
+    const { id, opened_at, last_at, resolved_at, status, severity, title } = r;
+    return { id, opened_at, last_at, resolved_at, status, severity, title, rows: this.rowsOf(r.id), hypothesis };
   }
 
   get(id: string): Issue | undefined {

@@ -30,6 +30,8 @@ import { InstallationTokens } from './mcp/github-app.js';
 import { RepoSync } from './mcp/reposync.js';
 import { Metrics, startHealth, startMetrics } from './metrics.js';
 import { sweep } from './engine/retention.js';
+import { controlsFor } from './slack/buttons.js';
+import { startButtons } from './slack/socket.js';
 
 const USAGE = `engine <command> [options]
 
@@ -168,6 +170,9 @@ function makeEngine(cfg: Config, runsDir = cfg.runsDir): Engine {
 function monitorAgent(cfg: Config): MonitorAgent {
   return { engine: makeEngine(cfg), agent: loadAgent(join(cfg.agentsDir, 'monitor'), cfg.memoryDir) };
 }
+// The buttons (On it, Not an issue) are on: Socket Mode and the bot. Off, the
+// clicks already recorded are kept and ignored.
+const buttonsOn = (cfg: Config) => !!(cfg.slackApp && cfg.slackBotToken);
 // The issue record lives in the engine's SQLite file, next to the Slack outbox.
 // A fresh look (--fresh) starts from no issues too.
 const issueRecord = (cfg: Config, fresh = false) => (fresh ? Issues.memory() : new Issues(join(cfg.runsDir, 'engine.db')));
@@ -184,7 +189,7 @@ async function patrolEvery(cfg: Config, noise: Noise, owners: Owners, sink: Card
     state: State.load(cfg.stateFile),
     sink,
     windowMin: w,
-    opts: { llm: a.llm, post: a.post, log, owners, issues: issueRecord(cfg) },
+    opts: { llm: a.llm, post: a.post, log, owners, issues: issueRecord(cfg), buttons: buttonsOn(cfg) },
     monitor: a.llm ? monitorAgent(cfg) : undefined,
     onPass: metrics ? (at, r) => metrics.patrol(at, r) : undefined,
   });
@@ -276,8 +281,19 @@ async function main() {
   const noise = Noise.load(cfg.noiseFile);
   const owners = Owners.load(cfg.ownersFile);
   // The bot when configured (threads, one message per issue), else the webhook.
-  const transport = cfg.slackBotToken ? botTransport(cfg.slackBotToken, cfg.slackChannel!) : cfg.slackWebhookUrl ? webhookTransport(cfg.slackWebhookUrl) : undefined;
-  const sink = new CardSink(cfg.outDir, transport ? new SlackOutbox(join(cfg.runsDir, 'engine.db'), transport) : undefined);
+  const bot = cfg.slackBotToken ? botTransport(cfg.slackBotToken, cfg.slackChannel!) : undefined;
+  const transport = bot ?? (cfg.slackWebhookUrl ? webhookTransport(cfg.slackWebhookUrl) : undefined);
+  // The buttons (On it, Not an issue): Socket Mode (SLACK_APP_TOKEN) and the
+  // bot, in the process that keeps posting the patrol. Their clicks shape what
+  // any patrol posts; only this process shows them and takes clicks.
+  const posting = a.post && ((cmd === 'serve' && a.patrol) || cmd === 'loop');
+  if (cfg.slackApp && posting && !bot) log('SLACK_APP_TOKEN is set but the bot is not (SLACK_BOT_TOKEN, SLACK_CHANNEL_ID): no buttons');
+  const clicks = cfg.slackApp && posting && bot ? issueRecord(cfg) : undefined;
+  const sink = new CardSink(cfg.outDir, transport ? new SlackOutbox(join(cfg.runsDir, 'engine.db'), transport, clicks ? { controls: controlsFor(clicks) } : {}) : undefined);
+  const buttons = () =>
+    clicks && bot && sink.outbox
+      ? startButtons({ appToken: cfg.slackApp!.token, appId: cfg.slackApp!.appId, channel: cfg.slackChannel!, team: () => bot.team(), issues: clicks, outbox: sink.outbox, log })
+      : undefined;
   const w = cfg.windowMinutes;
 
   switch (cmd) {
@@ -295,7 +311,7 @@ async function main() {
       if (!name) throw new Error('usage: run <agent> --task "<text>"');
       if (name === 'monitor') {
         const state = a.fresh ? State.memory() : State.load(cfg.stateFile);
-        const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, align(new Date(), w), { llm: true, post: a.post, log, owners, issues: issueRecord(cfg, a.fresh) }, monitorAgent(cfg));
+        const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, align(new Date(), w), { llm: true, post: a.post, log, owners, issues: issueRecord(cfg, a.fresh), buttons: buttonsOn(cfg) }, monitorAgent(cfg));
         for (const c of r.cards) console.log(`card: ${c}`);
         return;
       }
@@ -386,6 +402,7 @@ async function main() {
         engine: makeEngine(cfg),
         users,
         repos: loadRepos(cfg.mcp.reposFile, cfg.mcp.reposDir, cfg.mcp.reposGithub),
+        issues: issueRecord(cfg),
         ...(cfg.mcp.login ? { login: new Login(cfg.mcp.login) } : {}),
         ...(cfg.mcp.notifySlack && cfg.slackWebhookUrl ? { notify: slackNotifier(cfg.slackWebhookUrl) } : {}),
         ...((): { telemetry?: Telemetry } => {
@@ -418,7 +435,12 @@ async function main() {
         if (!ctx.users.list().some((u) => u.role === 'admin')) throw new Error('the Keycloak sign-in is on but there is no admin to invite anyone: set ENGINE_ADMINS or `user invite <email> --admin`');
       }
       const server = startHttp(ctx, { host, port });
-      beforeExit = () => (server.close(), shutdown(ctx, 'engine shutting down', 20_000));
+      const socket = buttons();
+      beforeExit = async () => {
+        server.close();
+        await socket?.stop();
+        return shutdown(ctx, 'engine shutting down', 20_000);
+      };
       log(`MCP on http://${host}:${port}/mcp · sign-in ${ctx.login ? `Keycloak ${cfg.mcp.login!.issuer} (client ${cfg.mcp.login!.clientId})` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
       if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
       const metrics = metricsServer(cfg);
@@ -463,7 +485,7 @@ async function main() {
     case 'patrol': {
       const state = a.fresh ? State.memory() : State.load(cfg.stateFile);
       const at = align(a.at ? date(a.at, 'at') : new Date(), w);
-      const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log, owners, issues: issueRecord(cfg, a.fresh) }, a.llm ? monitorAgent(cfg) : undefined);
+      const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log, owners, issues: issueRecord(cfg, a.fresh), buttons: buttonsOn(cfg) }, a.llm ? monitorAgent(cfg) : undefined);
       for (const row of r.summary.send) console.log(rowLine(row));
       for (const c of r.cards) console.log(`card: ${c}`);
       return;
@@ -472,6 +494,8 @@ async function main() {
     case 'loop': {
       const metrics = metricsServer(cfg);
       if (a.port) startHealth({ host: a.host ?? '127.0.0.1', port: Number(a.port) });
+      const socket = buttons();
+      if (socket) beforeExit = () => socket.stop();
       return void (await patrolEvery(cfg, noise, owners, sink, w, metrics));
     }
 

@@ -14,7 +14,7 @@ import { checkReport, type Report } from '../src/investigate/report.js';
 import { buildServer, type McpContext } from '../src/mcp/server.js';
 import { Users } from '../src/mcp/users.js';
 import { CardSink } from '../src/output/sink.js';
-import { SlackOutbox, webhookTransport, type SlackMessage, type Transport } from '../src/output/slack.js';
+import { SlackError, SlackOutbox, webhookTransport, type SlackMessage, type Transport } from '../src/output/slack.js';
 import { Issues } from '../src/patrol/issues.js';
 import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
@@ -293,6 +293,42 @@ test('an urgent rows card in the issue thread is news: no reminder broadcast 3 h
   const sibling = await w.patrol(tel, 26); // 26 h after it opened, 3 h after the rows card
   assert.equal(sibling.filed[0]?.action, 'linked');
   assert.deepEqual(t.sent.slice(sent).map((s) => s.reply_broadcast), [false]);
+});
+
+test('the reminder clock counts what Slack accepted: a rows card it refused is not news', async () => {
+  const login = (t: number) => (t >= T0 && t < T0 + 40 * H ? (t >= T0 + 23 * H ? 300 : 30) : 0);
+  const tel = schedule({ '/v1/auth/login': login, '/v1/auth/signup': between(26, 40) });
+  const t = bot();
+  // Slack refuses the urgent rows card for the issue's thread; everything else goes out.
+  const refusing: Transport = { threads: true, post: async (m) => (/^Patrol /.test(m.text) ? Promise.reject(new SlackError('Slack: invalid_blocks', undefined, true)) : t.post(m)) };
+  const w = setup(refusing, linker());
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  await w.patrol(tel, 23); // ten times worse: the rows card is queued for the thread, and refused
+  assert.ok(w.issues!.events(id).some((e) => e.type === 'rows_posted'), 'queued for the channel');
+  assert.deepEqual(w.box.status().find((s) => s.status === 'failed'), { status: 'failed', n: 1 });
+  const sibling = await w.patrol(tel, 26); // the channel last saw the issue 26 h ago
+  assert.equal(sibling.filed[0]?.action, 'reminded');
+  assert.deepEqual([t.sent.at(-1)!.thread_ts, t.sent.at(-1)!.reply_broadcast], ['1700000000.000001', true]);
+});
+
+test('a reminder Slack has not taken yet holds the next one: no pile of broadcasts when it comes back', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/auth/signup': between(25, 40), '/v1/auth/reset': between(26, 40) });
+  const t = bot();
+  let down = false;
+  // Slack refuses replies shown in the channel for a while; the rest goes out.
+  const flaky: Transport = { threads: true, post: async (m) => (down && m.reply_broadcast ? Promise.reject(new SlackError('Slack: HTTP 503')) : t.post(m)) };
+  const w = setup(flaky, linker());
+  await w.patrol(tel, 0);
+  down = true;
+  const late = await w.patrol(tel, 25); // the channel last saw the issue 25 h ago
+  assert.equal(late.filed[0]?.action, 'reminded');
+  const next = await w.patrol(tel, 26);
+  assert.equal(next.filed[0]?.action, 'linked', 'the first reminder is still queued: no second one');
+  down = false;
+  await w.patrol(tel, 26.25);
+  assert.equal(t.sent.filter((s) => s.reply_broadcast).length, 1, 'one reminder in the channel');
+  assert.deepEqual(w.box.status(), [{ status: 'sent', n: 3 }]);
 });
 
 test("a new cause on an open issue's rows gets its own message, not that issue's thread", async () => {

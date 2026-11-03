@@ -13,7 +13,8 @@
   },
   "settings": {
     "org_deploy_enabled": false,
-    "socket_mode_enabled": false,
+    "socket_mode_enabled": true,
+    "interactivity": { "is_enabled": true },
     "token_rotation_enabled": false
   }
 }
