@@ -143,12 +143,13 @@ function setup(transport: Transport, decide: Decide, o: { issues?: boolean } = {
     agent: loadAgent(join(c.agentsDir, 'monitor')),
   };
   const state = State.memory();
+  const rules = { noise: new Noise({}) }; // a test may add a noise rule part way
   const logs: string[] = [];
   const patrol = async (tel: FakeTelemetry, hours: number): Promise<PatrolResult> => {
     clock.now = at(hours);
-    return patrolOnce(tel, c, new Noise({}), state, sink, at(hours), { llm: true, post: true, log: (s) => logs.push(s), issues }, monitor);
+    return patrolOnce(tel, c, rules.noise, state, sink, at(hours), { llm: true, post: true, log: (s) => logs.push(s), issues }, monitor);
   };
-  return { c, db, box, issues, session, patrol, logs, state };
+  return { c, db, box, issues, session, patrol, logs, state, rules };
 }
 
 // ---- the posting rule ---------------------------------------------------------------
@@ -255,6 +256,43 @@ test('an issue resolves when every row is back, with one recovery note in its th
   assert.equal(w.issues!.get(id)!.resolved_at, '2026-11-02T08:30:00.000Z');
   await w.patrol(tel, 0.75);
   assert.equal(t.sent.length, 2, 'resolved once');
+});
+
+test('a row hidden by a noise rule still fires: its issue stays open until it stops', async () => {
+  const login = (t: number) => (between(0, 0.25)(t) || between(0.5, 2)(t));
+  const tel = schedule({ '/v1/auth/login': login, '/v1/ownership/transfer': between(0, 1) });
+  const t = bot();
+  const w = setup(t, linker());
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  await w.patrol(tel, 0.25); // login back to normal, transfer still fires
+  w.rules.noise = new Noise({ noise: [{ id: 'login-flake', reason: 'known flake', route: '/v1/auth/login', expires: '2026-12-01' }] });
+  const hidden = await w.patrol(tel, 0.5); // login fires again, hidden by the rule
+  assert.deepEqual(hidden.summary.suppressed.map((s) => s.row.key), [key('/v1/auth/login')]);
+  const transferBack = await w.patrol(tel, 1);
+  assert.deepEqual(transferBack.summary.recovered, [key('/v1/ownership/transfer')]);
+  assert.deepEqual(transferBack.resolved, [], 'login still fires under the rule');
+  assert.ok(w.logs.includes(`${id}: 1 of 2 row(s) back to normal, still open`));
+  assert.equal(t.sent.filter((s) => s.text.includes('Back to normal')).length, 0);
+  const loginBack = await w.patrol(tel, 2);
+  assert.deepEqual(loginBack.resolved, [id]);
+  assert.equal(t.sent.filter((s) => s.text.includes('Back to normal')).length, 1);
+});
+
+test('an urgent rows card in the issue thread is news: no reminder broadcast 3 h later', async () => {
+  const login = (t: number) => (t >= T0 && t < T0 + 40 * H ? (t >= T0 + 23 * H ? 300 : 30) : 0);
+  const tel = schedule({ '/v1/auth/login': login, '/v1/auth/signup': between(26, 40) });
+  const t = bot();
+  const w = setup(t, linker());
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  await w.patrol(tel, 23); // ten times worse: urgent, the rows card goes to the channel in the issue's thread
+  assert.ok(t.sent.some((s) => s.thread_ts === '1700000000.000001' && s.reply_broadcast === true), 'the rows card was broadcast in the thread');
+  assert.ok(w.issues!.events(id).some((e) => e.type === 'rows_posted' && e.at === at(23).toISOString()));
+  const sent = t.sent.length;
+  const sibling = await w.patrol(tel, 26); // 26 h after it opened, 3 h after the rows card
+  assert.equal(sibling.filed[0]?.action, 'linked');
+  assert.deepEqual(t.sent.slice(sent).map((s) => s.reply_broadcast), [false]);
 });
 
 test('webhook: a repeat is not posted (the card and the run keep it); news still is', async () => {

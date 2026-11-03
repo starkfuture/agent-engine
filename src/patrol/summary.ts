@@ -68,6 +68,7 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
     const rule = noise.suppressedBy(row, at);
     if (rule) {
       suppressed.push({ row, rule });
+      state.firing(row.key);
       continue;
     }
     const novelty = state.novelty(row, at);

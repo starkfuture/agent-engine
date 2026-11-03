@@ -26,7 +26,7 @@ export interface Issue {
   hypothesis: string; // the latest report's likely cause, one line
 }
 
-export type IssueEventType = 'opened' | 'report_linked' | 'severity_raised' | 'resolved' | 'reopened' | 'reminded';
+export type IssueEventType = 'opened' | 'report_linked' | 'severity_raised' | 'resolved' | 'reopened' | 'reminded' | 'rows_posted';
 export interface IssueEvent {
   id: number;
   issue_id: string;
@@ -48,7 +48,7 @@ export interface Linked {
   issue: Issue;
   raisedFrom?: Severity; // set when this report raised the severity
   reopenedFrom?: string; // when it reopened a resolved issue: its resolved_at
-  lastNewsAt?: string; // before this report: when the channel last heard about it (opened, raised, reopened, reminded)
+  lastNewsAt?: string; // before this report: when the channel last heard about it (opened, raised, reopened, reminded, urgent rows)
 }
 
 const H = 3600_000;
@@ -155,7 +155,7 @@ export class Issues {
       if (!before) throw new Error(`no issue ${id}`);
       const iso = at.toISOString();
       const res: Omit<Linked, 'issue'> = {};
-      const news = this.db.prepare(`SELECT MAX(at) AS at FROM issue_events WHERE issue_id = ? AND type IN ('opened', 'severity_raised', 'reopened', 'reminded')`).get(id) as { at: string | null };
+      const news = this.db.prepare(`SELECT MAX(at) AS at FROM issue_events WHERE issue_id = ? AND type IN ('opened', 'severity_raised', 'reopened', 'reminded', 'rows_posted')`).get(id) as { at: string | null };
       if (news.at) res.lastNewsAt = news.at;
       if (before.status === 'resolved' && o.reopen) {
         // A new episode: its severity starts from this report.
@@ -180,6 +180,11 @@ export class Issues {
   // a long time without news there.
   remind(id: string, at: Date, run?: string): void {
     this.event(id, 'reminded', at, run ? { run } : {});
+  }
+
+  // The urgent rows card went to the channel in this issue's thread.
+  rowsPosted(id: string, at: Date, rows: string[]): void {
+    this.event(id, 'rows_posted', at, { rows });
   }
 
   resolve(id: string, at: Date): void {

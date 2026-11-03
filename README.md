@@ -100,7 +100,7 @@ The incoming webhook (`SLACK_WEBHOOK_URL`) still works as a fallback, without th
 
 ### Issues: one cause, one thread
 
-A critical or major AI report opens an **issue**: the engine's record of one cause, with a short id like `I-7f3a`. It is the bot's finding, not an incident (a person may promote it to one on the team's board, and the bot can be wrong). It lives in the engine's SQLite file next to the outbox: `issues`, `issue_rows` (the rows it covers) and an append-only `issue_events` (opened, report_linked, severity_raised, resolved, reopened, reminded).
+A critical or major AI report opens an **issue**: the engine's record of one cause, with a short id like `I-7f3a`. It is the bot's finding, not an incident (a person may promote it to one on the team's board, and the bot can be wrong). It lives in the engine's SQLite file next to the outbox: `issues`, `issue_rows` (the rows it covers) and an append-only `issue_events` (opened, report_linked, severity_raised, resolved, reopened, reminded, rows_posted).
 
 The investigator is shown the open issues and those resolved in the last 24 h (at most 20, as fenced data: id, title, severity, first seen, last report, rows, latest cause). Each report says `"issue": "<id>"` when it has the same cause, even on different rows, or `"new"`. An id that wasn't on the list is rejected and the model resubmits.
 
@@ -110,7 +110,7 @@ What a report posts:
 |---|---|---|
 | `new`, critical or major | a new message (or a reply on its urgent rows card, as before); opens the issue | a message |
 | same issue, same or lower severity | a reply in the issue's thread, **not** shown in the channel, also after 24 h | nothing (the card and `get_run` keep it) |
-| same issue, but the channel has heard nothing about it for 24 h | a reply in its thread, also shown in the channel (at most once a day per open issue, so a chronic one isn't hidden for good) | a message |
+| same issue, but the channel has heard nothing about it for 24 h (no new, raised, reopened or reminder post, and no urgent rows card in its thread) | a reply in its thread, also shown in the channel (at most once a day per open issue, so a chronic one isn't hidden for good) | a message |
 | same issue, severity rises (major → critical) | a reply in its thread, also shown in the channel | a message |
 | a resolved issue (it came back) | reopens it; a reply in its thread, also shown in the channel | a message |
 | minor or noise | not posted, as before; a linked one's rows still join the issue | nothing |

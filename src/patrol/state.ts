@@ -81,6 +81,13 @@ export class State {
     return this.data.rows[key]?.firstSeen;
   }
 
+  // A row a noise rule hides still fires: it is not back to normal. Only its
+  // recovery marker changes; novelty and the Slack window stay as they were.
+  firing(key: string): void {
+    const m = this.data.rows[key];
+    if (m) delete m.recoveredAt;
+  }
+
   // Set once a reported row is seen healthy again; cleared when it fires again.
   recoveredAt(key: string): string | undefined {
     return this.data.rows[key]?.recoveredAt;

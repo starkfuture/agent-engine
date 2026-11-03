@@ -207,6 +207,8 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   // Urgent rows that all belong to one open issue go into its thread, still broadcast.
   const rowsIssue = urgentRows.length && o.issues ? record('finding the issue of urgent rows', () => o.issues!.holding(urgentRows.map((r) => r.key)), undefined) : undefined;
   emit(card, `${stamp(summary.at)}-rows`, urgentRows.length ? { kind: 'rows', keys: urgentRows.map((r) => r.key), broadcast: true, issue: rowsIssue?.id } : undefined);
+  // The channel heard about the issue: that restarts its reminder clock.
+  if (rowsIssue && o.post) record(`noting the rows card on ${rowsIssue.id}`, () => o.issues!.rowsPosted(rowsIssue.id, at, urgentRows.map((r) => r.key)), undefined);
   if (urgentRows.length) {
     log(`rows card to Slack: ${urgentRows.length} urgent row(s)${rowsIssue ? ` (in ${rowsIssue.id}'s thread)` : ''}`);
     await flush();
