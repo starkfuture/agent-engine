@@ -35,7 +35,7 @@ export const findingsOutput: OutputSpec<Findings> = {
   max: 1,
 };
 
-export function renderFindings(f: Findings, footer: string, dissent: string[] = []): string {
+export function renderFindings(f: Findings, footer: string, dissent: string[] = [], dissentHead = '⚠️ Challenge: ESCALATE (a human decides)'): string {
   return [
     `# ${f.title}`,
     '',
@@ -45,7 +45,7 @@ export function renderFindings(f: Findings, footer: string, dissent: string[] = 
     ...f.findings.map((x) => `- **${x.status}**: ${x.claim}${x.evidence.map((e) => `\n  - ${e.id}: “${e.quote}”`).join('')}`),
     ...(f.next_steps.length ? ['', '## Next steps', ...f.next_steps.map((s) => `- ${s}`)] : []),
     ...(f.not_checked.length ? ['', '## Not checked', ...f.not_checked.map((s) => `- ${s}`)] : []),
-    ...(dissent.length ? ['', '## ⚠️ Challenge: ESCALATE (a human decides)', ...dissent] : []),
+    ...(dissent.length ? ['', `## ${dissentHead}`, ...dissent] : []),
     '',
     `_${footer}_`,
   ].join('\n');

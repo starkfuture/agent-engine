@@ -18,10 +18,10 @@ import { SlackError, SlackOutbox, webhookTransport, type SlackMessage, type Tran
 import { Issues } from '../src/patrol/issues.js';
 import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
-import { patrolOnce, type MonitorAgent, type PatrolResult } from '../src/runner.js';
+import { patrolOnce, shownInChannel, type MonitorAgent, type PatrolResult } from '../src/runner.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { fakeSession, ok } from './fake-session.js';
+import { fail, fakeSession, ok } from './fake-session.js';
 import { FakeTelemetry, H, testConfig } from './fake.js';
 
 // ---- the world: legacy /v1 routes whose 400s fire on a schedule -----------------
@@ -80,14 +80,28 @@ function parse(prompt: string): Seen {
   return { prompt, rows, issues };
 }
 
+// What the fake challenger says, given its own evidence id and the one the
+// report cites: its submission, or 'fail' (it runs out of budget first).
+type Judge = (ids: { mine: string; theirs: string }) => { items?: unknown[]; objections?: unknown[]; overall?: string } | 'fail';
+const agree: Judge = () => ({ items: [{ item: 1, holds: 'yes', reason: 'The counts match the evidence.' }] });
+
 // One fake investigation per patrol: read one tool result, cite it, submit
-// one report covering every row, as decided. A challenger (big spikes) agrees.
-function model(decide: Decide): Session & { seen: Seen[] } {
+// one report covering every row, as decided. A challenger re-checks one tool
+// result and judges as told (by default it agrees).
+function model(decide: Decide, judge: Judge = agree): Session & { seen: Seen[]; challenges: Array<{ model: string; prompt: string }> } {
   const seen: Seen[] = [];
+  const challenges: Array<{ model: string; prompt: string }> = [];
   const session = (req: Parameters<Session>[0]) =>
     fakeSession(async function* (sim) {
       if (sim.req.tools.some((t) => t.name === 'submit_challenge')) {
-        await sim.mcp('submit_challenge', { objections: [], overall: 'Holds up: the counts match the evidence.' });
+        challenges.push({ model: sim.req.model, prompt: sim.req.prompt });
+        const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+        const said = judge({ mine: /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!, theirs: /"id": "(E-[0-9a-f]{4}-\d+)"/.exec(sim.req.prompt)![1]! });
+        if (said === 'fail') {
+          yield fail('error_max_budget_usd', 1);
+          return;
+        }
+        await sim.mcp('submit_challenge', { objections: [], overall: 'Holds up: the counts match the evidence.', ...said });
         yield ok(0.05, 1);
         return;
       }
@@ -106,7 +120,7 @@ function model(decide: Decide): Session & { seen: Seen[] } {
       } else assert.equal(r.isError, false, r.text);
       yield ok(0.1, 3);
     })(req);
-  return Object.assign(session, { seen });
+  return Object.assign(session, { seen, challenges });
 }
 
 // The same cause, linked whenever an issue is listed (open or resolved).
@@ -130,14 +144,14 @@ function webhook(): Transport & { sent: Sent[] } {
 }
 
 // A patrol world with one engine.db for the issues and the outbox, as in production.
-function setup(transport: Transport, decide: Decide, o: { issues?: boolean; oncall?: string | undefined } = {}) {
+function setup(transport: Transport, decide: Decide, o: { issues?: boolean; oncall?: string | undefined; judge?: Judge; buttons?: boolean } = {}) {
   const c: Config = { ...testConfig(), slackOncall: o.oncall };
   const db = join(c.runsDir, 'engine.db');
   const clock = { now: new Date(T0) };
   const box = new SlackOutbox(db, transport, { now: () => clock.now, sleep: async () => {}, gapMs: 0 });
   const sink = new CardSink(c.outDir, box);
   const issues = o.issues === false ? undefined : new Issues(db);
-  const session = model(decide);
+  const session = model(decide, o.judge);
   const monitor: MonitorAgent = {
     engine: { store: new Store(db), runsDir: c.runsDir, stopFile: join(c.runsDir, 'STOP'), session, dailyCapUsd: 1000, llmAvailable: true },
     agent: loadAgent(join(c.agentsDir, 'monitor')),
@@ -147,9 +161,23 @@ function setup(transport: Transport, decide: Decide, o: { issues?: boolean; onca
   const logs: string[] = [];
   const patrol = async (tel: FakeTelemetry, hours: number): Promise<PatrolResult> => {
     clock.now = at(hours);
-    return patrolOnce(tel, c, rules.noise, state, sink, at(hours), { llm: true, post: true, log: (s) => logs.push(s), issues }, monitor);
+    return patrolOnce(tel, c, rules.noise, state, sink, at(hours), { llm: true, post: true, log: (s) => logs.push(s), issues, buttons: o.buttons }, monitor);
   };
-  return { c, db, box, issues, session, patrol, logs, state, rules };
+  return { c, db, box, issues, session, monitor, patrol, logs, state, rules };
+}
+
+// What get_run answers about a run, as an admin.
+async function getRun(w: ReturnType<typeof setup>, runId: string): Promise<string> {
+  const users = Users.load(join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json'));
+  users.add('root', { admin: true });
+  const engine = { store: new Store(w.db), runsDir: w.c.runsDir, stopFile: join(w.c.runsDir, 'STOP'), session: w.session, dailyCapUsd: 1000, llmAvailable: true };
+  const ctx: McpContext = { cfg: { ...w.c, mcp: { ...w.c.mcp, usersFile: users.file } }, engine, users, repos: new Map() };
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await buildServer(ctx, users.list().find((u) => u.name === 'root')!).connect(st);
+  const client = new Client({ name: 't', version: '1' });
+  await client.connect(ct);
+  const got = (await client.callTool({ name: 'get_run', arguments: { run_id: runId } })) as { content: Array<{ text: string }> };
+  return got.content[0]!.text;
 }
 
 // ---- the posting rule ---------------------------------------------------------------
@@ -336,6 +364,8 @@ test('the reminder clock counts what Slack accepted: a rows card it refused is n
   const sibling = await w.patrol(tel, 26); // the channel last saw the issue 26 h ago
   assert.equal(sibling.filed[0]?.action, 'reminded');
   assert.deepEqual([t.sent.at(-1)!.thread_ts, t.sent.at(-1)!.reply_broadcast], ['1700000000.000001', true]);
+  // The record says 3 h, Slack's clock 26 h: the challenge goes by Slack's clock too.
+  assert.equal(sibling.investigation?.challenge?.verdict, 'upheld', 'the reminder was challenged');
 });
 
 test('a reminder Slack has not taken yet holds the next one: no pile of broadcasts when it comes back', async () => {
@@ -422,16 +452,7 @@ test('get_run shows the issue a monitor report went to', async () => {
   const w = setup(bot(), linker());
   const r = await w.patrol(tel, 0);
   const id = r.filed[0]!.action === 'opened' ? r.filed[0]!.issue.id : '';
-  const users = Users.load(join(mkdtempSync(join(tmpdir(), 'users-')), 'users.json'));
-  users.add('root', { admin: true });
-  const engine = { store: new Store(w.db), runsDir: w.c.runsDir, stopFile: join(w.c.runsDir, 'STOP'), session: w.session, dailyCapUsd: 1000, llmAvailable: true };
-  const ctx: McpContext = { cfg: { ...w.c, mcp: { ...w.c.mcp, usersFile: users.file } }, engine, users, repos: new Map() };
-  const [ct, st] = InMemoryTransport.createLinkedPair();
-  await buildServer(ctx, users.list().find((u) => u.name === 'root')!).connect(st);
-  const client = new Client({ name: 't', version: '1' });
-  await client.connect(ct);
-  const got = (await client.callTool({ name: 'get_run', arguments: { run_id: r.investigation!.runId } })) as { content: Array<{ text: string }> };
-  assert.match(got.content[0]!.text, new RegExp(`### Report 1 · opened ${id} \\(major\\)`));
+  assert.match(await getRun(w, r.investigation!.runId), new RegExp(`### Report 1 · opened ${id} \\(major\\)`));
 });
 
 // ---- the on-call mention ---------------------------------------------------------
@@ -580,6 +601,205 @@ test('a fresh engine.db and one from before issues both migrate, and a queued po
   assert.equal((await box.flush()).sent, 1);
 });
 
+// ---- the second check: Opus before the channel ------------------------------------
+
+test('a report the channel would see is checked by Opus first; a quiet reply in its thread is not', async () => {
+  // 30 400s a window: no urgent rows, so the old gate never fired.
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(2, 40), '/v1/auth/signup': between(26, 40) });
+  const t = recorder(true);
+  const w = setup(t, linker());
+  const first = await w.patrol(tel, 0);
+  assert.equal(first.filed[0]?.action, 'opened');
+  assert.deepEqual(w.session.challenges.map((c) => c.model), ['claude-opus-5-5'], 'a new major issue is challenged');
+  assert.equal(first.investigation?.challenge?.verdict, 'upheld');
+  assert.match(JSON.stringify(t.sent[0]!.blocks), /second check agrees/);
+  const sibling = await w.patrol(tel, 2);
+  assert.equal(sibling.filed[0]?.action, 'linked');
+  assert.equal(sibling.investigation?.challenge, undefined, 'a quiet reply in the thread is not');
+  assert.equal(w.session.challenges.length, 1);
+  const nextDay = await w.patrol(tel, 26);
+  assert.equal(nextDay.filed[0]?.action, 'reminded');
+  assert.equal(w.session.challenges.length, 2, 'the 24 h reminder shows in the channel: challenged');
+  assert.ok(w.logs.some((l) => /^investigation ok: .*, challenge upheld \(\$0\.050\)$/.test(l)), 'the log has the challenge and its cost');
+});
+
+test('what the channel would see: a new issue, a rise, a reopen, a reminder, or a report with no issue record', () => {
+  const issues = Issues.memory();
+  const open = issues.open({ title: 'Sign-in rejects emails with a trailing space', severity: 'major', rows: ['k'], hypothesis: 'h' }, at(0));
+  const r = (over: Partial<Report>) => report({ rows: ['k'], issue: open.id, ...over });
+  assert.equal(shownInChannel(issues, r({ issue: 'new' }), at(1)), true, 'a new issue');
+  assert.equal(shownInChannel(issues, r({}), at(1)), false, 'the same cause again: a quiet reply');
+  assert.equal(shownInChannel(issues, r({ severity: 'critical' }), at(1)), true, 'a severity rise');
+  assert.equal(shownInChannel(issues, r({}), at(24)), true, 'a 24 h reminder');
+  assert.equal(shownInChannel(undefined, r({}), at(1)), true, 'no issue record: posted on its own');
+  assert.equal(shownInChannel(issues, r({ issue: 'new', severity: 'minor' }), at(1)), false, 'minor is never shown');
+  issues.resolve(open.id, at(2));
+  assert.equal(shownInChannel(issues, r({}), at(3)), true, 'a reopen');
+});
+
+test("with the buttons and Slack's clock, what the channel would see is what fileReport would post", () => {
+  const issues = Issues.memory();
+  const open = issues.open({ title: 'Sign-in rejects emails with a trailing space', severity: 'major', rows: ['k'], hypothesis: 'h' }, at(0));
+  issues.rowsPosted(open.id, at(23), ['k']); // queued for the channel, never delivered
+  const r = (over: Partial<Report>) => report({ rows: ['k'], issue: open.id, ...over });
+  const slack = { newsAt: () => at(0).toISOString(), newsPending: () => false };
+  assert.equal(shownInChannel(issues, r({}), at(25)), false, 'by the record: news 2 h ago');
+  assert.equal(shownInChannel(issues, r({}), at(25), slack), true, "by Slack's clock: 25 h, a reminder");
+  assert.equal(shownInChannel(issues, r({}), at(25), { ...slack, newsPending: () => true }), false, 'news still queued: no reminder');
+  const clicks = { ...slack, clicks: true };
+  issues.click(open.id, 'acknowledged', 'U0ALICE', at(1));
+  assert.equal(shownInChannel(issues, r({}), at(25), clicks), false, 'On it: no reminder');
+  assert.equal(shownInChannel(issues, r({ severity: 'critical' }), at(25), clicks), true, 'On it, raised to critical: shown');
+  issues.click(open.id, 'dismissed', 'U0BOB', at(2));
+  assert.equal(shownInChannel(issues, r({}), at(25), clicks), false, 'Not an issue: muted');
+  assert.equal(shownInChannel(issues, r({}), at(3), { ...clicks, breaksMute: (k) => k === 'k' }), true, 'a protected row or a big jump breaks the mute: shown');
+  assert.equal(shownInChannel(issues, r({ severity: 'critical' }), at(3), clicks), true, 'a rise to critical ends the mute: shown');
+  assert.equal(shownInChannel(issues, r({}), at(25), slack), true, 'buttons off: clicks are ignored');
+});
+
+test('no reminder goes out unchallenged: a click while the run settles leaves it to a later patrol', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/auth/signup': between(25, 40), '/v1/auth/reset': between(26, 40) });
+  const t = bot();
+  const w = setup(t, linker(), { buttons: true });
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  w.issues!.click(id, 'acknowledged', 'U0ALICE', at(1));
+  // On it when the challenge is decided (no reminder, so none), undone before the report is filed.
+  const store = w.monitor.engine.store;
+  const settle = store.settle.bind(store);
+  store.settle = (run, s) => (w.issues!.click(id, 'undo', 'U0ALICE', at(25)), settle(run, s));
+  const late = await w.patrol(tel, 25);
+  assert.equal(late.investigation?.challenge, undefined, 'not challenged');
+  assert.equal(late.filed[0]?.action, 'linked', 'so not a reminder, although one is due now');
+  assert.ok(!t.sent.some((s) => s.reply_broadcast), 'nothing shown in the channel');
+  store.settle = settle;
+  const next = await w.patrol(tel, 26); // the next report reminds, and is challenged first
+  assert.equal(next.filed[0]?.action, 'reminded');
+  assert.equal(next.investigation?.challenge?.verdict, 'upheld');
+});
+
+test("a repeat about an issue Slack never took is that issue's first post in the channel: it is challenged", async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(2, 40) });
+  const t = recorder(true);
+  // Slack refuses the new issue's message for good; everything else goes out.
+  const refusing: Transport = { threads: true, post: async (m) => (/^🟠 Major: /.test(m.text) ? Promise.reject(new SlackError('Slack: invalid_blocks', undefined, true)) : t.post(m)) };
+  const w = setup(refusing, linker());
+  assert.equal((await w.patrol(tel, 0)).filed[0]?.action, 'opened');
+  assert.equal(t.sent.length, 0, 'the issue never reached Slack');
+  const sibling = await w.patrol(tel, 2); // same cause, same severity, 2 h later: a repeat
+  assert.equal(sibling.filed[0]?.action, 'linked');
+  assert.equal(sibling.investigation?.challenge?.verdict, 'upheld', 'challenged, because it goes out as the first post');
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.sent[0]!.thread_ts, undefined, 'top-level: shown in the channel');
+  assert.match(JSON.stringify(t.sent[0]!.blocks), /second check agrees/);
+});
+
+test('a report that becomes news only after the check was decided (the record failed) is posted, marked not verified', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(2, 40) });
+  const t = recorder(true);
+  const w = setup(t, linker());
+  await w.patrol(tel, 0); // opens the issue, challenged
+  // The record fails once while the report is filed: a lock, say.
+  const issues = w.issues!;
+  const link = issues.link.bind(issues);
+  issues.link = () => {
+    issues.link = link;
+    throw new Error('database is locked');
+  };
+  const sibling = await w.patrol(tel, 2); // a quiet repeat when the check was decided
+  assert.equal(sibling.investigation?.challenge, undefined, 'not challenged: it was going to be a quiet reply');
+  assert.equal(w.session.challenges.length, 1, 'and no second challenge run now');
+  assert.deepEqual(sibling.filed, [{ action: 'none' }], 'the record failed: posted on its own');
+  assert.ok(w.logs.includes('issues: filing report 1 failed: database is locked'));
+  assert.ok(w.logs.includes('report 1 no issue record: posted on its own; not verified: no second check ran'));
+  assert.equal(t.sent.length, 2);
+  assert.equal(t.sent[1]!.thread_ts, undefined, 'shown in the channel');
+  assert.match(JSON.stringify(t.sent[1]!.blocks), /not verified by a second check/);
+  assert.match(readFileSync(sibling.cards.at(-1)!, 'utf8'), /Not verified: the challenge did not complete \(not run: it became news after the check was decided\)\./);
+});
+
+const BOT = 'The 400s are one bot retrying a bad payload.';
+const doesNotHold: Judge = ({ mine }) => ({ items: [{ item: 1, holds: 'no', reason: BOT, evidence: [mine] }], overall: 'Does not hold up.' });
+
+test('"does not hold up": not posted, minor in get_run, and no issue opened', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const t = recorder(true);
+  const w = setup(t, linker(), { judge: doesNotHold });
+  const r = await w.patrol(tel, 0);
+  assert.equal(r.investigation?.challenge?.verdict, 'escalate');
+  assert.deepEqual(t.sent, [], 'not posted');
+  assert.deepEqual(r.filed, [{ action: 'none' }]);
+  assert.deepEqual(w.issues!.openIssues(), [], 'no issue opened');
+  assert.ok(w.logs.includes('report 1 minor: not posted; was major, the second check says it does not hold up'));
+  assert.ok(w.logs.includes('0 of 1 report(s) go to Slack; 1 held back by the second check'));
+  const got = await getRun(w, r.investigation!.runId);
+  assert.match(got, /### Report 1 · minor: not posted; was major, the second check says it does not hold up\n\n## 🟡 Sign-in rejects emails/);
+  assert.match(got, /\*\*Severity:\*\* minor/);
+  assert.match(got, new RegExp(`On this report: does not hold up\\. ${BOT.replaceAll('.', '\\.')}`));
+});
+
+test('a report that does not hold up still covers its rows: they are not owed another run until they get worse', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const w = setup(recorder(true), linker(), { judge: doesNotHold });
+  await w.patrol(tel, 0);
+  assert.equal(w.state.data.rows[key('/v1/auth/login')]!.investigation?.status, 'complete');
+  await w.patrol(tel, 6.25); // its 6-hour reminder: still firing, not worse
+  assert.equal(w.session.seen.length, 1, 'no second AI run on it');
+});
+
+test('"partly holds": posted, with the objections on the card', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const t = recorder(true);
+  const objection = (theirs: string) => ({ claim: 'Half of the 400s come from one test account.', failure_scenario: 'the team chases a bug few users hit', settling_check: 'group the 400s by account', evidence: [theirs], blocking: true });
+  const w = setup(t, linker(), { judge: ({ theirs }) => ({ items: [{ item: 1, holds: 'partly', reason: 'Real, but smaller than it says.' }], objections: [objection(theirs)] }) });
+  const r = await w.patrol(tel, 0);
+  assert.equal(r.filed[0]?.action, 'opened');
+  assert.equal(t.sent.length, 1);
+  assert.match(t.sent[0]!.text, /^🟠 Major: Sign-in rejects emails/);
+  assert.match(parsed(t.sent[0]!), /⚠️ \*A second AI check disputes this, a human decides:\* Half of the 400s come from one test account\./);
+});
+
+test('a challenger that fails, or that the caps cannot pay for: posted as before, marked not verified', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const t = recorder(true);
+  const w = setup(t, linker(), { judge: () => 'fail' });
+  const r = await w.patrol(tel, 0);
+  assert.equal(r.investigation?.challenge?.verdict, 'error');
+  assert.equal(r.filed[0]?.action, 'opened');
+  assert.equal(t.sent.length, 1, 'posted');
+  assert.match(JSON.stringify(t.sent[0]!.blocks), /not verified by a second check/);
+  assert.match(readFileSync(r.cards.at(-1)!, 'utf8'), /Not verified: the challenge did not complete \(error_max_budget_usd\)/);
+
+  // The day's cap holds the investigator ($2.5) but not the challenger as well ($1).
+  const u = recorder(true);
+  const v = setup(u, linker());
+  v.monitor.engine.dailyCapUsd = 3;
+  const capped = await v.patrol(tel, 0);
+  assert.equal(capped.investigation?.status, 'ok', 'the investigator still ran');
+  assert.equal(v.session.challenges.length, 0, 'no challenger session');
+  assert.equal(capped.investigation?.challenge?.note, 'not run: global daily cap $3 reached');
+  assert.equal(u.sent.length, 1, 'posted');
+  assert.match(JSON.stringify(u.sent[0]!.blocks), /not verified by a second check/);
+  const row = v.monitor.engine.store.get(capped.investigation!.runId)!;
+  assert.deepEqual([row.challenge, row.reserve], ['error', 2.5]);
+});
+
+test('a protected journey is never hidden: "does not hold up" is posted with the objection', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const t = recorder(true);
+  const w = setup(t, linker(), { judge: doesNotHold });
+  w.rules.noise = new Noise({ never_suppress: [{ section: 'http', route: '/v1/auth/login', status: '4..' }] });
+  const r = await w.patrol(tel, 0);
+  assert.equal(t.sent.length, 2, 'the rows card first, unchanged, then the report');
+  assert.match(t.sent[0]!.text, /^Patrol 2026-11-02 08:00Z/);
+  assert.match(t.sent[1]!.text, /^🟠 Major: Sign-in rejects emails/);
+  assert.match(parsed(t.sent[1]!), new RegExp(`⚠️ \\*A second AI check says this does not hold up, a human decides:\\* ${BOT.replaceAll('.', '\\.')}`));
+  assert.equal(r.filed[0]?.action, 'opened');
+  const id = r.filed[0]!.action === 'opened' ? r.filed[0]!.issue.id : '';
+  assert.equal(w.issues!.get(id)!.severity, 'major');
+  assert.ok(w.logs.includes(`report 1 opened ${id} (major); the second check says it does not hold up, posted anyway: a protected journey`));
+});
+
 // ---- 11-02/03, simulated --------------------------------------------------------
 
 // 21 h of one cause (an email with a trailing space fails validation) reaching
@@ -609,6 +829,12 @@ test('11-02/03 simulated: seven reports on one cause give one message and six qu
   const visible = (s: Sent[]) => s.filter((x) => !x.thread_ts || x.reply_broadcast).length;
   assert.equal(visible(before.t.sent), 7, 'before: every report showed in the channel');
   assert.deepEqual(after.t.sent.map((s) => [s.thread_ts ?? 'root', s.reply_broadcast]), [['root', undefined], ...Array(6).fill(['1700000000.000001', false])]);
+  const id = after.w.issues!.openIssues()[0]!.id;
+  assert.deepEqual(after.t.sent.map((s) => s.text), ['🟠 Major: Sign-in rejects emails with a trailing space', ...Array(6).fill(`🟠 Update on ${id}: Sign-in rejects emails with a trailing space`)]);
   assert.equal(after.w.issues!.openIssues().length, 1);
   assert.equal(after.w.issues!.openIssues()[0]!.rows.length, 5);
+  // Opus agrees, so the channel gets the same messages. It checked what the
+  // channel saw: every report before, only the new issue after.
+  assert.equal(before.w.session.challenges.length, 7);
+  assert.equal(after.w.session.challenges.length, 1);
 });

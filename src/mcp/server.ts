@@ -7,6 +7,7 @@ import { z } from 'zod';
 import type { Config } from '../config.js';
 import { FILE_TOOLS, listAgents, loadAgent, type LoadedAgent } from '../engine/agent.js';
 import { monitorReports, storedMonitorAnswer, writeAnswer } from '../engine/answer.js';
+import { itemDissent } from '../engine/challenge.js';
 import { findingsOutput, type Findings } from '../engine/output.js';
 import { runAgent, type Engine, type Root, type RunResult } from '../engine/run.js';
 import { cleanModelText, redact, safeJson, slackEscape, stripImages, truncate } from '../engine/text.js';
@@ -215,8 +216,9 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       let challenge = '';
       if (existsSync(join(dir, 'challenge.json'))) {
         try {
-          const c = JSON.parse(readFileSync(join(dir, 'challenge.json'), 'utf8')) as { verdict: string; overall: string; notes?: Array<{ claim: string }> };
-          challenge = stripImages(redact(`\n## Challenge: ${c.verdict}\n${c.overall}${c.notes?.length ? `\nNotes:\n${c.notes.map((n) => `- ${n.claim}`).join('\n')}` : ''}`));
+          const c = JSON.parse(readFileSync(join(dir, 'challenge.json'), 'utf8')) as { verdict: string; overall: string; notes?: Array<{ claim: string }>; items?: Parameters<typeof itemDissent>[0] };
+          const dissent = itemDissent(c.items);
+          challenge = stripImages(redact(`\n## Challenge: ${c.verdict}\n${c.overall}${dissent.length ? `\n${dissent.join('\n')}` : ''}${c.notes?.length ? `\nNotes:\n${c.notes.map((n) => `- ${n.claim}`).join('\n')}` : ''}`));
         } catch {
           challenge = '\n## Challenge: unreadable\nThe challenge record could not be read: do not treat this run as upheld.';
         }

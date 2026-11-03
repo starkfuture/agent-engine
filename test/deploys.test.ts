@@ -97,6 +97,30 @@ test('a deploy on its own never posts: listed for the AI, no row, no card, no AI
   assert.deepEqual([r.summary.send, r.cards, sent, session.requests.length, r.investigation], [[], [], [], 0, undefined]);
 });
 
+test('an urgent rollout row is challenged by the gate, whatever the report says (a minor one too)', async () => {
+  const c = cfg();
+  const { box } = outbox();
+  const session = fakeSession(
+    async function* (sim) {
+      const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+      const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+      const quote = /\/v1\/products \d+ \| \d+/.exec(out.text)![0];
+      const r = await sim.mcp('submit_report', { title: 'ecom-service rollout is stuck', severity: 'minor', status: 'active', started_at: 'unknown', what_broke: 'new pods are not ready', impact: 'unknown', cause: { hypothesis: 'a failing readiness probe', confidence: 'low' }, evidence: [{ id, quote, claim: 'traffic is still served' }], suggested_fix: 'check the new pods', not_checked: [], rows: [STALLED], issue: 'new' });
+      assert.equal(r.isError, false, r.text);
+      yield ok(0.1);
+    },
+    async function* (sim) {
+      await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+      await sim.mcp('submit_challenge', { objections: [], items: [{ item: 1, holds: 'yes', reason: 'The rollout is stuck.' }], overall: 'Holds up.' });
+      yield ok(0.1);
+    },
+  );
+  const r = await patrolOnce(cluster([ECOM]), c, new Noise({}), State.memory(), new CardSink(c.outDir, box), AT, { llm: true, post: true }, monitor(c, session));
+  assert.deepEqual(r.summary.send.map((x) => x.key), [STALLED]);
+  assert.equal(session.requests[1]?.model, 'claude-opus-5-5', 'the challenger ran');
+  assert.equal(r.investigation?.challenge?.verdict, 'upheld');
+});
+
 test('replicas behind for 10 min are an urgent rollout row, posted by code, and "rollout complete" in its thread once it completes', async () => {
   const c = cfg();
   const { sent, box } = outbox();

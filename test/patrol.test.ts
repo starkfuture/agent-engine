@@ -17,7 +17,7 @@ import type { Engine } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
 import type { FlaggedRow } from '../src/patrol/summary.js';
 import { needsChallenge, patrolOnce, type MonitorAgent, patrolLoop } from '../src/runner.js';
-import { fakeSession, ok, say, type Script } from './fake-session.js';
+import { fail, fakeSession, ok, say, type Script } from './fake-session.js';
 import { DAY, FakeTelemetry, H, INCIDENT_START, testConfig as cfg, world } from './fake.js';
 
 test('incident rows are flagged, steady noise is not', async () => {
@@ -376,23 +376,71 @@ test('a 6-hour reminder of an urgent row is not posted again', async () => {
 test('the AI decides the rest: critical and major are posted with their owners, minor is only recorded', async () => {
   const c = cfg();
   const owners = new Owners({ owners: { 'backend-*': '<@U0BACKEND1>' } });
-  const session = fakeSession(async function* (sim) {
-    const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
-    const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
-    const quote = /\/v1\/auth\/password\/reset 400 \| \d+/.exec(out.text)![0];
-    for (const [severity, rows] of [['major', [RESET]], ['minor', [SIGNUP]]] as const) {
-      const r = await sim.mcp('submit_report', report({ severity, rows: [...rows], evidence: [{ id, quote, claim: 'reset requests return 400' }] }));
-      assert.equal(r.isError, false, r.text);
-    }
-    yield ok(0.3, 4);
-  });
+  const session = fakeSession(
+    async function* (sim) {
+      const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+      const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+      const quote = /\/v1\/auth\/password\/reset 400 \| \d+/.exec(out.text)![0];
+      for (const [severity, rows] of [['major', [RESET]], ['minor', [SIGNUP]]] as const) {
+        const r = await sim.mcp('submit_report', report({ severity, rows: [...rows], evidence: [{ id, quote, claim: 'reset requests return 400' }] }));
+        assert.equal(r.isError, false, r.text);
+      }
+      yield ok(0.3, 4);
+    },
+    async function* (sim) {
+      await sim.mcp('route_timeline', { service: 'backend-production', route: '/v1/auth/password/reset', hours: 2 });
+      await sim.mcp('submit_challenge', { objections: [], overall: 'Both hold up.' });
+      yield ok(0.2, 2);
+    },
+  );
   const r = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false, owners }, monitor(c, session));
   assert.equal(r.investigation?.outputs.length, 2);
-  assert.equal(r.investigation?.challenge, undefined, 'not urgent, not challenged');
+  assert.equal(r.investigation?.challenge?.verdict, 'upheld', 'not urgent, but a major the channel will see is challenged first');
   assert.equal(r.cards.length, 3);
   assert.equal(r.slack.length, 1, 'only the major report');
   assert.ok(r.slack[0]!.endsWith('-1.md'));
   assert.match(readFileSync(r.slack[0]!, 'utf8'), /\*\*Severity:\*\* major · \*\*Confidence:\*\* medium · cc <@U0BACKEND1>/);
+});
+
+test('a challenge that runs out of budget verifies nothing: its objection stays, every card says not verified', async () => {
+  const c = cfg();
+  const sent: Array<{ text: string; blocks: unknown[] }> = [];
+  const box = new SlackOutbox(':memory:', { threads: true, post: async (m) => (sent.push(m), `ts${sent.length}`) }, { sleep: async () => {}, gapMs: 0 });
+  const session = fakeSession(
+    async function* (sim) {
+      const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+      const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+      const quote = /\/v1\/auth\/password\/reset 400 \| \d+/.exec(out.text)![0];
+      for (const rows of [[RESET], [SIGNUP]]) assert.equal((await sim.mcp('submit_report', report({ severity: 'major', rows, evidence: [{ id, quote, claim: 'reset requests return 400' }] }))).isError, false);
+      yield ok(0.3, 4);
+    },
+    async function* (sim) {
+      const own = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec((await sim.mcp('route_timeline', { service: 'backend-production', route: '/v1/auth/password/reset', hours: 2 })).text)![1]!;
+      await sim.mcp('submit_challenge', {
+        objections: [{ claim: 'The /v1/auth/password/reset 400s are one client retrying', failure_scenario: 'the team rolls back a working release', settling_check: 'count the 400s by client', evidence: [own], blocking: true }],
+        items: [
+          { item: 1, holds: 'no', reason: 'One client retrying.', evidence: [own] },
+          { item: 2, holds: 'yes', reason: 'Sign-up checks out.' },
+        ],
+        overall: 'Report 1 does not hold up.',
+      });
+      yield fail('error_max_budget_usd', 1);
+    },
+  );
+  const r = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir, box), new Date('2026-09-29T12:15:00Z'), { llm: true, post: true }, monitor(c, session));
+  assert.deepEqual([r.investigation?.challenge?.verdict, r.investigation?.challenge?.note], ['escalate', 'error_max_budget_usd']);
+  assert.equal(sent.length, 2, 'both posted: a challenge that broke off hides nothing');
+  const [reset, signup] = sent.map((m) => JSON.stringify(m.blocks));
+  assert.match(reset!, /A second AI check disputes this, a human decides:\* The \/v1\/auth\/password\/reset 400s are one client retrying/, 'its objection stays');
+  for (const b of [reset!, signup!]) {
+    assert.match(b, /not verified by a second check/);
+    assert.doesNotMatch(b, /second check agrees/);
+  }
+  for (const f of r.cards.slice(1)) {
+    const md = readFileSync(f, 'utf8');
+    assert.match(md, /Not verified: the challenge did not complete \(error_max_budget_usd\)\./);
+    assert.doesNotMatch(md, /On this report: holds up/);
+  }
 });
 
 test('nothing new above the floor: no AI run, nothing posted', async () => {
@@ -536,6 +584,13 @@ function investigator(asked: string[][], cover: (rows: string[]) => string[] = (
     yield ok(0.1);
   };
 }
+
+// A challenger that re-checks one tool result and agrees.
+const agrees: Script = async function* (sim) {
+  await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+  await sim.mcp('submit_challenge', { objections: [], overall: 'Holds up.' });
+  yield ok(0.1, 1);
+};
 
 test('a 6-hour reminder of a row already explained does not join the next run', async () => {
   const c = cfg();
@@ -721,7 +776,8 @@ test('a report the outbox could not queue is investigated again next patrol, as 
   box.enqueue = () => {
     throw new Error('database is locked');
   };
-  const m = monitor(c, fakeSession(investigator(asked, undefined, 'major'), investigator(asked, undefined, 'major')));
+  // A major report goes to the channel, so each run is challenged.
+  const m = monitor(c, fakeSession(investigator(asked, undefined, 'major'), agrees, investigator(asked, undefined, 'major'), agrees));
   const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z' });
   const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir, box), new Date(time), { llm: true, post: true }, m);
   await assert.rejects(pass('2026-09-29T12:15:00Z'), /database is locked/);

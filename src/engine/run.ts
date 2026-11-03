@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tool, type HookCallbackMatcher, type HookEvent, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z, type ZodRawShape } from 'zod';
 import { FILE_TOOLS, WEB_TOOLS, type LoadedAgent } from './agent.js';
-import { challengeLite, type ChallengeResult } from './challenge.js';
+import { challengeLite, notRun, unsound, type ChallengeResult } from './challenge.js';
 import { Evidence, evidenceHook } from './evidence.js';
 import { pathGuard } from './guard.js';
 import { firstTurnUsd, pluginCopy, SpendMeter, type Session, type SessionEvent, type SessionRequest } from './session.js';
@@ -50,7 +50,9 @@ export interface RunInput<T> {
   data?: string; // untrusted context (patrol summary, alert body): fenced
   tools?: ToolFactory; // in-process tools; these hold credentials, so they count as sensitive reads
   output: OutputSpec<T>;
-  challenge?: boolean;
+  // true: a challenger checks the outputs. A function: decided once the
+  // outputs exist (a gate that depends on the answer).
+  challenge?: boolean | ((outputs: T[]) => boolean);
   roots?: Array<string | Root>; // git folders the file tools may read; each is snapshotted at a commit
   user?: { name: string; usdPerDay?: number; maxRunning?: number }; // who asked (MCP)
   signal?: AbortSignal; // cancel this run (status 'stopped')
@@ -152,16 +154,15 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
   }
   if (existsSync(engine.stopFile)) return skipped(`kill switch is on${stopDetail(engine.stopFile)}; an admin clears it with resume`);
 
-  const challenge = input.challenge ?? spec.challenge.when === 'always';
-  const reserve = spec.limits.usd_per_run + (challenge ? spec.challenge.usd : 0);
-  const admitted = engine.store.admit({
+  const decide = typeof input.challenge === 'function' ? input.challenge : undefined;
+  const challenge = decide ? true : (input.challenge ?? spec.challenge.when === 'always'); // may run: reserved up front
+  const admission = {
     id: runId,
     agent: spec.name,
     version: agent.version,
     trigger: input.trigger,
     now,
     deadlineMs: spec.limits.deadline_min * 60_000,
-    reserve,
     agentCap: spec.limits.usd_per_day,
     ...(engine.agentMonthlyCapUsd?.[spec.name] !== undefined ? { agentMonthlyCap: engine.agentMonthlyCapUsd[spec.name] } : {}),
     globalCap: engine.dailyCapUsd,
@@ -169,7 +170,18 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     concurrency: spec.concurrency,
     ...(engine.build ? { build: engine.build } : {}),
     ...(input.user ? { user: input.user.name, userCap: input.user.usdPerDay, userMaxRunning: input.user.maxRunning } : {}),
-  });
+  };
+  let reserve = spec.limits.usd_per_run + (challenge ? spec.challenge.usd : 0);
+  let admitted = engine.store.admit({ ...admission, reserve });
+  // A challenge decided on the outputs never costs the author its run: when
+  // the caps can't hold both, the author runs alone, and a challenge it then
+  // needs is recorded as not run.
+  let unpaid: string | undefined;
+  if (!admitted.ok && decide) {
+    unpaid = admitted.reason;
+    reserve = spec.limits.usd_per_run;
+    admitted = engine.store.admit({ ...admission, reserve });
+  }
   if (!admitted.ok) return skipped(admitted.reason);
   if (input.signal?.aborted) return settleSkipped('cancelled before start');
 
@@ -247,7 +259,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     const data = input.data === undefined ? undefined : redact(input.data);
     const task = askedTask + where;
     const prompt = [task, ...(data ? ['', fence('context', data)] : [])].join('\n');
-    writeFileSync(join(dir, 'input.md'), redact(`# ${spec.name} @ ${agent.version}\n\nengine: ${engine.build ?? 'unknown'}\ntrigger: ${input.trigger}\nchallenge: ${challenge}\n\n${prompt}\n`));
+    writeFileSync(join(dir, 'input.md'), redact(`# ${spec.name} @ ${agent.version}\n\nengine: ${engine.build ?? 'unknown'}\ntrigger: ${input.trigger}\nchallenge: ${decide ? 'if the outputs need it' : challenge}\n\n${prompt}\n`));
 
     const Out = z.object(input.output.shape);
     const fail = (msg: string) => ({ content: [{ type: 'text' as const, text: `error: ${msg}` }], isError: true });
@@ -317,7 +329,11 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     if (status === 'ok' && outputs.length === 0) status = 'no_output';
 
     // Challenger: its own loop detector and its own abort, chained to the run's.
-    if (challenge && outputs.length && !stopped) {
+    // One that is due but can't start (a spend cap, or the run was stopped) is
+    // recorded as not run, so the outputs read as not verified.
+    const due = outputs.length > 0 && (decide ? decide(outputs) : challenge);
+    if (due && (unpaid || stopped)) challengeResult = notRun(unpaid ?? note ?? 'run stopped');
+    else if (due) {
       const cAbort = new AbortController();
       abort.signal.addEventListener('abort', () => cAbort.abort());
       let cStop: string | undefined;
@@ -344,10 +360,10 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
         },
       });
       const cBroke = cStop ?? evidence.failure;
-      if (cBroke && challengeResult.verdict === 'upheld') challengeResult = { ...challengeResult, verdict: 'error', note: cBroke };
+      if (cBroke && challengeResult.verdict !== 'error') challengeResult = unsound(challengeResult, cBroke);
       cost += challengeResult.cost;
-      writeFileSync(join(dir, 'challenge.json'), safeJson(challengeResult, 1));
     }
+    if (challengeResult) writeFileSync(join(dir, 'challenge.json'), safeJson(challengeResult, 1));
   } catch (err) {
     // Setup or bookkeeping failed (disk full, not a git folder, …).
     if (!stopped) {
