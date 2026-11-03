@@ -12,7 +12,7 @@ import { monitorTools } from '../src/investigate/tools.js';
 import { reportCard } from '../src/output/card.js';
 import { CardSink } from '../src/output/sink.js';
 import { SlackOutbox } from '../src/output/slack.js';
-import { tagOf } from '../src/patrol/deploys.js';
+import { stallQuery, tagOf } from '../src/patrol/deploys.js';
 import { bucketOf, tier } from '../src/patrol/digest.js';
 import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
@@ -124,6 +124,53 @@ test('replicas behind for 10 min are an urgent rollout row, posted by code, and 
   assert.match(renderSummary(done.summary), /ecom-service-production: 1\.2645\.5 → 1\.2645\.6 · complete in 24 min/);
   assert.equal(sent.length, 2);
   assert.match(sent[1]!.text, /^✅ Back to normal at 12:45Z: ecom-service-production · rollout complete$/);
+});
+
+test('a stall ends only when its rollout completes: every pod updated but not yet available is not "rollout complete"', async () => {
+  const c = cfg();
+  const { sent, box } = outbox();
+  const sink = new CardSink(c.outDir, box);
+  const state = State.memory();
+  // Replicas behind until 12:35, then every pod on the new template but not all available until 12:55.
+  const tel = cluster([{ ...ECOM, updated: Date.parse('2026-11-03T12:35:00Z'), done: Date.parse('2026-11-03T12:55:00Z') }]);
+  const pass = (iso: string) => patrolOnce(tel, c, new Noise({}), state, sink, new Date(iso), { llm: false, post: true });
+  assert.deepEqual((await pass('2026-11-03T12:30:00Z')).summary.send.map((r) => r.key), [STALLED]);
+  const ready = await pass('2026-11-03T12:45:00Z');
+  assert.deepEqual([ready.summary.recovered, ready.summary.known.map((r) => r.key)], [[], [STALLED]]);
+  assert.match(ready.summary.known[0]!.detail ?? '', /^still not complete: 2 replica\(s\) to update, become available or retire \(ns microservices\)$/);
+  assert.ok(!sent.some((m) => /rollout complete/.test(m.text)));
+  const done = await pass('2026-11-03T13:00:00Z');
+  assert.deepEqual(done.summary.recovered, [STALLED]);
+  assert.match(sent.at(-1)!.text, /Back to normal at 13:00Z: ecom-service-production · rollout complete$/);
+  // A row from an old episode (not seen for 6 h+) does not hold a scale-up as a stall.
+  const old = new State({ rows: { [STALLED]: { firstSeen: '2026-11-03T05:00:00.000Z', lastSeen: '2026-11-03T05:00:00.000Z', lastReportedAt: '2026-11-03T05:00:00.000Z' } } });
+  assert.deepEqual((await buildSummary(tel, c, new Noise({}), old, new Date('2026-11-03T12:45:00Z'))).send, []);
+});
+
+test('a one-replica rollout is not complete while its old pod still serves', async () => {
+  // The new pod counts as updated while unready, and the old ready pod keeps available at 1.
+  const rolling = await buildSummary(cluster([{ ...ECOM, oneReplica: true, created: AT.getTime() - 5 * MIN }]), cfg(), new Noise({}), State.memory(), AT);
+  assert.match(renderSummary(rolling), /ecom-service-production: 1\.2645\.5 → 1\.2645\.6 · rolling for 5 min/);
+  const done = await buildSummary(cluster([{ ...ECOM, oneReplica: true, created: AT.getTime() - 5 * MIN, done: AT.getTime() - MIN }]), cfg(), new Noise({}), State.memory(), AT);
+  assert.match(renderSummary(done), /ecom-service-production: 1\.2645\.5 → 1\.2645\.6 · complete in 4 min/);
+});
+
+test('a Deployment created minutes ago is not stalled: the stall needs a sample in every minute of it', async () => {
+  const fresh: Rollout = { ...ECOM, brandNew: true, prevRs: '', prev: '', created: AT.getTime() - 3 * MIN };
+  const s = await buildSummary(cluster([fresh]), cfg(), new Noise({}), State.memory(), AT);
+  assert.deepEqual(s.send, []);
+  assert.match(renderSummary(s), /ecom-service-production: 1\.2645\.6 \(previous image not seen\) · rolling for 3 min/);
+  assert.match(stallQuery(cfg().sources), / and on \(namespace, deployment\) max by \(namespace, deployment\) \(count_over_time\(\(kube_deployment_spec_replicas\{namespace=~"microservices"\} - kube_deployment_status_replicas_updated\{namespace=~"microservices"\}\)\[10m:1m\]\)\) >= 10 or on /);
+});
+
+test('without kube-state-metrics, deploys are unknown, never "none": in the summary and in recent_changes', async () => {
+  const gone = new FakeTelemetry(() => []);
+  const s = await buildSummary(gone, cfg(), new Noise({}), State.memory(), AT);
+  assert.match(renderSummary(s), /\n## Deploys in the last 6 h \(new ReplicaSets; scaling is not a deploy\)\n- unknown: deployment metrics missing \(no kube_replicaset_created series\)\n/);
+  const tools = monitorTools(gone, cfg(), AT)(new Evidence(), 'author');
+  const out = (await tools.find((t) => t.name === 'recent_changes')!.handler({ hours: 24 } as never, {})).content[0] as { text: string };
+  assert.match(out.text, /- unknown: deployment metrics missing/);
+  assert.doesNotMatch(out.text, /- none/);
 });
 
 test("a one-replica rollout stalls only by the controller's deadline, and that is a row too", async () => {

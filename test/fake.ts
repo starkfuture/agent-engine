@@ -103,16 +103,25 @@ export interface Rollout {
   done?: number; // every replica updated and available from then; unset = never
   back?: number; // rolled back: the previous ReplicaSet's pods again from then
   oneReplica?: boolean; // its new pod counts as updated: only the controller's deadline shows the stall
+  updated?: number; // every pod on the new template from then, before they are all available
+  brandNew?: boolean; // a new Deployment: no series before `created`
 }
 
-// Rolling = created and not done. Stalled = rolling for 10+ min. `base` answers
-// everything else (by default the 29 Sep world, quiet on other days).
+// Rolling = created and not done. Stalled = replicas behind (rolling, before
+// `updated`) for 10+ min. `base` answers everything else (by default the 29 Sep
+// world, quiet on other days). What is left to do counts old replicas only when
+// the query asks for kube_deployment_status_replicas: a one-replica rollout is
+// otherwise 0 (updated 1, available 1) from its start. min_over_time over a
+// brand-new Deployment's first minutes fires unless the query counts samples.
 export function cluster(rollouts: Rollout[], base: (q: string, at: Date) => Sample[] = world): FakeTelemetry {
   const rolling = (r: Rollout, t: number) => t >= r.created && (r.done === undefined || t < r.done);
+  const left = (q: string, r: Rollout, t: number) => (!rolling(r, t) ? 0 : !r.oneReplica ? 2 : q.includes('kube_deployment_status_replicas{') ? 1 : 0);
+  const behind = (q: string, r: Rollout, t: number) => rolling(r, t) && !r.oneReplica && (r.updated === undefined || t < r.updated) && (t - r.created >= 10 * MIN || (!!r.brandNew && !q.includes('count_over_time(')));
   return new FakeTelemetry(
     (q, at) => {
       const t = at.getTime();
       const ns = { namespace: 'microservices' };
+      if (q.startsWith('count(')) return base(q, at); // presence checks
       if (q.includes('kube_replicaset_created')) {
         const window = Number(/time\(\) - (\d+)/.exec(q)![1]) * 1000;
         const owner = /owner_name="([^"]+)"/.exec(q)?.[1];
@@ -125,16 +134,19 @@ export function cluster(rollouts: Rollout[], base: (q: string, at: Date) => Samp
           return rolling(r, t) ? [pods(r.prevRs, r.prev), pods(r.rs, r.image)] : [pods(r.rs, r.image)];
         });
       if (q.includes('min_over_time((kube_deployment_spec_replicas'))
-        return rollouts
-          .filter((r) => rolling(r, t) && t - r.created >= 10 * MIN)
-          .map((r) => (r.oneReplica ? { labels: { ...ns, deployment: r.workload, reason: 'ProgressDeadlineExceeded' }, value: 1 } : { labels: { ...ns, deployment: r.workload }, value: 2 }));
+        return rollouts.flatMap((r) => {
+          if (behind(q, r, t)) return [{ labels: { ...ns, deployment: r.workload }, value: 2 }];
+          return r.oneReplica && rolling(r, t) && t - r.created >= 10 * MIN ? [{ labels: { ...ns, deployment: r.workload, reason: 'ProgressDeadlineExceeded' }, value: 1 }] : [];
+        });
+      if (q.includes('clamp_min(kube_deployment_spec_replicas'))
+        return rollouts.filter((r) => left(q, r, t) > 0).map((r) => ({ labels: { ...ns, deployment: r.workload }, value: left(q, r, t) }));
       return base(q, at);
     },
     (q, start, end, step) =>
       q.includes('clamp_min(kube_deployment_spec_replicas')
         ? rollouts.map((r) => {
             const points: Array<[number, number]> = [];
-            for (let t = start.getTime(); t <= end.getTime(); t += step * 1000) points.push([t / 1000, rolling(r, t) || (r.back !== undefined && t >= r.back && t < r.back + 2 * MIN) ? 2 : 0]);
+            for (let t = start.getTime(); t <= end.getTime(); t += step * 1000) points.push([t / 1000, r.back !== undefined && t >= r.back && t < r.back + 2 * MIN ? 2 : left(q, r, t)]);
             return { labels: { namespace: 'microservices', deployment: r.workload }, points };
           })
         : [],

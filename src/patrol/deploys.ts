@@ -61,21 +61,26 @@ export function createdQuery(src: Sources, hours: number, workload?: string): st
 export const imagesQuery = (src: Sources) =>
   `count by (namespace, owner_name, container, image_spec) (kube_pod_container_info{${ns(src)}} * on (namespace, pod) group_left (owner_name) kube_pod_owner{${ns(src)},owner_kind="ReplicaSet"})`;
 
-// Replicas still to update or to become available, per Deployment. Scaling
-// makes pods on the current template, so only a rollout keeps it above 0 for long.
-const progressQuery = (src: Sources, workloads: string[]) => {
-  const sel = `${ns(src)},deployment=~${q(workloads.map(reEscape).join('|'))}`;
-  return `max by (namespace, deployment) (clamp_min(kube_deployment_spec_replicas{${sel}} - kube_deployment_status_replicas_updated{${sel}}, 0) + clamp_min(kube_deployment_spec_replicas{${sel}} - kube_deployment_status_replicas_available{${sel}}, 0))`;
-};
+// What a rollout still has to do, per Deployment: replicas to update, to become
+// available, and old ones to retire. 0 = complete. The last term matters for one
+// replica: the new pod counts as updated while unready, and the old ready pod
+// keeps available at 1.
+const remaining = (sel: string) =>
+  `max by (namespace, deployment) (clamp_min(kube_deployment_spec_replicas{${sel}} - kube_deployment_status_replicas_updated{${sel}}, 0) + clamp_min(kube_deployment_spec_replicas{${sel}} - kube_deployment_status_replicas_available{${sel}}, 0) + clamp_min(kube_deployment_status_replicas{${sel}} - kube_deployment_status_replicas_updated{${sel}}, 0))`;
+const progressQuery = (src: Sources, workloads: string[]) => remaining(`${ns(src)},deployment=~${q(workloads.map(reEscape).join('|'))}`);
+export const unfinishedQuery = (src: Sources) => `${remaining(ns(src))} > 0`;
 
 // Stalled: replicas not on the new version for every minute of stall_minutes
 // (before the controller gives up), or the controller's own
 // ProgressDeadlineExceeded (Progressing false; progressDeadlineSeconds is 600 in
 // the charts). The second catches a one-replica rollout, whose new pod counts as
-// updated while it never becomes ready. One series per Deployment.
+// updated while it never becomes ready. min_over_time skips minutes with no
+// sample, so the first also needs a sample in every one of them: a Deployment
+// created a minute ago is not stalled. One series per Deployment.
 export function stallQuery(src: Sources): string {
   const m = src.deploys.stall_minutes;
-  return `max by (namespace, deployment) (min_over_time((kube_deployment_spec_replicas{${ns(src)}} - kube_deployment_status_replicas_updated{${ns(src)}})[${m}m:1m])) > 0 or on (namespace, deployment) max by (namespace, deployment, reason) (kube_deployment_status_condition{${ns(src)},condition="Progressing",status="false"}) == 1`;
+  const behind = `(kube_deployment_spec_replicas{${ns(src)}} - kube_deployment_status_replicas_updated{${ns(src)}})[${m}m:1m]`;
+  return `max by (namespace, deployment) (min_over_time(${behind})) > 0 and on (namespace, deployment) max by (namespace, deployment) (count_over_time(${behind})) >= ${m} or on (namespace, deployment) max by (namespace, deployment, reason) (kube_deployment_status_condition{${ns(src)},condition="Progressing",status="false"}) == 1`;
 }
 
 // UNVERIFIED in this cluster: none of the apps is a StatefulSet.
@@ -108,10 +113,15 @@ function rolloutRow(service: string, subject: string, status: string | undefined
   return { key: rowKey({ section: 'rollout', service, subject, status }), section: 'rollout', service, subject, ...(status ? { status } : {}), counts, score: heldScore(counts), detail, query };
 }
 
-export async function collectRollouts(tel: Telemetry, src: Sources, at: Date): Promise<Row[]> {
+// `flagged(key)`: whether a stalled row is still open from an earlier patrol.
+// A stall ends when its rollout completes (every replica updated and available,
+// the old ones retired), not when its symptom changes: once every pod is
+// updated, new pods that never get ready no longer show as replicas behind.
+export async function collectRollouts(tel: Telemetry, src: Sources, at: Date, flagged: (key: string) => boolean = () => false): Promise<Row[]> {
   const query = stallQuery(src);
-  const [cells] = await Promise.all([
+  const [cells, unfinished] = await Promise.all([
     fourWay(tel, query, at, (s) => `${s.labels.namespace}\u0000${s.labels.deployment}`),
+    tel.promInstant(unfinishedQuery(src), at),
     // Without Deployment series a stall would read as complete.
     requireSeries(tel, `kube_deployment_spec_replicas{${ns(src)}}`, at, 'kube-state-metrics deployment'),
   ]);
@@ -123,6 +133,13 @@ export async function collectRollouts(tel: Telemetry, src: Sources, at: Date): P
       ? `the controller gave up on it: Progressing ${labels.reason} (ns ${namespace})`
       : `${Math.round(counts.now)} replica(s) not on the new version for ${src.deploys.stall_minutes}+ min (ns ${namespace})`;
     rows.push(rolloutRow(deployment, 'stalled', undefined, counts, detail, query));
+  }
+  for (const s of unfinished) {
+    const { namespace = '?', deployment = '?' } = s.labels;
+    const k = `${namespace}\u0000${deployment}`;
+    if (cells.get(k)?.counts.now || !flagged(rowKey({ section: 'rollout', service: deployment, subject: 'stalled' }))) continue;
+    const counts = { ...(cells.get(k)?.counts ?? { h1: 0, d1: 0, d7: 0 }), now: 1 };
+    rows.push(rolloutRow(deployment, 'stalled', undefined, counts, `still not complete: ${Math.round(s.value)} replica(s) to update, become available or retire (ns ${namespace})`, unfinishedQuery(src)));
   }
   return rows;
 }
@@ -209,11 +226,14 @@ export async function listDeploys(tel: Telemetry, src: Sources, at: Date, hours:
       notes.push(`${what} not read: ${e.message.slice(0, 200)}`);
       return undefined;
     };
-  const [created, statefulsets, argocd] = await Promise.all([
+  const [present, created, statefulsets, argocd] = await Promise.all([
+    tel.promInstant(`count(kube_replicaset_created{${ns(src)}})`, at),
     tel.promInstant(createdQuery(src, hours, workload), at),
     tel.promInstant(statefulsetsQuery(src, workload), at).catch(note('StatefulSets')),
     src.deploys.argocd ? argocdContext(tel, src, at, hours, workload).catch(note('Argo CD')) : undefined,
   ]);
+  // No ReplicaSet series at all is kube-state-metrics gone, not "no deploys".
+  if (!((present[0]?.value ?? 0) > 0)) return notRead(at, hours, new Error('deployment metrics missing (no kube_replicaset_created series)'));
   const deploys: Deploy[] = created
     .filter((s) => s.labels.owner_name && s.labels.replicaset && Number.isFinite(s.value))
     .map((s) => ({ namespace: s.labels.namespace ?? '?', workload: s.labels.owner_name!, replicaset: s.labels.replicaset!, at: new Date(s.value * 1000).toISOString(), state: 'unknown' as RolloutState }))
@@ -337,7 +357,7 @@ export const deployLine = (d: Deploy, at: string) => `${clock(d.at, at)} ${d.nam
 export const deploysHeading = (x: Deploys) => `Deploys in the last ${x.hours} h (new ReplicaSets; scaling is not a deploy)`;
 
 export function deployLines(x: Deploys): string[] {
-  if (x.error) return [`- not read: ${x.error}`];
+  if (x.error) return [`- unknown: ${x.error}`];
   return [
     ...(x.deploys.length ? x.deploys.map((d) => `- ${deployLine(d, x.at)}`) : ['- none']),
     ...(x.statefulsets.length ? [`- StatefulSets rolling now: ${x.statefulsets.join(', ')}`] : []),

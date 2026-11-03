@@ -222,6 +222,10 @@ test('deploys over MCP: code only and read-only, one service by the name the pat
   assert.doesNotMatch(one.text, /ecom-service/);
   assert.equal(session.requests.length, 0, 'no model call');
   assert.match((await call('list_runs')).text, /^no runs$/, 'nothing recorded, nothing spent');
+
+  ctx.telemetry = new FakeTelemetry(() => []); // kube-state-metrics gone
+  const gone = await (await connect(ctx, who('bo'))).call('deploys', {});
+  assert.match(gone.text, /\n- unknown: deployment metrics missing \(no kube_replicaset_created series\)$/);
 });
 
 test('a deployment offers only its ENGINE_AGENTS (web agents run apart from prod data)', async () => {

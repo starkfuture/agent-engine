@@ -67,7 +67,7 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 1. **Summary (code, no LLM).** For every source, it compares the last 15 min with the same window **1 h, 1 d and 7 d** earlier:
    - **HTTP:** every route × status that isn't 2xx/3xx, across the V3 services, legacy `/v1`, Keycloak and the mesh, plus traffic drops.
    - **Workloads:** restarts, stuck containers, unavailable replicas.
-   - **Rollouts:** a stalled rollout (replicas not on the new version for 10 min, or the controller's `ProgressDeadlineExceeded`), an Argo CD app Degraded or Missing for 5 min, and a failed Argo CD sync. A rollout row is a state: it is flagged for as long as it holds, and it recovers when the rollout completes.
+   - **Rollouts:** a stalled rollout (replicas not on the new version for 10 min, or the controller's `ProgressDeadlineExceeded`), an Argo CD app Degraded or Missing for 5 min, and a failed Argo CD sync. A rollout row is a state: it is flagged for as long as it holds. A stall recovers only when its rollout completes: every replica updated and available, and the old ones retired.
    - **Error counters:** SQS consumer errors, from every service. A counter has no series until its first error, so an `up` check says whether the services are being scraped. If they are not, the source is blind.
    - **Logs:** error lines grouped into stable templates.
    - **Traces:** error traces by root operation.
@@ -119,6 +119,7 @@ A deploy is a new ReplicaSet in `microservices|backend.*`, read from kube-state-
 - **Cards that are posted anyway** get one line: "Deploys in the last 2 h: …".
 - **Argo CD** (scraped since argo-cd #1314; `deploys.argocd` in `config/sources.yaml`, on): app health and syncs, as rows and as context. Off, nothing is read and no blind spot is reported.
 - **`deploys` over MCP** answers "what was deployed" from code, with no AI run and no cost.
+- **Without kube-state-metrics** the deploys are "unknown: deployment metrics missing", never "none".
 
 A rollback to an older template reuses its old ReplicaSet. It shows on the deploy it undid ("rolled back: 1.2645.5 runs again") while that deploy is in the window.
 

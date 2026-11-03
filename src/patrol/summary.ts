@@ -33,11 +33,17 @@ type Job = { source: string; run: () => Promise<Row[]> };
 export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, state: State, at: Date): Promise<Summary> {
   const w = cfg.windowMinutes;
   const s = cfg.sources;
+  // A stalled row flagged by a recent patrol and not recovered stays until its
+  // rollout completes (collectRollouts). Older memory is a stale row, not a stall.
+  const stillStalled = (key: string) => {
+    const m = state.data.rows[key];
+    return !!m && !m.recoveredAt && at.getTime() - Date.parse(m.lastSeen) <= 6 * 3600_000;
+  };
   const jobs: Job[] = [
     ...s.http_families.map((f) => ({ source: `http:${f.id}`, run: () => collectHttp(tel, f, at, w) })),
     ...s.error_counters.map((c) => ({ source: `counter:${c.id}`, run: () => collectCounter(tel, c, at, w) })),
     { source: 'workloads', run: () => collectWorkloads(tel, s.workloads.namespaces, at, w) },
-    { source: 'rollouts', run: () => collectRollouts(tel, s, at) },
+    { source: 'rollouts', run: () => collectRollouts(tel, s, at, stillStalled) },
   ];
   if (s.deploys.argocd) jobs.push({ source: 'argocd', run: () => collectArgocd(tel, s, at, w) });
   if (tel.has.loki) jobs.push({ source: 'logs', run: () => collectLogs(tel, s.logs, at, w) });
