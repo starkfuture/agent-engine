@@ -25,6 +25,20 @@ export const realGit: Git = (args, opts) =>
     ),
   );
 
+// The environment for a git call to `base` with an installation token: the
+// token travels as a header in GIT_CONFIG_*, never in argv or a stored config.
+export function gitAuthEnv(base: string, token: string): NodeJS.ProcessEnv {
+  const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
+  return {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: `http.${base}/.extraHeader`,
+    GIT_CONFIG_VALUE_0: `Authorization: Basic ${basic}`,
+  };
+}
+
 export interface RepoSyncOptions {
   token: () => Promise<string>; // installation token
   base?: string; // where owner/name lives (default https://github.com; tests use file://)
@@ -50,15 +64,7 @@ export class RepoSync {
   }
 
   private async env(): Promise<NodeJS.ProcessEnv> {
-    const basic = Buffer.from(`x-access-token:${await this.o.token()}`).toString('base64');
-    return {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: '0',
-      GIT_CONFIG_NOSYSTEM: '1',
-      GIT_CONFIG_COUNT: '1',
-      GIT_CONFIG_KEY_0: `http.${this.base}/.extraHeader`,
-      GIT_CONFIG_VALUE_0: `Authorization: Basic ${basic}`,
-    };
+    return gitAuthEnv(this.base, await this.o.token());
   }
 
   private async one(name: string, r: RepoEntry & { github: string }): Promise<void> {

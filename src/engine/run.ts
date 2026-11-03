@@ -41,7 +41,8 @@ export interface OutputSpec<T> {
   max?: number; // how many outputs one run may submit (default 10)
 }
 
-export type ToolFactory = (ev: Evidence, by: 'author' | 'challenger') => SdkMcpToolDefinition<any>[];
+// roots: the snapshots the file tools read, for tools that work on them (a draft fix's edits).
+export type ToolFactory = (ev: Evidence, by: 'author' | 'challenger', roots?: string[]) => SdkMcpToolDefinition<any>[];
 
 export interface RunInput<T> {
   agent: LoadedAgent;
@@ -57,6 +58,9 @@ export interface RunInput<T> {
   user?: { name: string; usdPerDay?: number; maxRunning?: number }; // who asked (MCP)
   signal?: AbortSignal; // cancel this run (status 'stopped')
   onAdmitted?: (runId: string) => void; // called once the run is admitted, before the model starts
+  // Work that waits for admission (caps, the kill switch), before the roots are
+  // snapshotted: a draft fix clones its repo here. A failure is the run's error.
+  prepare?: () => Promise<void>;
   // Why the caller's last run was skipped, if that still holds (a cap, the kill
   // switch). A skip for this same reason is returned but not recorded again.
   heldBy?: string;
@@ -240,6 +244,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
       }
     };
 
+    await input.prepare?.();
     // File tools read snapshots: one commit's files without secret files.
     let roots: string[] | undefined;
     if (input.roots) {
@@ -298,7 +303,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
         model: spec.model,
         system: agent.prompt,
         prompt,
-        tools: [...(input.tools?.(evidence, 'author') ?? []), submit],
+        tools: [...(input.tools?.(evidence, 'author', roots) ?? []), submit],
         maxTurns: spec.limits.max_turns,
         maxBudgetUsd: spec.limits.usd_per_run,
       })) {
@@ -353,7 +358,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
         ...(data ? { data } : {}),
         output: outputs.length === 1 ? outputs[0] : outputs,
         evidence,
-        tools: input.tools?.(evidence, 'challenger') ?? [],
+        tools: input.tools?.(evidence, 'challenger', roots) ?? [],
         onEvent: (e) => {
           transcript('challenger', e);
           watchChallenger(e);

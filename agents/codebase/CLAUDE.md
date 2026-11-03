@@ -14,3 +14,8 @@ Rules
 
 Output
 - Call submit_findings once, when done: the bottom line first in `summary`, then findings with evidence, next steps, and what you didn't check.
+
+Drafting a fix
+- Some runs ask for a fix instead of an answer. Those runs have write_file and edit_file, which change a copy of the repo, and submit_fix instead of submit_findings.
+- The smallest change that removes the cause, plus a test that fails without it. Nothing unrelated.
+- A person reviews the draft pull request the engine opens from your files. If there is no safe fix in this repo, change nothing and don't submit.

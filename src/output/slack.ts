@@ -96,8 +96,9 @@ export function webhookTransport(url: string, timeoutMs = 10_000): Transport {
 // rows: an urgent rows card (or code's line on an issue someone is on).
 // report: an AI report. recovered: a thread reply that rows are back to normal
 // (only when they have a thread). root: an issue's first message again, with
-// its buttons as they now stand (chat.update, not a new message).
-export type PostKind = 'rows' | 'report' | 'recovered' | 'root';
+// its buttons as they now stand (chat.update, not a new message). fix: a draft
+// fix's pull request, a reply in the issue's thread only.
+export type PostKind = 'rows' | 'report' | 'recovered' | 'root' | 'fix';
 
 export interface Post {
   kind: PostKind;
@@ -127,6 +128,9 @@ export interface OutboxOptions {
   // The buttons (Socket Mode on): the blocks shown under an issue's first
   // message, as the issue now stands. Absent: no buttons, no updates.
   controls?: ((issue: string) => unknown[] | undefined) | undefined;
+  // Which set of buttons `controls` draws (default 'base'; 'fix' with Draft a
+  // fix). A first message drawn with another set is redrawn once at start.
+  controlsSet?: string;
 }
 
 const H = 3600_000;
@@ -156,6 +160,13 @@ export function queueRootUpdate(db: DatabaseSync, issue: string, at: Date): void
     was?.attempts ?? 0,
     was?.next_attempt_at ?? null,
   );
+}
+
+// Queue a reply in an issue's thread on any connection to engine.db, inside
+// the caller's transaction (a draft fix's pull request, with its record). It
+// is never shown in the channel, and never sent without the issue's thread.
+export function queueThreadReply(db: DatabaseSync, issue: string, m: SlackMessage, at: Date): void {
+  db.prepare(`INSERT INTO slack_outbox (created_at, kind, keys, broadcast, message, status, issue, repeat) VALUES (?, 'fix', '[]', 0, ?, 'pending', ?, 1)`).run(at.toISOString(), JSON.stringify(m), issue);
 }
 
 type Pending = {
@@ -197,6 +208,8 @@ export class SlackOutbox {
     // When the issue's first message last showed its buttons.
     const threadCols = new Set((this.db.prepare(`PRAGMA table_info(slack_issue_threads)`).all() as Array<{ name: string }>).map((c) => c.name));
     if (!threadCols.has('controls_at')) this.db.exec(`ALTER TABLE slack_issue_threads ADD COLUMN controls_at TEXT`);
+    // And with which set of buttons; NULL is from before sets: the base set.
+    if (!threadCols.has('controls_set')) this.db.exec(`ALTER TABLE slack_issue_threads ADD COLUMN controls_set TEXT`);
     this.o = {
       threadHours: 24,
       freshMinutes: 30,
@@ -205,6 +218,7 @@ export class SlackOutbox {
       maxWaitSec: 10,
       now: () => new Date(),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      controlsSet: 'base',
       ...opts,
     };
   }
@@ -286,6 +300,15 @@ export class SlackOutbox {
       this.db.exec('ROLLBACK');
       throw e;
     }
+  }
+
+  // Issues whose first message shows buttons drawn with another set than this
+  // outbox draws (Draft a fix turned on or off since).
+  drawnOtherwise(): string[] {
+    if (!this.o.controls) return [];
+    return (
+      this.db.prepare(`SELECT issue FROM slack_issue_threads WHERE ts IS NOT NULL AND controls_at IS NOT NULL AND COALESCE(controls_set, 'base') <> ? ORDER BY issue`).all(this.o.controlsSet) as Array<{ issue: string }>
+    ).map((r) => r.issue);
   }
 
   // The issue's first message as posted, with the buttons' blocks under it.
@@ -435,7 +458,7 @@ export class SlackOutbox {
     const rowThread = inIssue ? undefined : this.threadFor(keys, now);
     const taken = !!(p.issue && rowThread && this.db.prepare(`SELECT 1 FROM slack_issue_threads WHERE ts = ? AND issue <> ?`).get(rowThread.ts, p.issue));
     const thread = inIssue ?? (taken ? undefined : rowThread);
-    const noThread = p.kind === 'recovered' ? !thread : !!(p.repeat && known && !inIssue);
+    const noThread = p.kind === 'recovered' ? !thread : p.kind === 'fix' ? !inIssue : !!(p.repeat && known && !inIssue);
     if (noThread) {
       this.db.prepare(`UPDATE slack_outbox SET status = 'skipped' WHERE id = ?`).run(p.id);
       if (p.kind !== 'recovered') log(`slack: ${p.kind} post ${p.id} about ${p.issue} not sent: a repeat, and there is no thread to reply in`);
@@ -462,7 +485,7 @@ export class SlackOutbox {
       this.db
         .prepare(`INSERT INTO slack_issue_threads (issue, ts, opened_at) VALUES (?, ?, ?) ON CONFLICT(issue) DO UPDATE SET ts = excluded.ts, opened_at = excluded.opened_at WHERE slack_issue_threads.ts IS NULL AND excluded.ts IS NOT NULL`)
         .run(p.issue, root ?? null, thread?.opened_at ?? at);
-      if (buttons) this.db.prepare(`UPDATE slack_issue_threads SET controls_at = ? WHERE issue = ? AND ts = ?`).run(at, p.issue, ts ?? null);
+      if (buttons) this.db.prepare(`UPDATE slack_issue_threads SET controls_at = ?, controls_set = ? WHERE issue = ? AND ts = ?`).run(at, this.o.controlsSet, p.issue, ts ?? null);
       // Its first message was not this one (the rows card it started under,
       // or one posted before the buttons): show them there, once.
       else if (this.o.controls && this.issueThread(p.issue)?.controls_at === null && !this.db.prepare(`SELECT 1 FROM slack_outbox WHERE kind = 'root' AND issue = ?`).get(p.issue)) this.updateRoot(p.issue);
@@ -490,7 +513,7 @@ export class SlackOutbox {
     if ('err' in r) return this.failed(p, r.err, out, log);
     const at = this.o.now().toISOString();
     this.db.prepare(`UPDATE slack_outbox SET status = 'sent', attempts = attempts + 1, sent_at = ?, ts = ?, in_channel = 0, last_error = NULL WHERE id = ?`).run(at, view.ts, p.id);
-    this.db.prepare(`UPDATE slack_issue_threads SET controls_at = ? WHERE issue = ?`).run(at, p.issue);
+    this.db.prepare(`UPDATE slack_issue_threads SET controls_at = ?, controls_set = ? WHERE issue = ?`).run(at, this.o.controlsSet, p.issue);
     out.sent++;
     return 'sent';
   }
