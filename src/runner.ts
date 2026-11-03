@@ -151,7 +151,6 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     const file = sink.emit(card, name, o.post ? slack : undefined);
     result.cards.push(file);
     if (slack) result.slack.push(file);
-    return file;
   };
   // A failed send waits for the next patrol, including when the urgent card
   // was attempted before the investigator. Do not retry it again at finish().
@@ -210,7 +209,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   // delays or hides those. Otherwise it stays on disk and the AI's reports decide.
   // A protected journey among the urgent rows needs a person now: the card mentions the on-call.
   const oncall = urgentRows.some((r) => noise.protected(r)) ? cfg.slackOncall : undefined;
-  // Rows the rows card mentions the on-call for: a report on any of them doesn't mention them again.
+  // Rows the on-call has just been mentioned for: a report on any of them doesn't mention them again.
   const paged = new Set(oncall ? urgentRows.map((r) => r.key) : []);
   const card = patrolCard(summary, skip ? `not investigated: ${skip}` : 'AI investigation started', {
     owners: o.owners,
@@ -221,7 +220,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   });
   // Urgent rows that all belong to one open issue go into its thread, still broadcast.
   const rowsIssue = urgentRows.length && o.issues ? record('finding the issue of urgent rows', () => o.issues!.holding(urgentRows.map((r) => r.key)), undefined) : undefined;
-  const rowsFile = emit(card, `${stamp(summary.at)}-rows`, urgentRows.length ? { kind: 'rows', keys: urgentRows.map((r) => r.key), broadcast: true, issue: rowsIssue?.id } : undefined);
+  emit(card, `${stamp(summary.at)}-rows`, urgentRows.length ? { kind: 'rows', keys: urgentRows.map((r) => r.key), broadcast: true, issue: rowsIssue?.id } : undefined);
   // The channel heard about the issue: that restarts its reminder clock.
   if (rowsIssue && o.post) record(`noting the rows card on ${rowsIssue.id}`, () => o.issues!.rowsPosted(rowsIssue.id, at, urgentRows.map((r) => r.key)), undefined);
   if (urgentRows.length) {
@@ -263,10 +262,6 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     }
     result.investigation = inv;
     log(`investigation ${inv.status}: ${inv.outputs.length} report(s), ${inv.evidence.items.size} tool call(s), ${inv.turns} turn(s), $${inv.cost.toFixed(3)}${inv.challenge ? `, challenge ${inv.challenge.verdict}` : ''}${inv.note ? ` (${inv.note})` : ''}`);
-    // That mention stands only if Slack took the rows card or still has it queued.
-    // After a permanent failure, a report on its rows mentions the on-call itself.
-    const rowsStatus = paged.size ? sink.outbox?.statusOf(rowsFile) : undefined;
-    const held = rowsStatus === 'sent' || rowsStatus === 'pending' ? paged : new Set<string>();
     const footer = `${monitor.agent.spec.model} · ${inv.evidence.items.size} tool calls · $${inv.cost.toFixed(2)} · run ${inv.runId}`;
     const byKey = new Map(summary.send.map((r) => [r.key, r]));
     const ownersOf = (rep: Report) => [...new Set(rep.rows.map((k) => byKey.get(k) && o.owners?.ownerOf(byKey.get(k)!.service)).filter((x): x is string => !!x))];
@@ -276,7 +271,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     for (const [i, r] of inv.outputs.entries()) {
       const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId), { action: 'none' }) : { action: 'none' };
       result.filed.push(f);
-      const page = pagesOncall(f, r) && !r.rows.some((k) => held.has(k)) ? cfg.slackOncall : undefined;
+      const page = pagesOncall(f, r) && !r.rows.some((k) => paged.has(k)) ? cfg.slackOncall : undefined;
       const cc = [...new Set([...(page ? [page] : []), ...ownersOf(r)])];
       const card = reportCard(r, summary.at, footer, inv.challenge, cc, issueRef(f));
       const post = postFor(f, r);
