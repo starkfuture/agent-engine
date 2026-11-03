@@ -113,19 +113,21 @@ export class State {
 
   // After a run over these rows: the ones a report covers are done; the rest
   // stay pending, and are given up after ATTEMPTS attempts. Returns those.
+  // Rows can share a key (same-named workloads in two namespaces): one run is
+  // one attempt per key.
   investigated(rows: Row[], covered: Set<string>, outcome: string, attempted: boolean, runId?: string): string[] {
     const gaveUp: string[] = [];
-    for (const row of rows) {
-      const m = this.data.rows[row.key];
+    for (const key of new Set(rows.map((r) => r.key))) {
+      const m = this.data.rows[key];
       if (!m) continue;
       const i = (m.investigation ??= { status: 'pending', attempts: 0 });
       if (attempted) i.attempts++;
       i.outcome = outcome;
       if (runId) i.runId = runId;
-      if (covered.has(row.key)) i.status = 'complete';
+      if (covered.has(key)) i.status = 'complete';
       else if (i.attempts >= ATTEMPTS) {
         i.status = 'gave_up';
-        gaveUp.push(row.key);
+        gaveUp.push(key);
       }
     }
     return gaveUp;

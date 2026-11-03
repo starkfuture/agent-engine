@@ -368,8 +368,6 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     if (inv.status === 'skipped') state.data.held = { reason: inv.note ?? 'skipped', since: now.toISOString(), runId: inv.runId };
     else delete state.data.held;
     result.investigation = inv;
-    // Not admitted (caps, the kill switch on) or stopped (the kill switch, a cancel): deferred, not an attempt.
-    investigated(new Set(inv.outputs.flatMap((r) => r.rows)), inv.note ?? inv.status, inv.status !== 'skipped' && inv.status !== 'stopped', inv.runId);
     log(`investigation ${inv.status}: ${inv.outputs.length} report(s), ${inv.evidence.items.size} tool call(s), ${inv.turns} turn(s), $${inv.cost.toFixed(3)}${inv.challenge ? `, challenge ${inv.challenge.verdict}` : ''}${inv.note ? ` (${inv.note})` : ''}`);
     const footer = `${monitor.agent.spec.model} · ${inv.evidence.items.size} tool calls · $${inv.cost.toFixed(2)} · run ${inv.runId}`;
     const byKey = new Map(pending.map((r) => [r.key, r]));
@@ -398,6 +396,9 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       answer.push(`### Report ${i + 1} · ${filingNote(f, r)}`, '', card.markdown, '');
     }
     log(`${toSlack} of ${inv.outputs.length} report(s) go to Slack${quiet ? ` (${quiet} as a quiet reply in an issue's thread)` : ''}`);
+    // Only now, with the reports queued: if queueing threw, the rows are still owed.
+    // Not admitted (caps, the kill switch on) or stopped (the kill switch, a cancel): deferred, not an attempt.
+    investigated(new Set(inv.outputs.flatMap((r) => r.rows)), inv.note ?? inv.status, inv.status !== 'skipped' && inv.status !== 'stopped', inv.runId);
     // get_run reads answer.md: the reports, with the issue each one went to.
     if (inv.dir && answer.length)
       try {

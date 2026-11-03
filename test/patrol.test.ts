@@ -519,8 +519,8 @@ const firing = (since: Record<string, string>) =>
   });
 
 // One investigation: notes the row keys it was asked to cover, and files a
-// minor report (recorded, not posted) on the ones `cover` picks.
-function investigator(asked: string[][], cover: (rows: string[]) => string[] = (rows) => rows): Script {
+// report (minor: recorded, not posted) on the ones `cover` picks.
+function investigator(asked: string[][], cover: (rows: string[]) => string[] = (rows) => rows, severity: Report['severity'] = 'minor'): Script {
   return async function* (sim) {
     const lines = sim.req.prompt.split('\n');
     const start = lines.indexOf('Row keys to cover (copy exactly into reports):') + 1;
@@ -530,7 +530,7 @@ function investigator(asked: string[][], cover: (rows: string[]) => string[] = (
       const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
       const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
       const quote = /^\S+ 400 \| [1-9]\d*/m.exec(out.text)![0];
-      const r = await sim.mcp('submit_report', report({ severity: 'minor', rows: cover(rows), evidence: [{ id, quote, claim: 'the route returns 400' }] }));
+      const r = await sim.mcp('submit_report', report({ severity, rows: cover(rows), evidence: [{ id, quote, claim: 'the route returns 400' }] }));
       assert.equal(r.isError, false, r.text);
     }
     yield ok(0.1);
@@ -710,6 +710,34 @@ test('a row reported before investigations were recorded gets one at its next re
   assert.equal(reminder.investigation?.status, 'ok');
   assert.equal(state.data.rows[LOGIN]!.investigation?.status, 'complete');
   assert.equal((await pass('2026-09-30T00:45:00Z')).investigation, undefined, 'explained: its next reminder stays out of runs');
+});
+
+test('a report the outbox could not queue is investigated again next patrol, as before', async () => {
+  const c = cfg();
+  const state = State.memory();
+  const asked: string[][] = [];
+  const box = new SlackOutbox(':memory:', { threads: true, post: async () => 'ts' }, { sleep: async () => {}, gapMs: 0 });
+  const { enqueue } = box;
+  box.enqueue = () => {
+    throw new Error('database is locked');
+  };
+  const m = monitor(c, fakeSession(investigator(asked, undefined, 'major'), investigator(asked, undefined, 'major')));
+  const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z' });
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir, box), new Date(time), { llm: true, post: true }, m);
+  await assert.rejects(pass('2026-09-29T12:15:00Z'), /database is locked/);
+  box.enqueue = enqueue;
+  const again = await pass('2026-09-29T12:30:00Z');
+  assert.equal(asked.length, 2, 'investigated again');
+  assert.equal(again.slack.length, 1, 'and this time its report is queued');
+  assert.equal(state.data.rows[LOGIN]!.investigation?.status, 'complete');
+});
+
+test('rows that share a key (same-named workloads in two namespaces) spend one attempt per run, not two', () => {
+  const state = State.memory();
+  const row = { key: 'workload|api|restarts api|', section: 'workload', service: 'api', subject: 'restarts api', counts: { now: 3, h1: 0, d1: 0, d7: 0 }, score: { verdict: 'spike', expected: 0, z: 9, trend: 'started' } } as unknown as FlaggedRow;
+  state.seen(row, new Date('2026-09-29T12:15:00Z'), ['workloads']);
+  assert.deepEqual(state.investigated([row, { ...row }], new Set(), 'no_output', true), []);
+  assert.deepEqual([state.data.rows[row.key]!.investigation?.status, state.data.rows[row.key]!.investigation?.attempts], ['pending', 1]);
 });
 
 // ---- error counters and the summary ----------------------------------------------
