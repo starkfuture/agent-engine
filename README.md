@@ -83,8 +83,8 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 
 **How it is posted.** With the Slack bot (`SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID`, app manifest in `slack/`), each issue is one message:
 - **Later news on the same rows goes into its thread:** the AI report on an urgent rows card, a worse count, a recovery ("✅ Back to normal").
-- **Thread replies show in the channel too** (broadcast) only when the thread is more than 30 min old, so the AI's report right after its rows card stays in the thread.
-- **A thread takes replies for 24 h** after its last post; after a quiet day the issue starts a new message.
+- **Thread replies show in the channel too** (broadcast) only when the thread is more than 30 min old, so the AI's report right after its rows card stays in the thread. Reports about a known issue follow the issue rules below instead.
+- **A thread takes replies for 24 h** after its last post; after a quiet day the rows start a new message. An issue's thread has no such limit while the issue is open.
 
 Every post goes through an outbox in the engine's SQLite file (`slack_outbox`):
 - **Delivered means Slack answered ok.** A failure waits for the next patrol and gives up after a day.
@@ -97,6 +97,27 @@ Every post goes through an outbox in the engine's SQLite file (`slack_outbox`):
 Delivery is at least once: if Slack accepts a message but its response is lost, a retry may duplicate it. The outbox prevents overlapping senders from duplicating a post; it cannot make the remote send and the local receipt one transaction.
 
 The incoming webhook (`SLACK_WEBHOOK_URL`) still works as a fallback, without threads.
+
+### Issues: one cause, one thread
+
+A critical or major AI report opens an **issue**: the engine's record of one cause, with a short id like `I-7f3a`. It is the bot's finding, not an incident (a person may promote it to one on the team's board, and the bot can be wrong). It lives in the engine's SQLite file next to the outbox: `issues`, `issue_rows` (the rows it covers) and an append-only `issue_events` (opened, report_linked, severity_raised, resolved, reopened, reminded, rows_posted).
+
+The investigator is shown the open issues and those resolved in the last 24 h (at most 20, as fenced data: id, title, severity, first seen, last report, rows, latest cause). Each report says `"issue": "<id>"` when it has the same cause, even on different rows, or `"new"`. An id that wasn't on the list is rejected and the model resubmits.
+
+What a report posts:
+
+| The report | Slack (bot) | Webhook |
+|---|---|---|
+| `new`, critical or major | a new message (or a reply on its urgent rows card, as before); opens the issue | a message |
+| same issue, same or lower severity | a reply in the issue's thread, **not** shown in the channel, also after 24 h | nothing (the card and `get_run` keep it) |
+| same issue, but the channel has heard nothing about it for 24 h (no new, raised, reopened or reminder post, and no urgent rows card in its thread) | a reply in its thread, also shown in the channel (at most once a day per open issue, so a chronic one isn't hidden for good) | a message |
+| same issue, severity rises (major → critical) | a reply in its thread, also shown in the channel | a message |
+| a resolved issue (it came back) | reopens it; a reply in its thread, also shown in the channel | a message |
+| minor or noise | not posted, as before; a linked one's rows still join the issue | nothing |
+
+The rows of a linked report join the issue. Urgent rows that all belong to one open issue are posted in its thread, still shown in the channel. When every row of an open issue is back to normal (healthy observers required, as for any recovery), the issue is resolved and its thread gets one "✅ Back to normal · I-7f3a resolved" note; its rows get no recovery note of their own, also while some of them still fire.
+
+Patrol logs say what each report did (`report 1 linked to I-7f3a (no broadcast)`, `I-7f3a resolved: all 3 row(s) back to normal`); `get_run` on a monitor run shows each report with its issue. A linked repeat still costs an AI run: this changes what is posted, not what triggers a run.
 
 The baseline is `min(1 d, 7 d)`, scaled by current traffic, so a one-day incident doesn't become its own baseline the next day. The 1 h window only labels a row "started" or "ongoing".
 
@@ -153,10 +174,10 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 | `config/noise.yaml` | Known noise (reason and expiry required) and the never-suppress list. |
 | `config/owners.yaml` | Service → Slack mention on posted cards. Ships with examples only. |
 | `src/clients/telemetry.ts` | Grafana datasource proxy client (Prometheus, Loki, Tempo), plus record and replay. |
-| `src/patrol/` | Collectors, scoring, noise, state, summary, owners, and the card digest (ranking, floor, grouping). |
+| `src/patrol/` | Collectors, scoring, noise, state, summary, owners, the issue record, and the card digest (ranking, floor, grouping). |
 | `src/engine/` | The engine: agent loader, run, session (SDK), evidence, guard, ledger, challenge, generic output. |
 | `agents/` | Agent folders: `monitor`, `research`, `codebase`. |
-| `src/investigate/` | Monitor: telemetry tools, task prompt, report schema. |
+| `src/investigate/` | Monitor: telemetry tools, task prompt (with the issue list), report schema. |
 | `src/output/` | Card rendering (Slack Block Kit and Markdown), the sink and the Slack outbox (bot or webhook). |
 | `slack/` | The Slack app (manifest and Slack CLI project). |
 | `src/runner.ts`, `src/cli.ts` | Patrol orchestration (card first, challenge gate) and commands. |
@@ -166,7 +187,7 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 - **Telemetry is read-only by construction.** The client has no write method, and Prometheus and Loki calls are concurrency-capped.
 - **The model holds no credentials.** Tools run in this process. The SDK subprocess gets only model credentials, with no built-in tools, `settingSources: []`, `strictMcpConfig` and `dontAsk`.
 - **PII and secrets are redacted** before anything reaches the model, a card or disk. Log text is fenced as untrusted data.
-- **Reports are checked in code:** the zod schema, cited evidence ids must exist, row keys must be real, and a critical report must have measured impact.
+- **Reports are checked in code:** the zod schema, cited evidence ids must exist, row keys must be real, a linked issue must be one the investigator was shown, and a critical report must have measured impact.
 - **Spend is capped** by the engine: `agents/monitor/agent.yaml` limits plus `ENGINE_DAILY_CAP_USD` and `ENGINE_MONTHLY_CAP_USD` (all agents). Set a spend limit on the Anthropic workspace too: the SDK checks a run's budget between turns, so one run can overshoot by a turn. The patrol keeps reporting when a cap is reached.
 
 ## Not built yet

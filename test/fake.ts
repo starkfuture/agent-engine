@@ -1,3 +1,7 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { Config } from '../src/config.js';
 import type { LogLine, Sample, Series, Telemetry, TraceHit } from '../src/clients/telemetry.js';
 
 // Answers promInstant by (query substring, time) so tests can describe the
@@ -44,3 +48,37 @@ export function world(query: string, at: Date): Sample[] {
   ];
 }
 
+// A patrol config over the legacy /v1 family only, with fresh temp folders.
+export const testConfig = (): Config => ({
+  grafanaUrl: 'http://grafana.test',
+  grafanaTokenFile: '/dev/null',
+  promUid: 'prometheus',
+  lokiUid: undefined,
+  tempoUid: undefined,
+  windowMinutes: 15,
+  attentionFloor: 10,
+  sources: {
+    http_families: [
+      { id: 'legacy-v1', selector: 'backend_be_production_http_requests_total', service: 'backend-production', route_label: 'route', status_label: 'status_code' },
+    ],
+    error_counters: [],
+    workloads: { namespaces: 'microservices' },
+    logs: { selector: '{namespace="microservices"}', error_filter: '', service_label: 'app', max_lines: 100 },
+    traces: { traceql: '{ status = error }', limit: 10 },
+  },
+  noiseFile: '/dev/null',
+  ownersFile: '/dev/null',
+  stateFile: join(mkdtempSync(join(tmpdir(), 'sre-test-')), 'state.json'),
+  outDir: mkdtempSync(join(tmpdir(), 'sre-out-')),
+  llm: { available: false, dailyCapUsd: 10, monthlyCapUsd: 100 },
+  agentsDir: join(import.meta.dirname, '..', 'agents'),
+  runsDir: mkdtempSync(join(tmpdir(), 'sre-runs-')),
+  slackWebhookUrl: undefined,
+  slackBotToken: undefined,
+  slackChannel: undefined,
+  direct: undefined,
+  memoryDir: undefined,
+  build: undefined,
+  retentionDays: 30,
+  mcp: { usersFile: '/nonexistent', reposFile: '/nonexistent', userDailyCapUsd: 10, userMaxRunning: 2, notifySlack: false, allowedOrigins: [], agents: undefined, login: undefined, reposDir: undefined, reposGithub: undefined, githubApp: undefined },
+});

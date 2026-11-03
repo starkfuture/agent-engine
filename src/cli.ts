@@ -9,6 +9,7 @@ import { httpQuery } from './patrol/collectors.js';
 import { Noise } from './patrol/noise.js';
 import { Owners } from './patrol/owners.js';
 import { State } from './patrol/state.js';
+import { Issues } from './patrol/issues.js';
 import { rowLine } from './patrol/summary.js';
 import { CardSink } from './output/sink.js';
 import { botTransport, SlackOutbox, webhookTransport } from './output/slack.js';
@@ -166,6 +167,9 @@ function makeEngine(cfg: Config, runsDir = cfg.runsDir): Engine {
 function monitorAgent(cfg: Config): MonitorAgent {
   return { engine: makeEngine(cfg), agent: loadAgent(join(cfg.agentsDir, 'monitor'), cfg.memoryDir) };
 }
+// The issue record lives in the engine's SQLite file, next to the Slack outbox.
+// A fresh look (--fresh) starts from no issues too.
+const issueRecord = (cfg: Config, fresh = false) => (fresh ? Issues.memory() : new Issues(join(cfg.runsDir, 'engine.db')));
 
 // Patrol times sit on window boundaries so recordings and replays line up.
 const align = (d: Date, min: number) => new Date(Math.floor(d.getTime() / (min * 60_000)) * min * 60_000);
@@ -179,7 +183,7 @@ async function patrolEvery(cfg: Config, noise: Noise, owners: Owners, sink: Card
     state: State.load(cfg.stateFile),
     sink,
     windowMin: w,
-    opts: { llm: a.llm, post: a.post, log, owners },
+    opts: { llm: a.llm, post: a.post, log, owners, issues: issueRecord(cfg) },
     monitor: a.llm ? monitorAgent(cfg) : undefined,
     onPass: metrics ? (at, r) => metrics.patrol(at, r) : undefined,
   });
@@ -290,7 +294,7 @@ async function main() {
       if (!name) throw new Error('usage: run <agent> --task "<text>"');
       if (name === 'monitor') {
         const state = a.fresh ? State.memory() : State.load(cfg.stateFile);
-        const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, align(new Date(), w), { llm: true, post: a.post, log, owners }, monitorAgent(cfg));
+        const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, align(new Date(), w), { llm: true, post: a.post, log, owners, issues: issueRecord(cfg, a.fresh) }, monitorAgent(cfg));
         for (const c of r.cards) console.log(`card: ${c}`);
         return;
       }
@@ -458,7 +462,7 @@ async function main() {
     case 'patrol': {
       const state = a.fresh ? State.memory() : State.load(cfg.stateFile);
       const at = align(a.at ? date(a.at, 'at') : new Date(), w);
-      const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log, owners }, a.llm ? monitorAgent(cfg) : undefined);
+      const r = await patrolOnce(telemetry(cfg), cfg, noise, state, sink, at, { llm: a.llm, post: a.post, log, owners, issues: issueRecord(cfg, a.fresh) }, a.llm ? monitorAgent(cfg) : undefined);
       for (const row of r.summary.send) console.log(rowLine(row));
       for (const c of r.cards) console.log(`card: ${c}`);
       return;
@@ -517,12 +521,15 @@ async function main() {
       // share the store and STOP file: real money, same caps, same kill switch.
       const monitor = a.llm ? { engine: makeEngine(cfg, join(outDir, 'runs')), agent: loadAgent(join(cfg.agentsDir, 'monitor'), cfg.memoryDir) } : undefined;
       const timeline: string[] = [`# Replay ${from.toISOString()} → ${to.toISOString()} (step ${step} min, window ${w} min)`, ''];
+      const issues = Issues.memory(); // the replay's own issues, never production's
       for (let t = from; t <= to; t = new Date(t.getTime() + step * 60_000)) {
-        const r = await patrolOnce(tel, replayCfg, noise, state, new CardSink(outDir), t, { llm: a.llm, post: false, trigger: 'replay', log, owners }, monitor);
+        const r = await patrolOnce(tel, replayCfg, noise, state, new CardSink(outDir), t, { llm: a.llm, post: false, trigger: 'replay', log, owners, issues }, monitor);
         const down = r.summary.sources.filter((s) => !s.ok).map((s) => s.source);
         timeline.push(`## ${t.toISOString()}  send ${r.summary.send.length} · known ${r.summary.known.length} · recovered ${r.summary.recovered.length} · to Slack ${r.slack.length}${down.length ? ` · blind: ${down.join(', ')}` : ''}`);
         for (const row of r.summary.send) timeline.push(`- ${rowLine(row)}`);
         if (r.investigation) timeline.push(`- investigator: ${r.investigation.status}, ${r.investigation.outputs.length} report(s), $${r.investigation.cost.toFixed(2)}${r.investigation.challenge ? `, challenge ${r.investigation.challenge.verdict}` : ''}`);
+        for (const f of r.filed) if (f.action !== 'none') timeline.push(`- ${f.action} ${f.issue.id}: ${f.issue.title}`);
+        for (const id of r.resolved) timeline.push(`- resolved ${id}`);
       }
       writeFileSync(join(outDir, 'timeline.md'), timeline.join('\n') + '\n');
       console.log(timeline.join('\n'));

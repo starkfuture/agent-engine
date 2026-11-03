@@ -7,9 +7,10 @@ import { runAgent, type Engine, type RunResult } from './engine/run.js';
 import { monitorTask } from './investigate/prompt.js';
 import { checkReport, Report, ReportShape } from './investigate/report.js';
 import { monitorTools } from './investigate/tools.js';
-import { patrolCard, recoveredCard, reportCard, type Card } from './output/card.js';
+import { patrolCard, recoveredCard, reportCard, type Card, type IssueRef } from './output/card.js';
 import type { CardSink, EmitSlack } from './output/sink.js';
 import { bucketOf } from './patrol/digest.js';
+import type { Issue, Issues, Severity } from './patrol/issues.js';
 import type { Noise } from './patrol/noise.js';
 import type { Owners } from './patrol/owners.js';
 import type { State } from './patrol/state.js';
@@ -22,6 +23,7 @@ export interface PatrolOptions {
   trigger?: string; // 'patrol' (default) | 'replay' | 'manual'
   log?: (s: string) => void;
   owners?: Owners | undefined; // Slack mentions on posted cards; absent = none
+  issues?: Issues | undefined; // the issue record (engine.db); absent = every report stands alone, as before
 }
 
 export interface PatrolResult {
@@ -30,6 +32,8 @@ export interface PatrolResult {
   cards: string[];
   slack: string[]; // the cards meant for Slack, sent when posting is on
   skippedLlm?: string;
+  filed: Filing[]; // per AI report, in order: what it did to the issue record
+  resolved: string[]; // issues whose rows were all back to normal this patrol
 }
 
 export interface MonitorAgent {
@@ -55,6 +59,64 @@ export function needsChallenge(rows: FlaggedRow[], noise: Noise): boolean {
 // and noise reports stay in the run folder, where the MCP answers from them.
 export const POSTED: ReadonlySet<Report['severity']> = new Set(['critical', 'major']);
 
+// What one AI report did to the issue record. The posting rule reads it.
+export type Filing =
+  | { action: 'none' } // no issue record, or "new" and not posted (minor, noise)
+  | { action: 'opened'; issue: Issue }
+  | { action: 'linked'; issue: Issue } // same cause, same or lower severity; or not posted
+  | { action: 'raised'; issue: Issue; from: Severity }
+  | { action: 'reopened'; issue: Issue } // it was resolved and came back
+  | { action: 'reminded'; issue: Issue }; // same cause, but the channel has heard nothing about it for REMIND_HOURS
+
+// An open issue whose rows never all recover (a chronic one) would otherwise
+// hide every later report in its thread for good: at most once in this many
+// hours, a report linked to it is shown in the channel again.
+export const REMIND_HOURS = 24;
+
+export function fileReport(issues: Issues, r: Report, at: Date, run?: string): Filing {
+  const filed = { title: r.title, severity: r.severity, rows: r.rows, hypothesis: r.cause.hypothesis, run };
+  if (r.issue === 'new') return POSTED.has(r.severity) ? { action: 'opened', issue: issues.open(filed, at) } : { action: 'none' };
+  // A recurrence reopens the issue only when it is worth posting.
+  const l = issues.link(r.issue, filed, at, { reopen: POSTED.has(r.severity) });
+  if (l.reopenedFrom) return { action: 'reopened', issue: l.issue };
+  if (l.raisedFrom) return { action: 'raised', issue: l.issue, from: l.raisedFrom };
+  if (POSTED.has(r.severity) && l.lastNewsAt && at.getTime() - Date.parse(l.lastNewsAt) >= REMIND_HOURS * 3600_000) {
+    issues.remind(l.issue.id, at, run);
+    return { action: 'reminded', issue: l.issue };
+  }
+  return { action: 'linked', issue: l.issue };
+}
+
+// The posting rule. News (a new issue, a higher severity, a recurrence) is a
+// new message or a broadcast reply; the same cause again is a quiet reply in
+// the issue's thread, or nothing where there is no thread (the webhook).
+export function postFor(f: Filing, r: Report): EmitSlack | undefined {
+  if (!POSTED.has(r.severity)) return undefined;
+  if (f.action === 'none') return { kind: 'report', keys: r.rows, broadcast: true };
+  if (f.action === 'linked') return { kind: 'report', keys: r.rows, broadcast: false, issue: f.issue.id, repeat: true };
+  return { kind: 'report', keys: r.rows, broadcast: true, issue: f.issue.id };
+}
+
+const issueRef = (f: Filing): IssueRef | undefined =>
+  f.action === 'none' ? undefined : { id: f.issue.id, title: f.issue.title, change: f.action === 'opened' ? 'new' : f.action === 'linked' || f.action === 'reminded' ? 'update' : f.action, ...(f.action === 'raised' ? { from: f.from } : {}) };
+
+function filingNote(f: Filing, r: Report): string {
+  switch (f.action) {
+    case 'none':
+      return POSTED.has(r.severity) ? 'no issue record: posted on its own' : `${r.severity}: not posted`;
+    case 'opened':
+      return `opened ${f.issue.id} (${r.severity})`;
+    case 'linked':
+      return `linked to ${f.issue.id} (${POSTED.has(r.severity) ? 'no broadcast' : `${r.severity}: not posted`})`;
+    case 'raised':
+      return `linked to ${f.issue.id}: severity ${f.from} → ${r.severity} (broadcast)`;
+    case 'reopened':
+      return `reopened ${f.issue.id}: it came back (broadcast)`;
+    case 'reminded':
+      return `linked to ${f.issue.id}: open with no news in the channel for ${REMIND_HOURS} h (broadcast)`;
+  }
+}
+
 export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, state: State, sink: CardSink, at: Date, o: PatrolOptions, monitor?: MonitorAgent): Promise<PatrolResult> {
   const log = o.log ?? (() => {});
   const summary = await buildSummary(tel, cfg, noise, state, at);
@@ -64,7 +126,17 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   writeFileSync(join(dir, `${stamp(summary.at)}.json`), safeJson(summary, 1));
   log(`patrol ${summary.at}: ${summary.send.length} to send, ${summary.known.length} known, ${summary.suppressed.length} noise, ${summary.recovered.length} recovered, sources down: ${summary.sources.filter((s) => !s.ok).map((s) => s.source).join(', ') || 'none'}`);
 
-  const result: PatrolResult = { summary, cards: [], slack: [] };
+  const result: PatrolResult = { summary, cards: [], slack: [], filed: [], resolved: [] };
+  // The issue record must never stop a patrol: on a database error the reports
+  // are posted on their own, as before the record existed.
+  const record = <T>(what: string, f: () => T, fallback: T): T => {
+    try {
+      return f();
+    } catch (e) {
+      log(`issues: ${what} failed: ${(e as Error).message.slice(0, 200)}`);
+      return fallback;
+    }
+  };
   // slack: queued for the channel (sent when posting is on) with the rows it is about.
   const emit = (card: Card, name: string, slack?: EmitSlack) => {
     const file = sink.emit(card, name, o.post ? slack : undefined);
@@ -84,8 +156,29 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   // rows take the separate fast path below, before the model starts.
   const finish = async () => {
     state.save();
-    if (o.post && sink.outbox?.threads && summary.recovered.length)
-      for (const keys of sink.outbox.groupByThread(summary.recovered)) sink.emit(recoveredCard(keys, summary.at), `${stamp(summary.at)}-recovered-${keys.length}`, { kind: 'recovered', keys, broadcast: false });
+    // An issue is resolved once every row of it is back to normal (which needs
+    // healthy observers), with one recovery note in its thread. Its rows get no
+    // recovery note of their own, also while some of them still fire.
+    let loose = summary.recovered;
+    const issues = o.issues;
+    if (issues) {
+      const open = record('listing open issues', () => issues.openIssues(), []);
+      const held = new Set(open.flatMap((i) => i.rows));
+      loose = summary.recovered.filter((k) => !held.has(k));
+      for (const i of open) {
+        const back = i.rows.filter((k) => state.recoveredAt(k) !== undefined).length;
+        if (back < i.rows.length) {
+          if (i.rows.some((k) => summary.recovered.includes(k))) log(`${i.id}: ${back} of ${i.rows.length} row(s) back to normal, still open`);
+          continue;
+        }
+        if (!record(`resolving ${i.id}`, () => (issues.resolve(i.id, at), true), false)) continue;
+        result.resolved.push(i.id);
+        log(`${i.id} resolved: all ${i.rows.length} row(s) back to normal`);
+        emit(recoveredCard(i.rows, summary.at, i.id), `${stamp(summary.at)}-resolved-${i.id}`, sink.outbox?.threads ? { kind: 'recovered', keys: i.rows, broadcast: false, issue: i.id } : undefined);
+      }
+    }
+    if (o.post && sink.outbox?.threads && loose.length)
+      for (const keys of sink.outbox.groupByThread(loose)) sink.emit(recoveredCard(keys, summary.at), `${stamp(summary.at)}-recovered-${keys.length}`, { kind: 'recovered', keys, broadcast: false });
     await flush();
     return result;
   };
@@ -111,14 +204,22 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     protected: (r) => noise.protected(r),
     ref: `patrols/${stamp(summary.at)}.md`,
   });
-  emit(card, `${stamp(summary.at)}-rows`, urgentRows.length ? { kind: 'rows', keys: urgentRows.map((r) => r.key), broadcast: true } : undefined);
+  // Urgent rows that all belong to one open issue go into its thread, still broadcast.
+  const rowsIssue = urgentRows.length && o.issues ? record('finding the issue of urgent rows', () => o.issues!.holding(urgentRows.map((r) => r.key)), undefined) : undefined;
+  emit(card, `${stamp(summary.at)}-rows`, urgentRows.length ? { kind: 'rows', keys: urgentRows.map((r) => r.key), broadcast: true, issue: rowsIssue?.id } : undefined);
+  // The channel heard about the issue: that restarts its reminder clock.
+  if (rowsIssue && o.post) record(`noting the rows card on ${rowsIssue.id}`, () => o.issues!.rowsPosted(rowsIssue.id, at, urgentRows.map((r) => r.key)), undefined);
   if (urgentRows.length) {
-    log(`rows card to Slack: ${urgentRows.length} urgent row(s)`);
+    log(`rows card to Slack: ${urgentRows.length} urgent row(s)${rowsIssue ? ` (in ${rowsIssue.id}'s thread)` : ''}`);
     await flush();
   }
 
   if (!skip && monitor) {
     const rowKeys = new Set(summary.send.map((r) => r.key));
+    // The issues the investigator may link to: open, or resolved in the last 24 h.
+    const none = { issues: [], more: 0 };
+    const listed = o.issues ? record('listing issues', () => o.issues!.listed(at), none) : none;
+    const issueIds = new Set(listed.issues.map((i) => i.id));
     const challenge = needsChallenge(summary.send, noise);
     log(`investigating ${summary.send.length} row(s) with ${monitor.agent.spec.model}${challenge ? ', then a challenger' : ''}…`);
     let inv: RunResult<Report>;
@@ -126,7 +227,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       inv = await runAgent<Report>(monitor.engine, {
         agent: monitor.agent,
         trigger: o.trigger ?? 'patrol',
-        task: monitorTask([...rowKeys]),
+        task: monitorTask([...rowKeys], listed),
         data: renderSummary(summary),
         tools: monitorTools(tel, cfg, at),
         output: {
@@ -134,7 +235,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
           description: 'Submit one report per distinct problem. Call it once for every problem you found (several calls are fine). Invalid reports come back with the reason; fix and resubmit.',
           shape: ReportShape,
           evidenceOf: (r) => r.evidence,
-          check: (r) => checkReport(r, rowKeys),
+          check: (r) => checkReport(r, rowKeys, issueIds),
         },
         challenge,
       });
@@ -150,9 +251,28 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     const footer = `${monitor.agent.spec.model} · ${inv.evidence.items.size} tool calls · $${inv.cost.toFixed(2)} · run ${inv.runId}`;
     const byKey = new Map(summary.send.map((r) => [r.key, r]));
     const ownersOf = (rep: Report) => [...new Set(rep.rows.map((k) => byKey.get(k) && o.owners?.ownerOf(byKey.get(k)!.service)).filter((x): x is string => !!x))];
-    for (const [i, r] of inv.outputs.entries())
-      emit(reportCard(r, summary.at, footer, inv.challenge, ownersOf(r)), `${stamp(summary.at)}-${i + 1}`, POSTED.has(r.severity) ? { kind: 'report', keys: r.rows, broadcast: true } : undefined);
-    log(`${inv.outputs.filter((r) => POSTED.has(r.severity)).length} of ${inv.outputs.length} report(s) rated critical or major go to Slack`);
+    const answer: string[] = [];
+    let toSlack = 0;
+    let quiet = 0;
+    for (const [i, r] of inv.outputs.entries()) {
+      const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId), { action: 'none' }) : { action: 'none' };
+      result.filed.push(f);
+      const card = reportCard(r, summary.at, footer, inv.challenge, ownersOf(r), issueRef(f));
+      const post = postFor(f, r);
+      emit(card, `${stamp(summary.at)}-${i + 1}`, post);
+      if (post) toSlack++;
+      if (post?.repeat) quiet++;
+      if (o.issues) log(`report ${i + 1} ${filingNote(f, r)}`);
+      answer.push(`### Report ${i + 1} · ${filingNote(f, r)}`, '', card.markdown, '');
+    }
+    log(`${toSlack} of ${inv.outputs.length} report(s) go to Slack${quiet ? ` (${quiet} as a quiet reply in an issue's thread)` : ''}`);
+    // get_run reads answer.md: the reports, with the issue each one went to.
+    if (inv.dir && answer.length)
+      try {
+        writeFileSync(join(inv.dir, 'answer.md'), redact([`# Monitor reports · patrol ${summary.at}`, '', ...answer].join('\n')));
+      } catch {
+        /* the cards and output.json have it all */
+      }
     if (inv.status !== 'ok') skip = `investigator ${inv.status}${inv.note ? `: ${inv.note}` : ''}`;
   }
   if (skip) result.skippedLlm = skip;

@@ -26,9 +26,18 @@ function challengeLines(c: ChallengeResult | undefined): string[] {
 // into the card. (Redacting the serialised blocks broke JSON on `KEY="…"`.)
 const m = (s: string) => cleanModelText(redact(s));
 
+// The issue a report belongs to, and what the report changed about it.
+export interface IssueRef {
+  id: string;
+  title: string; // the issue's own title (from its first report)
+  change: 'new' | 'update' | 'raised' | 'reopened';
+  from?: Report['severity']; // with 'raised': the severity before
+}
+
 // `cc`: owner mentions from the owners file (validated there), the only text
-// that reaches Slack unescaped.
-export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult, cc: string[] = []): Card {
+// that reaches Slack unescaped. `issue`: a new issue shows its id; an update on
+// an existing one is headed by that issue, not by this report's title.
+export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult, cc: string[] = [], issue?: IssueRef): Card {
   const r: Report = {
     ...raw,
     title: m(raw.title),
@@ -42,8 +51,11 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     rows: raw.rows.map(m),
   };
   const ch = challengeLines(challenge).map(m);
+  const update = issue && issue.change !== 'new';
+  const what = issue && { new: 'new issue', update: 'same cause', raised: `severity raised from ${issue.from}`, reopened: 'back after it recovered: reopened' }[issue.change];
   const md = [
-    `## ${SEV[r.severity]} ${r.title}`,
+    `## ${SEV[r.severity]} ${update ? `Update on ${issue.id}: ${m(issue.title)}` : r.title}`,
+    ...(issue ? [`**Issue:** ${issue.id} (${what})${update ? ` · **This report:** ${r.title}` : ''}`] : []),
     `**Status:** ${r.status} · **Since:** ${r.started_at} · **Severity:** ${r.severity} · **Confidence:** ${r.cause.confidence}${cc.length ? ` · cc ${cc.join(' ')}` : ''}`,
     '',
     `**What broke:** ${r.what_broke}`,
@@ -66,7 +78,9 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
   // Slack: what someone reads in the channel. Two short paragraphs, no evidence
   // ids; the card's file and the run keep everything. Model and production text
   // is escaped so <!channel>, <@U…> or <url|label> can't act.
-  const head = `${SEV[r.severity]} ${LEVEL[r.severity]}: ${r.title}`;
+  const head = update ? `${SEV[r.severity]} Update on ${issue.id}: ${m(issue.title)}` : `${SEV[r.severity]} ${LEVEL[r.severity]}: ${r.title}`;
+  // Before the status: what this post is to the issue.
+  const lead = !issue ? '' : issue.change === 'new' ? `New issue ${issue.id}` : issue.change === 'raised' ? `Now ${LEVEL[r.severity]} (was ${LEVEL[issue.from ?? 'major']})` : issue.change === 'reopened' ? `Back again · ${LEVEL[r.severity]}` : LEVEL[r.severity];
   const pair = (a: string, x: string, b: string, y: string) => ({ type: 'section', text: { type: 'mrkdwn', text: clip(`*${a}:* ${esc(brief(x, 400))}\n*${b}:* ${esc(brief(y, 400))}`) } });
   // The challenger reviews the whole patrol. Only objections about THIS report
   // (they cite its evidence or name one of its routes) go on its card.
@@ -76,7 +90,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
   const elsewhere = challenge?.verdict === 'escalate' && !against.length;
   const blocks = [
     { type: 'header', text: { type: 'plain_text', text: clip(head, 150) } },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `*${r.status}* ${esc(`since ${when(r.started_at, patrolAt)} · confidence ${r.cause.confidence}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}` }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `${lead ? `${esc(lead)} · ` : ''}*${r.status}* ${esc(`since ${when(r.started_at, patrolAt)} · confidence ${r.cause.confidence}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}` }] },
     pair("What's wrong", r.what_broke, 'Impact', r.impact),
     pair('Likely cause', r.cause.hypothesis, 'Suggested fix', r.suggested_fix),
     ...(against.length ? [{ type: 'section', text: { type: 'mrkdwn', text: clip(`⚠️ *A second AI check disputes this, a human decides:* ${esc(brief(noIds(m(against.map((o) => o.claim).join(' '))), 400))}`) } }] : []),
@@ -241,8 +255,9 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
 
 // ---- recovered ------------------------------------------------------------------
 // A short reply in the thread where the rows were posted. Row keys are
-// section|service|subject|status; the subject may itself contain '|'.
-export function recoveredCard(keys: string[], at: string): Card {
+// section|service|subject|status; the subject may itself contain '|'. With an
+// issue id: every row of that issue is back, and the issue is resolved.
+export function recoveredCard(keys: string[], at: string, issue?: string): Card {
   const line = (k: string) => {
     const parts = k.split('|');
     const [section, service] = parts;
@@ -251,7 +266,7 @@ export function recoveredCard(keys: string[], at: string): Card {
     return `${service} · ${shortSubject({ section: section as FlaggedRow['section'], subject })}${status ? ` ${status}` : ''}`;
   };
   const lines = keys.map(line);
-  const head = `✅ Back to normal at ${minute(at).slice(11)}`;
+  const head = `✅ Back to normal at ${minute(at).slice(11)}${issue ? ` · ${issue} resolved` : ''}`;
   const text = `${head}: ${lines.length === 1 ? lines[0] : `${lines.length} signals`}`;
   const blocks = [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(redact(`${head}\n${lines.map((l) => `• ${l}`).join('\n')}`)), 2900) }] }];
   return { text: esc(redact(text)), blocks, markdown: `**${head}**\n${lines.map((l) => `- ${l}`).join('\n')}` };

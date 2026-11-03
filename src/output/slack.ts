@@ -8,7 +8,9 @@ import { randomUUID } from 'node:crypto';
 // patrol (the model never re-runs for it) and gives up after a day. With the bot
 // (chat.postMessage), later news about the same rows goes into the first
 // message's thread instead of a new message; the webhook can't thread, so it
-// posts everything top-level as before.
+// posts everything top-level as before. A post about an issue (see
+// patrol/issues.ts) goes into that issue's thread for as long as the issue is
+// tracked, past the 24 h row window, and broadcasts exactly when asked.
 
 export interface SlackMessage {
   text: string; // notification fallback
@@ -85,13 +87,15 @@ export interface Post {
   keys: string[]; // the patrol rows this post is about: they pick the thread
   broadcast: boolean; // news worth showing in the channel when it lands in a thread
   file?: string; // the card on disk
+  issue?: string | undefined; // the issue it is about: its thread wins over the rows'
+  repeat?: boolean | undefined; // nothing new for the channel: a quiet reply in the issue's thread, or nothing
 }
 
 export interface FlushResult {
   sent: number;
   pending: number;
   failed: number; // permanent errors and posts that gave up
-  skipped: number; // recoveries with no thread to reply in
+  skipped: number; // recoveries and issue repeats with no thread to reply in
 }
 
 export interface OutboxOptions {
@@ -130,7 +134,12 @@ export class SlackOutbox {
       CREATE INDEX IF NOT EXISTS slack_outbox_pending ON slack_outbox (status) WHERE status = 'pending';
       CREATE TABLE IF NOT EXISTS slack_threads (key TEXT PRIMARY KEY, ts TEXT NOT NULL, opened_at TEXT NOT NULL, last_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS slack_sender (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, expires_at TEXT NOT NULL, last_attempt_at INTEGER);
+      -- An issue that reached Slack, and its thread (ts is NULL when it went out without one: the webhook).
+      CREATE TABLE IF NOT EXISTS slack_issue_threads (issue TEXT PRIMARY KEY, ts TEXT, opened_at TEXT NOT NULL);
     `);
+    const cols = new Set((this.db.prepare(`PRAGMA table_info(slack_outbox)`).all() as Array<{ name: string }>).map((c) => c.name));
+    if (!cols.has('issue')) this.db.exec(`ALTER TABLE slack_outbox ADD COLUMN issue TEXT`);
+    if (!cols.has('repeat')) this.db.exec(`ALTER TABLE slack_outbox ADD COLUMN repeat INTEGER NOT NULL DEFAULT 0`);
     this.o = {
       threadHours: 24,
       freshMinutes: 30,
@@ -149,8 +158,8 @@ export class SlackOutbox {
 
   enqueue(p: Post): number {
     const r = this.db
-      .prepare(`INSERT INTO slack_outbox (created_at, kind, keys, broadcast, message, file, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')`)
-      .run(this.o.now().toISOString(), p.kind, JSON.stringify(p.keys), p.broadcast ? 1 : 0, JSON.stringify(p.message), p.file ?? null);
+      .prepare(`INSERT INTO slack_outbox (created_at, kind, keys, broadcast, message, file, status, issue, repeat) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
+      .run(this.o.now().toISOString(), p.kind, JSON.stringify(p.keys), p.broadcast ? 1 : 0, JSON.stringify(p.message), p.file ?? null, p.issue ?? null, p.repeat ? 1 : 0);
     return Number(r.lastInsertRowid);
   }
 
@@ -163,6 +172,11 @@ export class SlackOutbox {
       .prepare(`SELECT DISTINCT ts, opened_at FROM slack_threads WHERE key IN (${keys.map(() => '?').join(',')}) AND last_at >= ?`)
       .all(...keys, since) as Array<{ ts: string; opened_at: string }>;
     return rows.length === 1 ? rows[0] : undefined;
+  }
+
+  // Whether an issue has reached Slack, and in which thread.
+  private issueThread(issue: string): { ts: string | null; opened_at: string } | undefined {
+    return this.db.prepare(`SELECT ts, opened_at FROM slack_issue_threads WHERE issue = ?`).get(issue) as { ts: string | null; opened_at: string } | undefined;
   }
 
   // Of these rows, the ones with an open thread, grouped by thread: recoveries
@@ -212,7 +226,7 @@ export class SlackOutbox {
   private async sendPending(log: (s: string) => void, renew: () => boolean): Promise<FlushResult> {
     const out: FlushResult = { sent: 0, pending: 0, failed: 0, skipped: 0 };
     const pending = this.db.prepare(`SELECT * FROM slack_outbox WHERE status = 'pending' ORDER BY id`).all() as Array<{
-      id: number; created_at: string; kind: PostKind; keys: string; broadcast: number; message: string; attempts: number;
+      id: number; created_at: string; kind: PostKind; keys: string; broadcast: number; message: string; attempts: number; issue: string | null; repeat: number;
     }>;
     let waits = 0; // Retry-After waits this flush, so a 429 storm can't hold the patrol
     for (let i = 0; i < pending.length; i++) {
@@ -229,13 +243,25 @@ export class SlackOutbox {
         continue;
       }
       const keys = JSON.parse(p.keys) as string[];
-      const thread = this.threadFor(keys, now);
-      if (p.kind === 'recovered' && !thread) {
+      // An issue already in Slack keeps its thread, however old, and the caller
+      // decides the broadcast. A repeat where it can't thread (the webhook, or
+      // its thread is unknown) isn't posted: it says nothing new. One about an
+      // issue that never reached Slack is its first post, so it goes out as one.
+      const known = p.issue ? this.issueThread(p.issue) : undefined;
+      const inIssue = known?.ts && this.transport.threads ? { ts: known.ts, opened_at: known.opened_at } : undefined;
+      // A new issue may start in its rows' thread (this patrol's urgent card),
+      // never in another issue's: a different cause gets its own message.
+      const rowThread = inIssue ? undefined : this.threadFor(keys, now);
+      const taken = !!(p.issue && rowThread && this.db.prepare(`SELECT 1 FROM slack_issue_threads WHERE ts = ? AND issue <> ?`).get(rowThread.ts, p.issue));
+      const thread = inIssue ?? (taken ? undefined : rowThread);
+      const noThread = p.kind === 'recovered' ? !thread : !!(p.repeat && known && !inIssue);
+      if (noThread) {
         this.db.prepare(`UPDATE slack_outbox SET status = 'skipped' WHERE id = ?`).run(p.id);
+        if (p.kind !== 'recovered') log(`slack: ${p.kind} post ${p.id} about ${p.issue} not sent: a repeat, and there is no thread to reply in`);
         out.skipped++;
         continue;
       }
-      const fresh = thread && now.getTime() - Date.parse(thread.opened_at) < this.o.freshMinutes * 60_000;
+      const fresh = !inIssue && thread && now.getTime() - Date.parse(thread.opened_at) < this.o.freshMinutes * 60_000;
       // Persist the gap across flushes too: an urgent card is flushed before
       // the model, and a fast investigation may finish less than a second later.
       const last = this.db.prepare(`SELECT last_attempt_at FROM slack_sender WHERE id = 1`).get() as { last_attempt_at: number | null };
@@ -255,6 +281,11 @@ export class SlackOutbox {
         this.db.prepare(`UPDATE slack_outbox SET status = 'sent', attempts = attempts + 1, sent_at = ?, ts = ?, thread_ts = ?, last_error = NULL WHERE id = ?`).run(at, ts ?? null, thread?.ts ?? null, p.id);
         // Rows posted top-level start (or move to) this message's thread; a reply keeps the thread alive.
         const root = thread?.ts ?? ts;
+        // The first post about an issue gives it its thread (none with the webhook).
+        if (p.issue && p.kind !== 'recovered')
+          this.db
+            .prepare(`INSERT INTO slack_issue_threads (issue, ts, opened_at) VALUES (?, ?, ?) ON CONFLICT(issue) DO UPDATE SET ts = excluded.ts, opened_at = excluded.opened_at WHERE slack_issue_threads.ts IS NULL AND excluded.ts IS NOT NULL`)
+            .run(p.issue, root ?? null, thread?.opened_at ?? at);
         if (root && p.kind !== 'recovered') {
           const up = this.db.prepare(
             `INSERT INTO slack_threads (key, ts, opened_at, last_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET ts = excluded.ts, opened_at = CASE WHEN slack_threads.ts = excluded.ts THEN slack_threads.opened_at ELSE excluded.opened_at END, last_at = excluded.last_at`,

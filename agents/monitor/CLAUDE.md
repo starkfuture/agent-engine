@@ -23,6 +23,12 @@ Severity (decides what the team sees: critical and major are posted to the team'
 - minor: a real defect with little current impact.
 - noise: expected behaviour. Propose a noise_rule so a human can review adding it.
 
+Issues already reported
+- The task lists the issues earlier patrols reported: open ones, and ones resolved in the last 24 h (marked RESOLVED), each with its rows and latest cause. They are earlier findings, not facts: check them like any other claim.
+- Set "issue" on every report. Use an issue's id when your problem has the same cause, even if the rows differ: a sibling route or another flow failing on the same validation, the same drop seen on another family, a row that came back or got worse. The team then sees one thread per cause instead of a new post each time.
+- Use "new" when the cause is different, or when you can't tell. Two problems that only share a service or a status code are not the same cause.
+- Rate severity for the problem as it is now. Raising it on an existing issue, or linking to a resolved one (it came back), is shown to the channel; the same cause again at the same severity is a quiet reply in its thread.
+
 Output
 - Call submit_report once per problem, covering every row you were given (each row key in exactly one report). If the tool rejects a report, fix it and resubmit.
 - After the last report, reply with one short line: how many reports you submitted.

@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Config } from '../src/config.js';
@@ -18,41 +17,7 @@ import type { Session } from '../src/engine/session.js';
 import type { FlaggedRow } from '../src/patrol/summary.js';
 import { needsChallenge, patrolOnce, type MonitorAgent, patrolLoop } from '../src/runner.js';
 import { fakeSession, ok } from './fake-session.js';
-import { DAY, FakeTelemetry, H, INCIDENT_START, world } from './fake.js';
-
-const cfg = (): Config => ({
-  grafanaUrl: 'http://grafana.test',
-  grafanaTokenFile: '/dev/null',
-  promUid: 'prometheus',
-  lokiUid: undefined,
-  tempoUid: undefined,
-  windowMinutes: 15,
-  attentionFloor: 10,
-  sources: {
-    http_families: [
-      { id: 'legacy-v1', selector: 'backend_be_production_http_requests_total', service: 'backend-production', route_label: 'route', status_label: 'status_code' },
-    ],
-    error_counters: [],
-    workloads: { namespaces: 'microservices' },
-    logs: { selector: '{namespace="microservices"}', error_filter: '', service_label: 'app', max_lines: 100 },
-    traces: { traceql: '{ status = error }', limit: 10 },
-  },
-  noiseFile: '/dev/null',
-  ownersFile: '/dev/null',
-  stateFile: join(mkdtempSync(join(tmpdir(), 'sre-test-')), 'state.json'),
-  outDir: mkdtempSync(join(tmpdir(), 'sre-out-')),
-  llm: { available: false, dailyCapUsd: 10, monthlyCapUsd: 100 },
-  agentsDir: join(import.meta.dirname, '..', 'agents'),
-  runsDir: mkdtempSync(join(tmpdir(), 'sre-runs-')),
-  slackWebhookUrl: undefined,
-  slackBotToken: undefined,
-  slackChannel: undefined,
-  direct: undefined,
-  memoryDir: undefined,
-  build: undefined,
-  retentionDays: 30,
-  mcp: { usersFile: '/nonexistent', reposFile: '/nonexistent', userDailyCapUsd: 10, userMaxRunning: 2, notifySlack: false, allowedOrigins: [], agents: undefined, login: undefined, reposDir: undefined, reposGithub: undefined, githubApp: undefined },
-});
+import { DAY, FakeTelemetry, H, INCIDENT_START, testConfig as cfg, world } from './fake.js';
 
 test('incident rows are flagged, steady noise is not', async () => {
   const s = await buildSummary(new FakeTelemetry(world), cfg(), new Noise({}), State.memory(), new Date('2026-09-29T12:15:00Z'));
@@ -220,6 +185,7 @@ const report = (over: Partial<Report> = {}): Report => ({
   suggested_fix: 'roll back the validation change',
   not_checked: [],
   rows: ['http|backend-production|/v1/auth/password/reset|400'],
+  issue: 'new',
   ...over,
 });
 
