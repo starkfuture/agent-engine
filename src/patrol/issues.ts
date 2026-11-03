@@ -200,8 +200,8 @@ export class Issues {
       if (!before) throw new Error(`no issue ${id}`);
       const iso = at.toISOString();
       const res: Omit<Linked, 'issue'> = {};
-      const news = this.db.prepare(`SELECT MAX(at) AS at FROM issue_events WHERE issue_id = ? AND type IN ('opened', 'severity_raised', 'reopened', 'reminded', 'rows_posted')`).get(id) as { at: string | null };
-      if (news.at) res.lastNewsAt = news.at;
+      const news = this.lastNewsAt(id);
+      if (news) res.lastNewsAt = news;
       if (before.status === 'resolved' && o.reopen) {
         // A new episode: its severity starts from this report.
         this.db.prepare(`UPDATE issues SET status = 'open', resolved_at = NULL, severity = ? WHERE id = ?`).run(r.severity, id);
@@ -219,6 +219,13 @@ export class Issues {
       return res;
     });
     return { issue: this.get(id)!, ...out };
+  }
+
+  // When the channel last heard about the issue: opened, raised, reopened,
+  // reminded, or an urgent rows card in its thread.
+  lastNewsAt(id: string): string | undefined {
+    const news = this.db.prepare(`SELECT MAX(at) AS at FROM issue_events WHERE issue_id = ? AND type IN ('opened', 'severity_raised', 'reopened', 'reminded', 'rows_posted')`).get(id) as { at: string | null };
+    return news.at ?? undefined;
   }
 
   // A linked report shown in the channel only because the issue has been open

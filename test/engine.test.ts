@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { loadConfig } from '../src/config.js';
 import { listAgents, loadAgent } from '../src/engine/agent.js';
-import { judge } from '../src/engine/challenge.js';
+import { judge, unsound } from '../src/engine/challenge.js';
 import { Evidence } from '../src/engine/evidence.js';
 import { redactDeep } from '../src/engine/text.js';
 import { pathAllowed } from '../src/engine/guard.js';
@@ -527,6 +527,21 @@ test('judge: blocking objections need a scenario, a settling check and a real ev
   const weak = judge([{ ...o, evidence: ['E-0000-1'] }, { ...o, settling_check: '' }, { ...o, blocking: false }], ev);
   assert.equal(weak.verdict, 'upheld');
   assert.deepEqual(weak.notes.map((n) => n.downgraded ?? 'note'), ['missing valid evidence id', 'missing settling check', 'note']);
+});
+
+test('judge: a "no" on one item of the output needs a real evidence id; a broken challenge never hides an item', () => {
+  const ev = new Evidence();
+  const id = ev.add('challenger', 'promql', {}, 'x').id;
+  const j = judge([], ev, [
+    { item: 1, holds: 'no', reason: 'The 400s are one bot.', evidence: [id] },
+    { item: 2, holds: 'no', reason: 'Looks wrong.', evidence: ['E-0000-1'] },
+    { item: 1, holds: 'yes', reason: 'A second verdict on item 1.', evidence: [] },
+  ]);
+  assert.equal(j.verdict, 'escalate', 'an item that does not hold up is a dissent');
+  assert.deepEqual(j.items.map((i) => [i.item, i.holds, i.downgraded ?? '']), [[1, 'no', ''], [2, 'partly', 'said no without a valid evidence id']], 'the first verdict on an item counts');
+  const broke = unsound({ ...j, overall: 'o', cost: 0, turns: 0, toolCalls: 1 }, 'same call 3×: promql');
+  assert.equal(broke.verdict, 'error');
+  assert.deepEqual(broke.items.map((i) => i.holds), ['partly', 'partly']);
 });
 
 // Author that answers with one fetched fact.

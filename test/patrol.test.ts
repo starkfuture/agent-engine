@@ -376,19 +376,26 @@ test('a 6-hour reminder of an urgent row is not posted again', async () => {
 test('the AI decides the rest: critical and major are posted with their owners, minor is only recorded', async () => {
   const c = cfg();
   const owners = new Owners({ owners: { 'backend-*': '<@U0BACKEND1>' } });
-  const session = fakeSession(async function* (sim) {
-    const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
-    const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
-    const quote = /\/v1\/auth\/password\/reset 400 \| \d+/.exec(out.text)![0];
-    for (const [severity, rows] of [['major', [RESET]], ['minor', [SIGNUP]]] as const) {
-      const r = await sim.mcp('submit_report', report({ severity, rows: [...rows], evidence: [{ id, quote, claim: 'reset requests return 400' }] }));
-      assert.equal(r.isError, false, r.text);
-    }
-    yield ok(0.3, 4);
-  });
+  const session = fakeSession(
+    async function* (sim) {
+      const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+      const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+      const quote = /\/v1\/auth\/password\/reset 400 \| \d+/.exec(out.text)![0];
+      for (const [severity, rows] of [['major', [RESET]], ['minor', [SIGNUP]]] as const) {
+        const r = await sim.mcp('submit_report', report({ severity, rows: [...rows], evidence: [{ id, quote, claim: 'reset requests return 400' }] }));
+        assert.equal(r.isError, false, r.text);
+      }
+      yield ok(0.3, 4);
+    },
+    async function* (sim) {
+      await sim.mcp('route_timeline', { service: 'backend-production', route: '/v1/auth/password/reset', hours: 2 });
+      await sim.mcp('submit_challenge', { objections: [], overall: 'Both hold up.' });
+      yield ok(0.2, 2);
+    },
+  );
   const r = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir), new Date('2026-09-29T12:15:00Z'), { llm: true, post: false, owners }, monitor(c, session));
   assert.equal(r.investigation?.outputs.length, 2);
-  assert.equal(r.investigation?.challenge, undefined, 'not urgent, not challenged');
+  assert.equal(r.investigation?.challenge?.verdict, 'upheld', 'not urgent, but a major the channel will see is challenged first');
   assert.equal(r.cards.length, 3);
   assert.equal(r.slack.length, 1, 'only the major report');
   assert.ok(r.slack[0]!.endsWith('-1.md'));
@@ -536,6 +543,13 @@ function investigator(asked: string[][], cover: (rows: string[]) => string[] = (
     yield ok(0.1);
   };
 }
+
+// A challenger that re-checks one tool result and agrees.
+const agrees: Script = async function* (sim) {
+  await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+  await sim.mcp('submit_challenge', { objections: [], overall: 'Holds up.' });
+  yield ok(0.1, 1);
+};
 
 test('a 6-hour reminder of a row already explained does not join the next run', async () => {
   const c = cfg();
@@ -721,7 +735,8 @@ test('a report the outbox could not queue is investigated again next patrol, as 
   box.enqueue = () => {
     throw new Error('database is locked');
   };
-  const m = monitor(c, fakeSession(investigator(asked, undefined, 'major'), investigator(asked, undefined, 'major')));
+  // A major report goes to the channel, so each run is challenged.
+  const m = monitor(c, fakeSession(investigator(asked, undefined, 'major'), agrees, investigator(asked, undefined, 'major'), agrees));
   const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z' });
   const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir, box), new Date(time), { llm: true, post: true }, m);
   await assert.rejects(pass('2026-09-29T12:15:00Z'), /database is locked/);

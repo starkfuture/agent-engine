@@ -51,6 +51,8 @@ Code-driven parts (a deterministic gate, credentialed tools, output checks) live
   - A blocking objection needs a failure scenario, a settling check and a real evidence id; otherwise it becomes a note.
   - The verdict is `upheld` or `escalate` (a human decides), with no rebuttal round and no consensus-seeking.
   - A challenge that failed, ended without a result, or checked nothing itself is `error`, never `upheld`. Only the first submission counts. The challenger has its own loop detector.
+  - It also judges each item of the output: holds, partly holds, or doesn't hold up. "Doesn't hold up" needs a real evidence id, and a broken challenge can't give it.
+  - A caller can decide on the challenge once the outputs exist (the monitor does). If the caps can't hold that challenge, the run goes ahead without it, and the challenge is recorded as not run.
 - **Run folder** `runs/<agent>/<run>/`: `input.md`, `transcript.jsonl`, `evidence.jsonl`, `output.json`, `challenge.json`, `answer.md` (with any dissent). All of them are redacted.
 - **Model-written text for humans** (cards): redacted per field, image syntax removed, links to unknown hosts defanged.
 
@@ -74,7 +76,7 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 2. **Filter.** Steady rows, known noise (`config/noise.yaml`) and already-reported rows are dropped. A quiet patrol ends here and costs $0.
 3. **Card first.** The rows card goes to `out/cards/` before any AI runs. If the investigator crashes, the rows are still marked reported.
 4. **Investigate.** Only if a row the investigator still owes an answer is big enough to read (a "to look at" row, below), the engine runs the `monitor` agent. Small rows on their own don't spend a run. It has read-only telemetry tools and no shell, files or web, and must submit schema-checked reports that cite evidence ids.
-5. **Challenge.** For protected journeys or big spikes (a deterministic gate, never the model's severity), a challenger re-checks the report. Its verdict goes on the card.
+5. **Challenge.** Before a report is shown in the channel as critical or major, an Opus challenger re-checks it. Urgent rows (protected journeys, big spikes, rollout rows) are always challenged, whatever the reports say. The verdict goes on the card (see "The second check" below).
 
 **What a run covers.** A row is owed an answer until an AI report covers it. The state file keeps this per row.
 - New and worse rows join the next run. So do rows an earlier run didn't cover. A patrol with only such older rows writes no card: its run is the record.
@@ -90,7 +92,7 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 
 - **Urgent rows, at once, by code:** a new or worse protected journey (`never_suppress`), a big spike (50+ events and 5× expected) or a rollout row. The rows card is posted before the AI starts, with or without it. 6-hour reminders of something already posted are not. A stalled rollout that completes gets "✅ Back to normal: … · rollout complete" in its thread.
 - **A deploy is never a post by itself.** It is context (below).
-- **Everything else, only as an AI report rated critical or major.** Minor and noise reports, and the rows card itself, stay on disk, where the MCP answers from them. Report cards mention the owners of the services they cover. In Slack a report reads as a header with its level, then two short paragraphs (what's wrong and impact, likely cause and fix); evidence and what wasn't checked stay in the card's file and the run.
+- **Everything else, only as an AI report rated critical or major,** after an Opus challenger checked it (see "The second check"). Minor and noise reports, and the rows card itself, stay on disk, where the MCP answers from them. Report cards mention the owners of the services they cover. In Slack a report reads as a header with its level, then two short paragraphs (what's wrong and impact, likely cause and fix); evidence and what wasn't checked stay in the card's file and the run.
 - **Without the AI** (no `--llm`, no credentials, kill switch, budget spent, crash), only urgent rows are posted.
 
 **How it is posted.** With the Slack bot (`SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID`, app manifest in `slack/`), each issue is one message:
@@ -131,14 +133,15 @@ The investigator is shown the open issues and those resolved in the last 24 h (a
 
 What a report posts:
 
-| The report | Slack (bot) | Webhook |
-|---|---|---|
-| `new`, critical or major | a new message (or a reply on its urgent rows card, as before); opens the issue | a message |
-| same issue, same or lower severity | a reply in the issue's thread, **not** shown in the channel, also after 24 h | nothing (the card and `get_run` keep it) |
-| same issue, but the channel has heard nothing about it for 24 h (no new, raised, reopened or reminder post, and no urgent rows card in its thread, counted when Slack accepted it, not when it was queued) | a reply in its thread, also shown in the channel (at most once a day per open issue, so a chronic one isn't hidden for good; not while news about it is still queued) | a message |
-| same issue, severity rises (major → critical) | a reply in its thread, also shown in the channel | a message |
-| a resolved issue (it came back) | reopens it; a reply in its thread, also shown in the channel | a message |
-| minor or noise | not posted, as before; a linked one's rows still join the issue | nothing |
+| The report | Slack (bot) | Webhook | Opus checks it first |
+|---|---|---|---|
+| `new`, critical or major | a new message (or a reply on its urgent rows card, as before); opens the issue | a message | yes |
+| same issue, same or lower severity | a reply in the issue's thread, **not** shown in the channel, also after 24 h | nothing (the card and `get_run` keep it) | no |
+| same issue, but the channel has heard nothing about it for 24 h (no new, raised, reopened or reminder post, and no urgent rows card in its thread, counted when Slack accepted it, not when it was queued) | a reply in its thread, also shown in the channel (at most once a day per open issue, so a chronic one isn't hidden for good; not while news about it is still queued) | a message | yes |
+| same issue, severity rises (major → critical) | a reply in its thread, also shown in the channel | a message | yes |
+| a resolved issue (it came back) | reopens it; a reply in its thread, also shown in the channel | a message | yes |
+| critical or major, with no issue record (it is off, or failed) | a message | a message | yes |
+| minor or noise | not posted, as before; a linked one's rows still join the issue | nothing | no |
 
 The rows of a linked report join the issue. Urgent rows that all belong to one open issue are posted in its thread, still shown in the channel. When every row of an open issue is back to normal (healthy observers required, as for any recovery), the issue is resolved and its thread gets one "✅ Back to normal · I-7f3a resolved" note; its rows get no recovery note of their own, also while some of them still fire.
 
@@ -167,6 +170,18 @@ With Socket Mode on (`SLACK_APP_TOKEN`; setup in `slack/README.md`), an issue's 
 - **Without `SLACK_APP_TOKEN`** there are no buttons and no updates, and nothing above changes what is posted. Clicks already recorded are kept, and apply again when the token is back.
 
 The baseline is `min(1 d, 7 d)`, scaled by current traffic, so a one-day incident doesn't become its own baseline the next day. The 1 h window only labels a row "started" or "ongoing".
+
+### The second check: Opus before the channel
+
+When a run has a report the channel would see as critical or major (the "yes" rows of the posting table), an Opus challenger checks the run's reports before anything is posted. It runs after the investigator, with the same read-only tools, and judges each report:
+
+- **Holds up:** posted as before. The card says "second check agrees".
+- **Partly holds:** posted, with the objection on the card.
+- **Doesn't hold up:** the report becomes minor. It is not posted, and it opens or raises no issue. The run, `answer.md` and `get_run` keep it, with the challenger's reason. This verdict needs an evidence id. A challenge that broke off or checked nothing can't hide a report.
+- **A protected journey is never hidden.** A report on a `never_suppress` row that doesn't hold up is posted anyway, with the objection. Urgent rows still get their rows card first, before any AI.
+- **Not verified:** when the challenger can't run (a spend cap, an error, a timeout), the report is posted as before, marked "not verified by a second check". A broken challenger never silences a post.
+
+Urgent rows are challenged as before. Quiet replies in an issue's thread are not, nor reports the buttons keep quiet (On it, Not an issue). A report that breaks a Not an issue mute (a rise to critical, a protected row, a big jump) is checked. A 24 h reminder only goes out from a run the challenger saw; otherwise a later patrol's report reminds. One challenge covers the whole run and costs at most $1 (`challenge.usd` in `agents/monitor/agent.yaml`). It is reserved with the run; when the caps can't hold both, the investigator runs alone. The patrol log and the run ledger show each challenge's verdict and cost.
 
 ### The rows card
 

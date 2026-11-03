@@ -12,7 +12,7 @@ limits:
   usd_per_day: 25
   deadline_min: 10
 challenge:
-  when: gate # deterministic: protected journey rows or big spikes (src/runner.ts)
+  when: gate # decided by the patrol (src/runner.ts): urgent rows, or a report the channel would see as critical or major
   model: claude-opus-5-5
   usd: 1
   max_turns: 15

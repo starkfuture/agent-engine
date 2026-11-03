@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { Report } from '../investigate/report.js';
 import { reportCard } from '../output/card.js';
 import type { LoadedAgent } from './agent.js';
-import type { ChallengeResult } from './challenge.js';
+import { verdictOn, type ChallengeResult } from './challenge.js';
 import { renderFindings, type Findings } from './output.js';
 import type { RunResult } from './run.js';
 import type { RunRow } from './store.js';
@@ -44,6 +44,8 @@ const StoredChallenge = z.object({
   overall: z.string(),
   blocking: z.array(Objection),
   notes: z.array(Objection),
+  // Per report; challenges from before per-report verdicts have none.
+  items: z.array(z.object({ item: z.number(), holds: z.enum(['yes', 'partly', 'no']), reason: z.string(), evidence: z.array(z.string()).default([]), downgraded: z.string().optional() })).default([]),
   cost: z.number(),
   turns: z.number(),
   toolCalls: z.number(),
@@ -60,6 +62,6 @@ export function storedMonitorAnswer(dir: string, row: RunRow, reports: StoredRep
   } catch {
     /* no challenge, or an unreadable one */
   }
-  const cards = reports.flatMap((r, i) => [`### Report ${i + 1}`, '', reportCard({ ...r, issue: r.issue ?? 'new' }, row.started_at, `run ${row.id}`, challenge).markdown, '']);
+  const cards = reports.flatMap((r, i) => [`### Report ${i + 1}`, '', reportCard({ ...r, issue: r.issue ?? 'new' }, row.started_at, `run ${row.id}`, challenge, [], undefined, undefined, verdictOn(challenge, i + 1)).markdown, '']);
   return stripImages(redact([`# Monitor reports · run started ${row.started_at}`, '', ...cards].join('\n')));
 }

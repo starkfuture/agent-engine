@@ -1,4 +1,4 @@
-import type { ChallengeResult } from '../engine/challenge.js';
+import type { ChallengeResult, ItemVerdict } from '../engine/challenge.js';
 import type { Report } from '../investigate/report.js';
 import { recentDeploys } from '../patrol/deploys.js';
 import { DEFAULT_FLOOR, digest, shortSubject, type DigestOptions, type Line } from '../patrol/digest.js';
@@ -15,12 +15,20 @@ export interface Card {
   markdown: string;
 }
 
+const HOLDS = { yes: 'holds up', partly: 'partly holds', no: 'does not hold up' } as const;
+
 // What the challenger concluded, in one block. Escalate = a human decides.
-function challengeLines(c: ChallengeResult | undefined): string[] {
+// `item`: its verdict on this report, when it gave one per report.
+function challengeLines(c: ChallengeResult | undefined, item?: ItemVerdict): string[] {
   if (!c) return [];
-  if (c.verdict === 'error') return [`Challenge did not complete (${c.note ?? 'unknown'}); this report is unchallenged.`];
+  if (c.verdict === 'error') return [`Not verified: the challenge did not complete (${c.note ?? 'unknown'}); this report is unchallenged.`];
   const head = c.verdict === 'upheld' ? `Challenge: upheld. ${c.overall}` : `⚠️ Challenge: ESCALATE, needs a human decision. ${c.overall}`;
-  return [head, ...c.blocking.map((o) => `• Objection: ${o.claim} (if acted on: ${o.failure_scenario}; check: ${o.settling_check}; ${o.evidence.join(', ')})`), ...(c.notes.length ? [`${c.notes.length} non-blocking note(s) in the run folder.`] : [])];
+  return [
+    head,
+    ...(item ? [`On this report: ${HOLDS[item.holds]}. ${item.reason}${item.downgraded ? ` (${item.downgraded})` : ''}`] : []),
+    ...c.blocking.map((o) => `• Objection: ${o.claim} (if acted on: ${o.failure_scenario}; check: ${o.settling_check}; ${o.evidence.join(', ')})`),
+    ...(c.notes.length ? [`${c.notes.length} non-blocking note(s) in the run folder.`] : []),
+  ];
 }
 
 // Every model-written string is redacted and cleaned on its own before it goes
@@ -39,8 +47,9 @@ export interface IssueRef {
 // (each validated where it is loaded), the only text that reaches Slack
 // unescaped. `issue`: a new issue shows its id; an update on an existing one
 // is headed by that issue, not by this report's title. `deploys`: one line of
-// recent deploys (code's), on a card that is posted anyway.
-export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult, cc: string[] = [], issue?: IssueRef, deploys?: string): Card {
+// recent deploys (code's), on a card that is posted anyway. `item`: the
+// challenger's verdict on this report.
+export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult, cc: string[] = [], issue?: IssueRef, deploys?: string, item?: ItemVerdict): Card {
   const r: Report = {
     ...raw,
     title: m(raw.title),
@@ -53,7 +62,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     not_checked: raw.not_checked.map(m),
     rows: raw.rows.map(m),
   };
-  const ch = challengeLines(challenge).map(m);
+  const ch = challengeLines(challenge, item).map(m);
   const update = issue && issue.change !== 'new';
   const what = issue && { new: 'new issue', update: 'same cause', raised: `severity raised from ${issue.from}`, reopened: 'back after it recovered: reopened' }[issue.change];
   const md = [
@@ -92,12 +101,21 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
   const subjects = r.rows.map((k) => k.split('|')[2]).filter((x): x is string => !!x && x.length > 3);
   const against = challenge?.verdict === 'escalate' ? challenge.blocking.filter((o) => o.evidence.some((id) => own.has(id)) || subjects.some((s) => o.claim.includes(s))) : [];
   const elsewhere = challenge?.verdict === 'escalate' && !against.length;
+  // Its own verdict on this report, when it gave one, says more than the objections.
+  const doubt =
+    item?.holds === 'no'
+      ? { says: 'says this does not hold up', why: [item.reason, ...against.map((o) => o.claim)] }
+      : against.length
+        ? { says: 'disputes this', why: against.map((o) => o.claim) }
+        : item?.holds === 'partly'
+          ? { says: 'disputes this', why: [item.reason] }
+          : undefined;
   const blocks = [
     { type: 'header', text: { type: 'plain_text', text: clip(head, 150) } },
     { type: 'context', elements: [{ type: 'mrkdwn', text: `${lead ? `${esc(lead)} · ` : ''}*${r.status}* ${esc(`since ${when(r.started_at, patrolAt)} · confidence ${r.cause.confidence}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}` }] },
     pair("What's wrong", r.what_broke, 'Impact', r.impact),
     pair('Likely cause', r.cause.hypothesis, 'Suggested fix', r.suggested_fix),
-    ...(against.length ? [{ type: 'section', text: { type: 'mrkdwn', text: clip(`⚠️ *A second AI check disputes this, a human decides:* ${esc(brief(noIds(m(against.map((o) => o.claim).join(' '))), 400))}`) } }] : []),
+    ...(doubt ? [{ type: 'section', text: { type: 'mrkdwn', text: clip(`⚠️ *A second AI check ${doubt.says}, a human decides:* ${esc(brief(noIds(m(doubt.why.join(' '))), 400))}`) } }] : []),
     ...(deploys ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(redact(deploys)), 600) }] }] : []),
     {
       type: 'context',
@@ -109,7 +127,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
               [
                 `${r.evidence.length} evidence ${r.evidence.length === 1 ? 'item' : 'items'}`,
                 r.not_checked.length ? `${r.not_checked.length} not checked` : '',
-                challenge?.verdict === 'upheld' ? 'second check agrees' : challenge?.verdict === 'error' ? 'second check failed' : elsewhere ? 'second check disputes another finding' : '',
+                challenge?.verdict === 'error' ? 'not verified by a second check' : doubt ? '' : item?.holds === 'yes' || challenge?.verdict === 'upheld' ? 'second check agrees' : elsewhere ? 'second check disputes another finding' : '',
                 `patrol ${when(patrolAt, patrolAt)}`,
                 footer,
               ]

@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { Config } from './config.js';
 import type { Telemetry } from './clients/telemetry.js';
 import type { LoadedAgent } from './engine/agent.js';
+import { verdictOn } from './engine/challenge.js';
 import { runAgent, type Engine, type RunResult } from './engine/run.js';
 import { monitorTask } from './investigate/prompt.js';
 import { checkReport, Report, ReportShape } from './investigate/report.js';
@@ -11,7 +12,7 @@ import { patrolCard, recoveredCard, reportCard, worseCard, type Card, type Issue
 import type { CardSink, EmitSlack } from './output/sink.js';
 import { recentDeploys } from './patrol/deploys.js';
 import { bucketOf } from './patrol/digest.js';
-import { MUTE_DAYS, type Disposition, type Issue, type Issues, type Severity } from './patrol/issues.js';
+import { MUTE_DAYS, RANK, type Disposition, type Issue, type Issues, type Severity } from './patrol/issues.js';
 import type { Noise } from './patrol/noise.js';
 import type { Owners } from './patrol/owners.js';
 import { ATTEMPTS, type State } from './patrol/state.js';
@@ -55,8 +56,8 @@ export function urgent(r: FlaggedRow, noise: Noise): boolean {
   return r.section === 'rollout' || noise.protected(r) || (r.counts.now >= 50 && r.counts.now >= 5 * Math.max(1, r.score.expected));
 }
 
-// Deterministic challenge gate: the model's own severity never decides whether
-// its work gets challenged. Urgent rows do.
+// Deterministic challenge gate, decided before the run: urgent rows always get
+// the AI's work challenged, whatever severity it gives them.
 export function needsChallenge(rows: FlaggedRow[], noise: Noise): boolean {
   return rows.some((r) => urgent(r, noise));
 }
@@ -87,6 +88,10 @@ export interface FileOptions {
   newsPending?: ((issue: string) => boolean) | undefined; // news for the channel about it still queued: no reminder on top
   clicks?: boolean | undefined; // the buttons are on: On it and Not an issue apply
   breaksMute?: ((key: string) => boolean) | undefined; // a row Not an issue can't silence (see breaksMute)
+  // false: no challenger saw this report, so it may not be a reminder (a later
+  // patrol's report reminds instead). A click or a delivery while the run was
+  // going can make a reminder due that wasn't when the challenge was decided.
+  remind?: boolean | undefined;
 }
 
 export function fileReport(issues: Issues, r: Report, at: Date, run?: string, o: FileOptions = {}): Filing {
@@ -105,11 +110,28 @@ export function fileReport(issues: Issues, r: Report, at: Date, run?: string, o:
   if (d?.kind === 'dismissed' && !r.rows.some((k) => o.breaksMute?.(k))) return { action: 'muted', issue: l.issue };
   // Someone is on it: no reminder in the channel.
   const news = o.newsAt?.(l.issue.id) ?? l.lastNewsAt;
-  if (POSTED.has(r.severity) && d?.kind !== 'acknowledged' && news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000 && !o.newsPending?.(l.issue.id)) {
+  if (POSTED.has(r.severity) && o.remind !== false && d?.kind !== 'acknowledged' && news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000 && !o.newsPending?.(l.issue.id)) {
     issues.remind(l.issue.id, at, run);
     return { action: 'reminded', issue: l.issue };
   }
   return { action: 'linked', issue: l.issue };
+}
+
+// Would this report be shown in the channel, as a new message or a broadcast
+// reply, rather than as a quiet reply in its issue's thread (or not at all)?
+// fileReport's rule with the same options, read before the record changes.
+// With no record, or an issue it can't find, the report is posted on its own:
+// yes. A report that breaks a Not an issue mute counts as shown too.
+export function shownInChannel(issues: Issues | undefined, r: Report, at: Date, o: FileOptions = {}): boolean {
+  if (!POSTED.has(r.severity)) return false;
+  if (!issues || r.issue === 'new') return true;
+  const i = issues.get(r.issue);
+  if (!i || i.status === 'resolved' || RANK[r.severity] > RANK[i.severity]) return true; // on its own, reopened, raised (a rise also ends a mute)
+  const d = o.clicks ? issues.disposition(i.id, at) : undefined;
+  if (d?.kind === 'dismissed') return r.rows.some((k) => o.breaksMute?.(k)); // muted, unless a row breaks the mute
+  if (d?.kind === 'acknowledged' || o.newsPending?.(i.id)) return false; // On it, or news still queued: no reminder
+  const news = o.newsAt?.(i.id) ?? issues.lastNewsAt(i.id);
+  return !!news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000; // the 24 h reminder
 }
 
 // The posting rule. News (a new issue, a higher severity, a recurrence) is a
@@ -315,8 +337,19 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     const none = { issues: [], more: 0 };
     const listed = o.issues ? record('listing issues', () => o.issues!.listed(at), none) : none;
     const issueIds = new Set(listed.issues.map((i) => i.id));
-    const challenge = needsChallenge(pending, noise);
-    log(`investigating ${pending.length} row(s) with ${monitor.agent.spec.model}${challenge ? ', then a challenger' : ''}…`);
+    const byKey = new Map(pending.map((r) => [r.key, r]));
+    const filing: FileOptions = {
+      newsAt: o.post && sink.outbox ? (id) => sink.outbox!.newsAt(id) : undefined,
+      newsPending: o.post && sink.outbox ? (id) => sink.outbox!.newsPending(id) : undefined,
+      clicks: o.buttons,
+      breaksMute: (k) => !!byKey.get(k) && breaksMute(byKey.get(k)!, noise),
+    };
+    // A challenger checks the reports before the channel sees them: always for
+    // urgent rows (the gate: rollout rows too), otherwise once a report would
+    // be shown there as critical or major. Quiet replies in an issue's thread need none.
+    const gate = needsChallenge(pending, noise);
+    const toChannel = (reports: Report[]) => gate || reports.some((r) => record('checking what the channel would see', () => shownInChannel(o.issues, r, at, filing), true));
+    log(`investigating ${pending.length} row(s) with ${monitor.agent.spec.model}${gate ? ', then a challenger' : ''}…`);
     // Rows no report covered stay pending for another attempt, then are given
     // up: in the log and the state file, never a Slack post.
     const investigated = (covered: Set<string>, outcome: string, attempted: boolean, runId?: string) => {
@@ -345,7 +378,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
           evidenceOf: (r) => r.evidence,
           check: (r) => checkReport(r, rowKeys, issueIds),
         },
-        challenge,
+        challenge: toChannel,
         heldBy,
         onAdmitted: () => {
           admitted = true;
@@ -370,34 +403,40 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     if (inv.status === 'skipped') state.data.held = { reason: inv.note ?? 'skipped', since: now.toISOString(), runId: inv.runId };
     else delete state.data.held;
     result.investigation = inv;
-    log(`investigation ${inv.status}: ${inv.outputs.length} report(s), ${inv.evidence.items.size} tool call(s), ${inv.turns} turn(s), $${inv.cost.toFixed(3)}${inv.challenge ? `, challenge ${inv.challenge.verdict}` : ''}${inv.note ? ` (${inv.note})` : ''}`);
+    const ch = inv.challenge;
+    log(`investigation ${inv.status}: ${inv.outputs.length} report(s), ${inv.evidence.items.size} tool call(s), ${inv.turns} turn(s), $${inv.cost.toFixed(3)}${ch ? `, challenge ${ch.verdict} ($${ch.cost.toFixed(3)}${ch.note ? `, ${ch.note}` : ''})` : ''}${inv.note ? ` (${inv.note})` : ''}`);
     const footer = `${monitor.agent.spec.model} · ${inv.evidence.items.size} tool calls · $${inv.cost.toFixed(2)} · run ${inv.runId}`;
-    const byKey = new Map(pending.map((r) => [r.key, r]));
     const ownersOf = (rep: Report) => [...new Set(rep.rows.map((k) => byKey.get(k) && o.owners?.ownerOf(byKey.get(k)!.service)).filter((x): x is string => !!x))];
     const answer: string[] = [];
     let toSlack = 0;
     let quiet = 0;
-    const filing: FileOptions = {
-      newsAt: o.post && sink.outbox ? (id) => sink.outbox!.newsAt(id) : undefined,
-      newsPending: o.post && sink.outbox ? (id) => sink.outbox!.newsPending(id) : undefined,
-      clicks: o.buttons,
-      breaksMute: (k) => !!byKey.get(k) && breaksMute(byKey.get(k)!, noise),
-    };
-    for (const [i, r] of inv.outputs.entries()) {
-      const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId, filing), { action: 'none' }) : { action: 'none' };
+    let held = 0;
+    // Only a run the challenger saw (or tried to) may send a reminder.
+    const filed: FileOptions = { ...filing, remind: inv.challenge !== undefined };
+    for (const [i, out] of inv.outputs.entries()) {
+      // A report the challenger says doesn't hold up becomes minor: kept in the
+      // run and answer.md, not posted, and it opens or raises no issue. A
+      // protected journey is never hidden: it is posted with the objection.
+      const item = verdictOn(inv.challenge, i + 1);
+      const fails = item?.holds === 'no' && POSTED.has(out.severity);
+      const kept = fails && out.rows.some((k) => !!byKey.get(k) && noise.protected(byKey.get(k)!));
+      const r: Report = fails && !kept ? { ...out, severity: 'minor' } : out;
+      if (fails && !kept) held++;
+      const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId, filed), { action: 'none' }) : { action: 'none' };
       result.filed.push(f);
       const cc = [...new Set([...(cfg.slackOncall && pagesOncall(f, r) ? [cfg.slackOncall] : []), ...ownersOf(r)])];
-      const card = reportCard(r, summary.at, footer, inv.challenge, cc, issueRef(f), recentDeploys(summary.deploys));
+      const card = reportCard(r, summary.at, footer, inv.challenge, cc, issueRef(f), recentDeploys(summary.deploys), item);
       const post = postFor(f, r);
       emit(card, `${stamp(summary.at)}-${i + 1}`, post);
       // Back from resolved, or Not an issue ended: its buttons are back.
       if (o.post && (f.action === 'reopened' || (f.action === 'raised' && f.unmuted))) sink.outbox?.updateRoot(f.issue.id);
       if (post) toSlack++;
       if (post?.repeat) quiet++;
-      if (o.issues) log(`report ${i + 1} ${filingNote(f, r)}`);
-      answer.push(`### Report ${i + 1} · ${filingNote(f, r)}`, '', card.markdown, '');
+      const note = `${filingNote(f, r)}${!fails ? '' : kept ? '; the second check says it does not hold up, posted anyway: a protected journey' : `; was ${out.severity}, the second check says it does not hold up`}`;
+      if (o.issues || fails) log(`report ${i + 1} ${note}`);
+      answer.push(`### Report ${i + 1} · ${note}`, '', card.markdown, '');
     }
-    log(`${toSlack} of ${inv.outputs.length} report(s) go to Slack${quiet ? ` (${quiet} as a quiet reply in an issue's thread)` : ''}`);
+    log(`${toSlack} of ${inv.outputs.length} report(s) go to Slack${quiet ? ` (${quiet} as a quiet reply in an issue's thread)` : ''}${held ? `; ${held} held back by the second check` : ''}`);
     // Only now, with the reports queued: if queueing threw, the rows are still owed.
     // Not admitted (caps, the kill switch on) or stopped (the kill switch, a cancel): deferred, not an attempt.
     investigated(new Set(inv.outputs.flatMap((r) => r.rows)), inv.note ?? inv.status, inv.status !== 'skipped' && inv.status !== 'stopped', inv.runId);
