@@ -40,8 +40,8 @@ const KEYCLOAK: Rollout = {
   prevRs: 'keycloak-production-58f6d9c7b2',
   prev: `${ECR}/keycloak:40306405609@sha256:c80fc98a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6`,
 };
-// One deploy's stall: the key carries its ReplicaSet's pod-template-hash.
-const STALLED = 'rollout|ecom-service-production|stalled|7566f689c8';
+// One deploy's stall: the key carries its namespace and ReplicaSet's pod-template-hash.
+const STALLED = 'rollout|ecom-service-production|stalled|microservices/7566f689c8';
 
 const outbox = () => {
   const sent: Array<{ text: string; blocks: unknown[] }> = [];
@@ -116,7 +116,7 @@ test('replicas behind for 10 min are an urgent rollout row, posted by code, and 
   assert.match(row.query ?? '', /min_over_time\(\(kube_deployment_spec_replicas\{namespace=~"microservices"\} - kube_deployment_status_replicas_updated\{namespace=~"microservices"\}\)\[10m:1m\]\)/);
   assert.match(renderSummary(stalled.summary), /ecom-service-production: 1\.2645\.5 → 1\.2645\.6 · STALLED \(13 min since it started\)/);
   assert.equal(sent.length, 1, 'the rows card, before and without the AI');
-  assert.match(JSON.stringify(sent[0]!.blocks), /\*ecom-service-production\* · rollout `stalled 7566f689c8`/);
+  assert.match(JSON.stringify(sent[0]!.blocks), /\*ecom-service-production\* · rollout `stalled microservices\/7566f689c8`/);
 
   const still = await pass('2026-11-03T12:37:00Z');
   assert.deepEqual([still.summary.known.map((r) => r.key), sent.length], [[STALLED], 1], 'still stalled: not posted again');
@@ -186,11 +186,11 @@ test("a stall on the next deploy is a new row, urgent again after the first one 
   assert.deepEqual((await pass('2026-11-03T12:45:00Z')).summary.recovered, [STALLED]);
   assert.deepEqual((await pass('2026-11-03T13:00:00Z')).summary.send, [], 'the next deploy rolling for 2 min');
   const again = await pass('2026-11-03T13:15:00Z');
-  assert.deepEqual(again.summary.send.map((r) => [r.key, r.novelty]), [['rollout|ecom-service-production|stalled|6b8d4c9f72', 'fresh']]);
+  assert.deepEqual(again.summary.send.map((r) => [r.key, r.novelty]), [['rollout|ecom-service-production|stalled|microservices/6b8d4c9f72', 'fresh']]);
   assert.equal(sent.length, 3, 'rows card, recovery, and the second stall\'s rows card');
-  assert.match(JSON.stringify(sent[2]!.blocks), /rollout `stalled 6b8d4c9f72`/);
+  assert.match(JSON.stringify(sent[2]!.blocks), /rollout `stalled microservices\/6b8d4c9f72`/);
   const still = await pass('2026-11-03T13:30:00Z');
-  assert.deepEqual([still.summary.known.map((r) => r.key), sent.length], [['rollout|ecom-service-production|stalled|6b8d4c9f72'], 3], 'still stalled: one row, not posted again');
+  assert.deepEqual([still.summary.known.map((r) => r.key), sent.length], [['rollout|ecom-service-production|stalled|microservices/6b8d4c9f72'], 3], 'still stalled: one row, not posted again');
 });
 
 test('a stalled Deployment whose series disappear is unknown, not complete: it does not recover', async () => {
@@ -200,7 +200,7 @@ test('a stalled Deployment whose series disappear is unknown, not complete: it d
   const tel = cluster([{ ...ECOM, gone: Date.parse('2026-11-03T12:40:00Z') }]);
   await patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir), AT, { llm: false, post: false });
   const later = await buildSummary(tel, c, new Noise({}), state, new Date('2026-11-03T12:45:00Z'));
-  assert.deepEqual([later.recovered, later.known.map((r) => [r.key, r.detail])], [[], [[STALLED, 'rollout state unknown: no kube-state-metrics series for this Deployment now']]]);
+  assert.deepEqual([later.recovered, later.known.map((r) => [r.key, r.detail])], [[], [[STALLED, 'rollout state unknown: no kube-state-metrics series for this Deployment now (ns microservices)']]]);
   assert.ok(later.sources.find((x) => x.source === 'rollouts')?.ok, 'the source is healthy: the rest of the cluster is read');
 });
 
@@ -304,6 +304,7 @@ test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app a
     // A counter that only became visible (the scrape began after the window's start) is not a sync in the window:
     // web-admin's 7 failures and frontend-next's 48 syncs since the controller started.
     const visibleOnly = !q.includes(' and on (name) argocd_app_info offset ');
+    if (q.startsWith('max by (name, phase) (argocd_app_sync_total{phase=~"Error|Failed"})')) return [{ labels: { name: ECOM.workload, phase: 'Failed' }, value: 3 }];
     if (q.includes('argocd_app_sync_total{phase=~"Error|Failed"}'))
       return [{ labels: { name: ECOM.workload, phase: 'Failed' }, value: 1 }, ...(visibleOnly ? [{ labels: { name: 'web-admin-production', phase: 'Failed' }, value: 7 }] : [])];
     if (q.startsWith('count by (name, sync_status, health_status)')) return [{ labels: { ...app, health_status: 'Degraded' }, value: 1 }];
@@ -317,7 +318,7 @@ test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app a
     return world(q, at);
   };
   const on = await buildSummary(cluster([], argo), c, new Noise({}), State.memory(), AT);
-  assert.deepEqual(on.send.map((r) => r.key).sort(), ['rollout|ecom-service-production|argocd app|Degraded', 'rollout|ecom-service-production|argocd sync|Failed']);
+  assert.deepEqual(on.send.map((r) => r.key).sort(), ['rollout|ecom-service-production|argocd app|Degraded', 'rollout|ecom-service-production|argocd sync|Failed #3']);
   assert.ok(on.send.every((r) => urgent(r, new Noise({}))));
   assert.match(renderSummary(on), /- Argo CD apps not Synced and Healthy now: ecom-service-production Synced\/Degraded\n- Argo CD syncs in the last 6 h: ecom-service-production Failed ×1, keycloak-production Succeeded ×1\n/);
   // argocd_app_sync_total has no dest_namespace: it is matched to the apps by name.
@@ -328,6 +329,46 @@ test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app a
 
   const blind = await buildSummary(cluster([]), c, new Noise({}), State.memory(), AT);
   assert.match(blind.sources.find((x) => x.source === 'argocd')?.error ?? '', /^no Argo CD app series/);
+});
+
+test('each failed Argo CD sync is its own row: a second failure soon after the first recovered is posted again', async () => {
+  const c = cfg();
+  c.sources.deploys.argocd = true;
+  const { sent, box } = outbox();
+  const sink = new CardSink(c.outDir, box);
+  const state = State.memory();
+  // ecom's sync fails at 12:25 (the 1st failure since the controller started) and again at 13:10 (the 2nd).
+  const failures = (t: number) => (t >= Date.parse('2026-11-03T13:10:00Z') ? 2 : t >= Date.parse('2026-11-03T12:25:00Z') ? 1 : 0);
+  const inWindow = (t: number) => failures(t) > failures(t - 15 * MIN);
+  const argo = (q: string, at: Date) => {
+    const t = at.getTime();
+    if (q.startsWith('count(argocd_app_info')) return [{ labels: {}, value: 232 }];
+    if (q.startsWith('max by (name, phase) (argocd_app_sync_total{phase=~"Error|Failed"})')) return failures(t) ? [{ labels: { name: ECOM.workload, phase: 'Failed' }, value: failures(t) }] : [];
+    if (q.includes('argocd_app_sync_total{phase=~"Error|Failed"}')) return inWindow(t) ? [{ labels: { name: ECOM.workload, phase: 'Failed' }, value: 1 }] : [];
+    return world(q, at);
+  };
+  const pass = (iso: string) => patrolOnce(cluster([], argo), c, new Noise({}), state, sink, new Date(iso), { llm: false, post: true });
+  assert.deepEqual((await pass('2026-11-03T12:30:00Z')).summary.send.map((r) => r.key), ['rollout|ecom-service-production|argocd sync|Failed #1']);
+  assert.deepEqual((await pass('2026-11-03T12:45:00Z')).summary.recovered, ['rollout|ecom-service-production|argocd sync|Failed #1']);
+  const again = await pass('2026-11-03T13:15:00Z');
+  assert.deepEqual(again.summary.send.map((r) => [r.key, r.novelty]), [['rollout|ecom-service-production|argocd sync|Failed #2', 'fresh']]);
+  assert.equal(sent.length, 3, 'rows card, recovery, and the second failure\'s rows card');
+  assert.match(again.summary.send[0]!.detail ?? '', /\(Failed #2 since the controller started\)$/);
+});
+
+test('same-named Deployments in two namespaces are two stalls, and each completes on its own', async () => {
+  const c = cfg();
+  c.sources.workloads.namespaces = 'microservices|backend.*';
+  const state = State.memory();
+  // A same-named Deployment in namespace backend starts rolling at 12:40, while microservices' stall completes at 12:41.
+  const OTHER: Rollout = { ...ECOM, namespace: 'backend', rs: 'ecom-service-production-5d9f8b7c64', prevRs: 'ecom-service-production-6f4c9d8b72', created: Date.parse('2026-11-03T12:40:00Z') };
+  const tel = cluster([{ ...ECOM, done: Date.parse('2026-11-03T12:41:00Z') }, OTHER]);
+  const pass = (iso: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir), new Date(iso), { llm: false, post: false });
+  assert.deepEqual((await pass('2026-11-03T12:30:00Z')).summary.send.map((r) => r.key), [STALLED]);
+  const done = await pass('2026-11-03T12:45:00Z');
+  assert.deepEqual([done.summary.recovered, done.summary.send, done.summary.known], [[STALLED], [], []], "backend's rollout is not microservices'");
+  const other = await pass('2026-11-03T13:00:00Z');
+  assert.deepEqual(other.summary.send.map((r) => r.key), ['rollout|ecom-service-production|stalled|backend/5d9f8b7c64']);
 });
 
 test('the shipped sources read Argo CD (scraped since argo-cd #1314) and map the two services whose names differ', async () => {

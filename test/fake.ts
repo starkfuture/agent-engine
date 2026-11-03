@@ -94,6 +94,7 @@ export const testConfig = (): Config => ({
 export const ECR = '952414816681.dkr.ecr.eu-west-1.amazonaws.com';
 export const MIN = 60_000;
 export interface Rollout {
+  namespace?: string; // default microservices
   workload: string; // the Deployment (== container)
   rs: string; // the new ReplicaSet
   created: number; // ms
@@ -118,46 +119,50 @@ export interface Rollout {
 // Deployment's first minutes fires unless the query counts samples; a
 // garbage-collected ReplicaSet is seen only through last_over_time.
 export function cluster(rollouts: Rollout[], base: (q: string, at: Date) => Sample[] = world): FakeTelemetry {
-  const ns = { namespace: 'microservices' };
+  const nsOf = (r: Rollout) => ({ namespace: r.namespace ?? 'microservices' });
   const rolling = (r: Rollout, t: number) => t >= r.created && (r.done === undefined || t < r.done);
   const shown = (r: Rollout, t: number) => r.gone === undefined || t < r.gone;
   const left = (q: string, r: Rollout, t: number) => (!rolling(r, t) ? 0 : !r.oneReplica ? 2 : q.includes('kube_deployment_status_replicas{') ? 1 : 0);
   const behind = (q: string, r: Rollout, t: number) => rolling(r, t) && !r.oneReplica && (r.updated === undefined || t < r.updated) && (t - r.created >= 10 * MIN || (!!r.brandNew && !q.includes('count_over_time(')));
-  // One value per workload: the most of its rollouts'.
+  // One value per namespace/workload: the most of its rollouts'.
   const perWorkload = (q: string, t: number, value: (r: Rollout) => number) => {
     const m = new Map<string, number>();
-    for (const r of rollouts) if (shown(r, t)) m.set(r.workload, Math.max(m.get(r.workload) ?? 0, value(r)));
+    for (const r of rollouts) if (shown(r, t)) m.set(`${nsOf(r).namespace}/${r.workload}`, Math.max(m.get(`${nsOf(r).namespace}/${r.workload}`) ?? 0, value(r)));
     return m;
   };
+  const labelsOf = (k: string) => ({ namespace: k.split('/')[0]!, deployment: k.split('/')[1]! });
   return new FakeTelemetry(
     (q, at) => {
       const t = at.getTime();
       if (q.startsWith('count(')) return base(q, at); // presence checks
       if (q.startsWith('topk by (namespace, owner_name) (1, kube_replicaset_created')) {
         const newest = new Map<string, Rollout>();
-        for (const r of rollouts) if (r.created <= t && (r.gc === undefined || t < r.gc) && (newest.get(r.workload)?.created ?? 0) < r.created) newest.set(r.workload, r);
-        return [...newest.values()].map((r) => ({ labels: { ...ns, owner_name: r.workload, replicaset: r.rs }, value: r.created / 1000 }));
+        for (const r of rollouts) {
+          const k = `${nsOf(r).namespace}/${r.workload}`;
+          if (r.created <= t && (r.gc === undefined || t < r.gc) && (newest.get(k)?.created ?? 0) < r.created) newest.set(k, r);
+        }
+        return [...newest.values()].map((r) => ({ labels: { ...nsOf(r), owner_name: r.workload, replicaset: r.rs }, value: r.created / 1000 }));
       }
       if (q.includes('kube_replicaset_created')) {
         const window = Number(/time\(\) - (\d+)/.exec(q)![1]) * 1000;
         const owner = /owner_name="([^"]+)"/.exec(q)?.[1];
         const seen = (r: Rollout) => r.gc === undefined || t < r.gc || (q.includes('last_over_time(') && r.gc > t - window);
-        return rollouts.filter((r) => r.created <= t && r.created > t - window && seen(r) && (!owner || owner === r.workload)).map((r) => ({ labels: { ...ns, owner_name: r.workload, replicaset: r.rs }, value: r.created / 1000 }));
+        return rollouts.filter((r) => r.created <= t && r.created > t - window && seen(r) && (!owner || owner === r.workload)).map((r) => ({ labels: { ...nsOf(r), owner_name: r.workload, replicaset: r.rs }, value: r.created / 1000 }));
       }
       if (q.includes('kube_pod_container_info') && q.includes('kube_pod_owner'))
         return rollouts.flatMap((r) => {
-          const pods = (rs: string, image: string) => ({ labels: { ...ns, owner_name: rs, container: r.workload, image_spec: image }, value: 2 });
+          const pods = (rs: string, image: string) => ({ labels: { ...nsOf(r), owner_name: rs, container: r.workload, image_spec: image }, value: 2 });
           if (t < r.created || (r.back !== undefined && t >= r.back)) return [pods(r.prevRs, r.prev)];
           return rolling(r, t) ? [pods(r.prevRs, r.prev), pods(r.rs, r.image)] : [pods(r.rs, r.image)];
         });
       if (q.includes('min_over_time((kube_deployment_spec_replicas'))
         return rollouts.flatMap((r) => {
           if (!shown(r, t)) return [];
-          if (behind(q, r, t)) return [{ labels: { ...ns, deployment: r.workload }, value: 2 }];
-          return r.oneReplica && rolling(r, t) && t - r.created >= 10 * MIN ? [{ labels: { ...ns, deployment: r.workload, reason: 'ProgressDeadlineExceeded' }, value: 1 }] : [];
+          if (behind(q, r, t)) return [{ labels: { ...nsOf(r), deployment: r.workload }, value: 2 }];
+          return r.oneReplica && rolling(r, t) && t - r.created >= 10 * MIN ? [{ labels: { ...nsOf(r), deployment: r.workload, reason: 'ProgressDeadlineExceeded' }, value: 1 }] : [];
         });
       if (q.includes('clamp_min(kube_deployment_spec_replicas'))
-        return [...perWorkload(q, t, (r) => left(q, r, t))].filter(([, v]) => !q.endsWith(' > 0') || v > 0).map(([deployment, value]) => ({ labels: { ...ns, deployment }, value }));
+        return [...perWorkload(q, t, (r) => left(q, r, t))].filter(([, v]) => !q.endsWith(' > 0') || v > 0).map(([k, value]) => ({ labels: labelsOf(k), value }));
       return base(q, at);
     },
     (q, start, end, step) => {
@@ -165,7 +170,7 @@ export function cluster(rollouts: Rollout[], base: (q: string, at: Date) => Samp
       const series = new Map<string, Array<[number, number]>>();
       for (let t = start.getTime(); t <= end.getTime(); t += step * 1000)
         for (const [deployment, v] of perWorkload(q, t, (r) => (r.back !== undefined && t >= r.back && t < r.back + 2 * MIN ? 2 : left(q, r, t)))) series.set(deployment, [...(series.get(deployment) ?? []), [t / 1000, v]]);
-      return [...series].map(([deployment, points]) => ({ labels: { namespace: 'microservices', deployment }, points }));
+      return [...series].map(([k, points]) => ({ labels: labelsOf(k), points }));
     },
   );
 }

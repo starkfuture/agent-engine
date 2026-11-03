@@ -126,10 +126,11 @@ function rolloutRow(service: string, subject: string, status: string | undefined
   return { key: rowKey({ section: 'rollout', service, subject, status }), section: 'rollout', service, subject, ...(status ? { status } : {}), counts, score: heldScore(counts), detail, query };
 }
 
-// A stalled row is one deploy's stall: its key carries the pod-template-hash
-// of the Deployment's newest ReplicaSet. A stall on the next deploy is a new
-// row (fresh and urgent again), however the first one ended; one that goes on
-// stays one row.
+// A stalled row is one deploy's stall: its key's status is the namespace and
+// the pod-template-hash of the Deployment's newest ReplicaSet
+// (microservices/7566f689c8). A stall on the next deploy is a new row (fresh and
+// urgent again), however the first one ended; one that goes on stays one row.
+// Same-named Deployments in two namespaces are two rows.
 //
 // `open()`: stalled rows still open from earlier patrols. A stall ends when its
 // rollout completes (every replica updated and available, the old ones
@@ -146,6 +147,7 @@ export async function collectRollouts(tel: Telemetry, src: Sources, at: Date, op
     requireSeries(tel, `kube_deployment_spec_replicas{${ns(src)}}`, at, 'kube-state-metrics deployment'),
   ]);
   const hashOf = new Map(newest.map((s) => [`${s.labels.namespace}\u0000${s.labels.owner_name}`, RS_HASH.exec(s.labels.replicaset ?? '')?.[0].slice(1)]));
+  const stall = (namespace: string, hash: string | undefined) => (hash ? `${namespace}/${hash}` : namespace);
   const rows: Row[] = [];
   for (const [k, { counts, labels }] of cells) {
     if (!(counts.now > 0)) continue;
@@ -153,30 +155,33 @@ export async function collectRollouts(tel: Telemetry, src: Sources, at: Date, op
     const detail = labels.reason
       ? `the controller gave up on it: Progressing ${labels.reason} (ns ${namespace})`
       : `${Math.round(counts.now)} replica(s) not on the new version for ${src.deploys.stall_minutes}+ min (ns ${namespace})`;
-    rows.push(rolloutRow(deployment, 'stalled', hashOf.get(k), counts, detail, query));
+    rows.push(rolloutRow(deployment, 'stalled', stall(namespace, hashOf.get(k)), counts, detail, query));
   }
-  const work = new Map<string, { namespace: string; value: number }>();
-  for (const s of left) {
-    const d = s.labels.deployment ?? '?';
-    if (!work.has(d) || s.value > work.get(d)!.value) work.set(d, { namespace: s.labels.namespace ?? '?', value: s.value });
-  }
+  const work = new Map(left.map((s) => [`${s.labels.namespace}/${s.labels.deployment}`, s.value]));
   const flagged = new Set(rows.map((r) => r.key));
   for (const key of open()) {
-    const [, deployment = '?', , status] = key.split('|');
-    const w = work.get(deployment);
-    if (flagged.has(key) || w?.value === 0) continue;
-    const detail = w ? `still not complete: ${Math.round(w.value)} replica(s) to update, become available or retire (ns ${w.namespace})` : 'rollout state unknown: no kube-state-metrics series for this Deployment now';
-    rows.push(rolloutRow(deployment, 'stalled', status || undefined, { now: 1, h1: 0, d1: 0, d7: 0 }, detail, remainingQuery(src)));
+    const [, deployment = '?', , status = ''] = key.split('|');
+    const namespace = status.split('/')[0]!;
+    const w = work.get(`${namespace}/${deployment}`);
+    if (flagged.has(key) || w === 0) continue;
+    const detail = w !== undefined ? `still not complete: ${Math.round(w)} replica(s) to update, become available or retire (ns ${namespace})` : `rollout state unknown: no kube-state-metrics series for this Deployment now (ns ${namespace})`;
+    rows.push(rolloutRow(deployment, 'stalled', status, { now: 1, h1: 0, d1: 0, d7: 0 }, detail, remainingQuery(src)));
   }
   return rows;
 }
 
+// A failed sync row is one failure: its status carries the phase and the
+// failure counter's value (Failed #3), so the next failure is a new row, fresh
+// and urgent again, even right after the last one recovered.
+const failuresQuery = 'max by (name, phase) (argocd_app_sync_total{phase=~"Error|Failed"})';
+
 export async function collectArgocd(tel: Telemetry, src: Sources, at: Date, windowMin: number): Promise<Row[]> {
   const degradedQ = degradedQuery(src);
   const failedQ = failedSyncQuery(src, windowMin);
-  const [degraded, failed] = await Promise.all([
+  const [degraded, failed, totals] = await Promise.all([
     fourWay(tel, degradedQ, at, (s) => `${s.labels.name}\u0000${s.labels.health_status}`),
     fourWay(tel, failedQ, at, (s) => `${s.labels.name}\u0000${s.labels.phase}`),
+    tel.promInstant(failuresQuery, at),
     // On, the scrape (argo-cd #1314) must be there: a missing one is a blind spot.
     requireSeries(tel, `argocd_app_info{${dest(src)}}`, at, 'Argo CD app'),
   ]);
@@ -186,10 +191,12 @@ export async function collectArgocd(tel: Telemetry, src: Sources, at: Date, wind
     const [app, health] = k.split('\u0000') as [string, string];
     rows.push(rolloutRow(app, 'argocd app', health, counts, `Argo CD app ${health} for 5+ min${labels.sync_status ? ` (${labels.sync_status})` : ''}`, degradedQ));
   }
+  const count = new Map(totals.map((s) => [`${s.labels.name}\u0000${s.labels.phase}`, Math.round(s.value)]));
   for (const [k, { counts }] of failed) {
     if (!(counts.now > 0)) continue;
     const [app, phase] = k.split('\u0000') as [string, string];
-    rows.push(rolloutRow(app, 'argocd sync', phase, counts, `an Argo CD sync ended ${phase} in the last ${windowMin} min`, failedQ));
+    const n = count.get(k);
+    rows.push(rolloutRow(app, 'argocd sync', n ? `${phase} #${n}` : phase, counts, `an Argo CD sync ended ${phase} in the last ${windowMin} min${n ? ` (${phase} #${n} since the controller started)` : ''}`, failedQ));
   }
   return rows;
 }
