@@ -141,7 +141,7 @@ Slack gets at most 10 lines to look at, 6 ongoing and 8 quiet, cut at whole line
 - an issue back as critical after it recovered;
 - an urgent rows card with a protected journey (`never_suppress`).
 
-Repeats in an issue's thread, reminders, majors, minors and recoveries never mention it. When the rows card has mentioned the on-call, an AI report in the same patrol on any of its rows doesn't mention them again. The mention works with the bot and the webhook. Model text stays escaped, so the model can't mention anyone. Unset means no mention. Anything other than one id stops the engine.
+Repeats in an issue's thread, reminders, majors, minors and recoveries never mention it. The mention works with the bot and the webhook. Model text stays escaped, so the model can't mention anyone. Unset means no mention. Anything other than one id stops the engine.
 
 ## Run it
 

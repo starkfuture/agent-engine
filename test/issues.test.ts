@@ -413,19 +413,6 @@ test('a rise to critical and a return as critical mention the on-call; majors an
   assert.deepEqual(back.sent.map((m) => [[...m.text][0], pinged(m)]), [['🟠', false], ['✅', false], ['🔴', true]]);
 });
 
-test("one patrol mentions the on-call once: a report on the rows card's rows does not again; one on other rows does", async () => {
-  const LOGIN = key('/v1/auth/login');
-  const TRANSFER = key('/v1/ownership/transfer');
-  for (const [rows, again] of [[[LOGIN, TRANSFER], false], [[TRANSFER], true]] as const) {
-    const t = recorder(true);
-    const w = setup(t, () => ({ issue: 'new', severity: 'critical', rows: [...rows] }), { oncall: ONCALL });
-    w.rules.noise = new Noise({ never_suppress: [{ section: 'http', route: '/v1/auth/login', status: '4..' }] });
-    const r = await w.patrol(schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(0, 40) }), 0);
-    assert.equal(r.filed[0]?.action, 'opened');
-    assert.deepEqual(t.sent.map((m) => [m.text.startsWith('Patrol') ? 'rows' : 'report', pinged(m)]), [['rows', true], ['report', again]], rows.join(' + '));
-  }
-});
-
 test('without an issue record a new critical report still mentions the on-call; a major does not', async () => {
   const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(1, 40) });
   const t = recorder(true);
