@@ -760,9 +760,3 @@ test("the shipped SQS counter reads every service's consumer errors, and checks 
   assert.deepEqual(sqs.group_by, ['app', 'queue', 'error_type']);
   assert.match(sqs.presence ?? '', /^up\{.+\} == 1$/);
 });
-
-test('the summary calls generation changes what they are, not rollouts', () => {
-  const s = { at: '2026-09-29T12:15:00.000Z', windowMinutes: 15, send: [], known: [], suppressed: [], recovered: [], changes: [{ namespace: 'microservices', workload: 'auth-service', changes: 2 }], sources: [] };
-  assert.match(renderSummary(s), /\n## Workload generation changes in the last 2 h \(context, not proof of a deployment\)\n- microservices\/auth-service: 2 generation change\(s\)/);
-  assert.doesNotMatch(renderSummary(s), /Rollouts/);
-});

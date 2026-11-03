@@ -15,7 +15,7 @@ never_suppress:
 
 noise: []
 #  - id: example
-#    section: http            # http | drop | workload | errors | logs | traces
+#    section: http            # http | drop | workload | rollout | errors | logs | traces
 #    service: some-service
 #    route: '/health.*'
 #    status: '404'

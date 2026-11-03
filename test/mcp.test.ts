@@ -18,7 +18,7 @@ import { Login } from '../src/mcp/login.js';
 import { buildServer, startHttp, type McpContext } from '../src/mcp/server.js';
 import { Users, type User } from '../src/mcp/users.js';
 import { fakeSession, fetchResponse, ok, readResponse, say, type Script } from './fake-session.js';
-import { FakeTelemetry, world } from './fake.js';
+import { cluster, ECR, FakeTelemetry, MIN, testConfig, world } from './fake.js';
 import { fakeKeycloak } from './fake-keycloak.js';
 
 const tmp = (p: string) => mkdtempSync(join(tmpdir(), p));
@@ -197,6 +197,35 @@ test('the prod agent answers from production telemetry over MCP; other agents ne
   // Answers built from prod data stay with the asker.
   const runId = /run (\S+): ok/.exec(r.text)![1]!;
   assert.match((await (await connect(ctx, who('bo'))).call('get_run', { run_id: runId })).text, /no run/);
+});
+
+test('deploys over MCP: code only and read-only, one service by the name the patrol uses, no run and no cost', async () => {
+  const session = fakeSession();
+  const { ctx, who } = context(session);
+  const { client, call } = await connect(ctx, who('bo'));
+  assert.ok(!(await client.listTools()).tools.some((t) => t.name === 'deploys'), 'no telemetry: no tool');
+
+  ctx.cfg.sources = testConfig().sources; // aliases: keycloak → keycloak-production
+  const now = Math.floor(Date.now() / MIN) * MIN; // whole minutes: rollout times are read at a 1-min step
+  ctx.telemetry = cluster([
+    { workload: 'keycloak-production', rs: 'keycloak-production-6c9f7b8d54', created: now - 40 * MIN, done: now - 33 * MIN, image: `${ECR}/keycloak:40306405610@sha256:d40dc2f1`, prevRs: 'keycloak-production-58f6d9c7b2', prev: `${ECR}/keycloak:40306405609@sha256:c80fc98a` },
+    { workload: 'ecom-service-production', rs: 'ecom-service-production-7566f689c8', created: now - 20 * MIN, done: now - 16 * MIN, image: `${ECR}/ecom-service:1.2645.6`, prevRs: 'ecom-service-production-5d4b9c7f88', prev: `${ECR}/ecom-service:1.2645.5` },
+  ]);
+  const { client: c2, call: call2 } = await connect(ctx, who('bo'));
+  const tool = (await c2.listTools()).tools.find((t) => t.name === 'deploys');
+  assert.equal(tool?.annotations?.readOnlyHint, true);
+  const all = await call2('deploys', {});
+  assert.equal(all.isError, false, all.text);
+  assert.match(all.text, /^Deploys in the last 6 h \(new ReplicaSets; scaling is not a deploy\):\n- .*keycloak-production: 40306405609 → 40306405610 · complete in 7 min\n- .*ecom-service-production: 1\.2645\.5 → 1\.2645\.6 · complete in 4 min$/);
+  const one = await call2('deploys', { service: 'keycloak', hours: 2 });
+  assert.match(one.text, /^Deploys in the last 2 h \(new ReplicaSets; scaling is not a deploy\) for keycloak:\n- .*keycloak-production: 40306405609 → 40306405610/);
+  assert.doesNotMatch(one.text, /ecom-service/);
+  assert.equal(session.requests.length, 0, 'no model call');
+  assert.match((await call('list_runs')).text, /^no runs$/, 'nothing recorded, nothing spent');
+
+  ctx.telemetry = new FakeTelemetry(() => []); // kube-state-metrics gone
+  const gone = await (await connect(ctx, who('bo'))).call('deploys', {});
+  assert.match(gone.text, /\n- unknown: deployment metrics missing \(no kube_replicaset_created series\)$/);
 });
 
 test('a deployment offers only its ENGINE_AGENTS (web agents run apart from prod data)', async () => {

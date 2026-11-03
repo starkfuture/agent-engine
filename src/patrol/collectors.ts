@@ -2,7 +2,7 @@ import type { ErrorCounter, HttpFamily, Sources } from '../config.js';
 import type { Sample, Telemetry } from '../clients/telemetry.js';
 import { DEFAULT_THRESHOLDS, isErrorStatus, scoreErrors, scoreTraffic, type Counts, type Thresholds } from './score.js';
 import { redact, templateOf, truncate } from '../engine/text.js';
-import { rowKey, type Change, type Row } from './types.js';
+import { rowKey, type Row } from './types.js';
 
 const H = 3600_000;
 export const OFFSETS = { now: 0, h1: H, d1: 24 * H, d7: 7 * 24 * H } as const;
@@ -13,7 +13,7 @@ const shift = (at: Date, s: Slot) => new Date(at.getTime() - OFFSETS[s]);
 
 // Runs one instant query at now / -1h / -1d / -7d and folds the results into
 // Counts per key. Same query text every time, so recordings replay exactly.
-async function fourWay(
+export async function fourWay(
   tel: Telemetry,
   query: string,
   at: Date,
@@ -216,15 +216,6 @@ export async function collectWorkloads(tel: Telemetry, nsRegex: string, at: Date
     });
   }
   return rows;
-}
-
-// Context, not anomalies: what rolled out recently.
-export async function collectChanges(tel: Telemetry, nsRegex: string, at: Date, lookbackMin = 120): Promise<Change[]> {
-  const q = `sum by (namespace, deployment) (changes(kube_deployment_status_observed_generation{namespace=~"${nsRegex}"}[${lookbackMin}m])) > 0`;
-  const res = await tel.promInstant(q, at);
-  return res
-    .map((s) => ({ namespace: s.labels.namespace ?? '?', workload: s.labels.deployment ?? '?', changes: Math.round(s.value) }))
-    .sort((a, b) => a.workload.localeCompare(b.workload));
 }
 
 // ---- Logs: error-level lines grouped into stable templates ------------------

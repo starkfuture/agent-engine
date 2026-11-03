@@ -27,10 +27,21 @@ const ErrorCounter = z.object({
 });
 export type ErrorCounter = z.infer<typeof ErrorCounter>;
 
+const Deploys = z.object({
+  // Row service → Deployment where the names differ (elsewhere app == deployment).
+  aliases: z.record(z.string(), z.string()).default({}),
+  // A rollout with replicas not on the new version for this long is stalled (urgent).
+  stall_minutes: z.number().int().min(2).max(60).default(10),
+  // Argo CD app metrics (argocd_app_info, argocd_app_sync_total). On, a missing
+  // scrape is a blind spot; off, nothing is read and nothing is reported.
+  argocd: z.boolean().default(false),
+});
+
 const Sources = z.object({
   http_families: z.array(HttpFamily),
   error_counters: z.array(ErrorCounter).default([]),
   workloads: z.object({ namespaces: z.string() }),
+  deploys: Deploys.prefault({}),
   logs: z.object({
     selector: z.string(),
     error_filter: z.string(),

@@ -9,6 +9,7 @@ import { checkReport, Report, ReportShape } from './investigate/report.js';
 import { monitorTools } from './investigate/tools.js';
 import { patrolCard, recoveredCard, reportCard, worseCard, type Card, type IssueRef } from './output/card.js';
 import type { CardSink, EmitSlack } from './output/sink.js';
+import { recentDeploys } from './patrol/deploys.js';
 import { bucketOf } from './patrol/digest.js';
 import { MUTE_DAYS, type Disposition, type Issue, type Issues, type Severity } from './patrol/issues.js';
 import type { Noise } from './patrol/noise.js';
@@ -47,10 +48,11 @@ export interface MonitorAgent {
 
 const stamp = (iso: string) => iso.replace(/[:.]/g, '').slice(0, 15) + 'Z';
 
-// Rows the AI must never be able to hide: protected journeys (never_suppress)
-// and big jumps. They are posted at once, with or without the AI.
+// Rows the AI must never be able to hide: protected journeys (never_suppress),
+// big jumps and rollout rows (a stalled rollout, an Argo CD app degraded or a
+// failed sync). They are posted at once, with or without the AI.
 export function urgent(r: FlaggedRow, noise: Noise): boolean {
-  return noise.protected(r) || (r.counts.now >= 50 && r.counts.now >= 5 * Math.max(1, r.score.expected));
+  return r.section === 'rollout' || noise.protected(r) || (r.counts.now >= 50 && r.counts.now >= 5 * Math.max(1, r.score.expected));
 }
 
 // Deterministic challenge gate: the model's own severity never decides whether
@@ -385,7 +387,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId, filing), { action: 'none' }) : { action: 'none' };
       result.filed.push(f);
       const cc = [...new Set([...(cfg.slackOncall && pagesOncall(f, r) ? [cfg.slackOncall] : []), ...ownersOf(r)])];
-      const card = reportCard(r, summary.at, footer, inv.challenge, cc, issueRef(f));
+      const card = reportCard(r, summary.at, footer, inv.challenge, cc, issueRef(f), recentDeploys(summary.deploys));
       const post = postFor(f, r);
       emit(card, `${stamp(summary.at)}-${i + 1}`, post);
       // Back from resolved, or Not an issue ended: its buttons are back.

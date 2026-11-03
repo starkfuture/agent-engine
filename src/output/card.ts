@@ -1,5 +1,6 @@
 import type { ChallengeResult } from '../engine/challenge.js';
 import type { Report } from '../investigate/report.js';
+import { recentDeploys } from '../patrol/deploys.js';
 import { DEFAULT_FLOOR, digest, shortSubject, type DigestOptions, type Line } from '../patrol/digest.js';
 import type { Owners } from '../patrol/owners.js';
 import type { FlaggedRow, Summary } from '../patrol/summary.js';
@@ -37,8 +38,9 @@ export interface IssueRef {
 // `cc`: the on-call (SLACK_ONCALL) and owner mentions from the owners file
 // (each validated where it is loaded), the only text that reaches Slack
 // unescaped. `issue`: a new issue shows its id; an update on an existing one
-// is headed by that issue, not by this report's title.
-export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult, cc: string[] = [], issue?: IssueRef): Card {
+// is headed by that issue, not by this report's title. `deploys`: one line of
+// recent deploys (code's), on a card that is posted anyway.
+export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult, cc: string[] = [], issue?: IssueRef, deploys?: string): Card {
   const r: Report = {
     ...raw,
     title: m(raw.title),
@@ -72,6 +74,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     ...(r.not_checked.length ? ['', '**Not checked**', ...r.not_checked.map((x) => `- ${x}`)] : []),
     ...(r.noise_rule ? ['', '**Proposed noise rule (needs review)**', '```yaml', m(JSON.stringify(r.noise_rule, null, 2)), '```'] : []),
     ...(ch.length ? ['', '**Challenge**', ...ch] : []),
+    ...(deploys ? ['', `_${redact(deploys)}_`] : []),
     '',
     `_Rows: ${r.rows.join(', ')} · patrol ${patrolAt} · ${footer}_`,
   ].join('\n');
@@ -95,6 +98,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     pair("What's wrong", r.what_broke, 'Impact', r.impact),
     pair('Likely cause', r.cause.hypothesis, 'Suggested fix', r.suggested_fix),
     ...(against.length ? [{ type: 'section', text: { type: 'mrkdwn', text: clip(`⚠️ *A second AI check disputes this, a human decides:* ${esc(brief(noIds(m(against.map((o) => o.claim).join(' '))), 400))}`) } }] : []),
+    ...(deploys ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(redact(deploys)), 600) }] }] : []),
     {
       type: 'context',
       elements: [
@@ -187,7 +191,8 @@ function lookLine(f: Fmt, l: Line, s: Summary, owner: string | undefined): strin
   const stats = `now ${rs.some((r) => r.truncated) ? '≥' : ''}${sum(rs, (r) => r.counts.now)}${totals} (1h ago ${sum(rs, (r) => r.counts.h1)}) vs expected ${num(sum(rs, (r) => r.score.expected))}`;
   const tags = [...uniq(rs.map((r) => r.score.verdict)), ...(rs.some((r) => r.novelty === 'worse') ? ['worse'] : []), ...uniq(rs.map((r) => TREND[r.score.trend])), ...(l.protected ? ['protected journey'] : [])];
   const v = variants(f, l, true);
-  return [`${f.dot} ${head(f, l)}${v}${l.variants ? ' ·' : ' —'} ${stats}`, tags.join(', '), since(l, s)].filter(Boolean).join(' · ') + (owner ? ` ${owner}` : '');
+  const deploy = [...rs].sort((a, b) => a.firstSeen.localeCompare(b.firstSeen)).find((r) => r.afterDeploy)?.afterDeploy;
+  return [`${f.dot} ${head(f, l)}${v}${l.variants ? ' ·' : ' —'} ${stats}`, tags.join(', '), since(l, s), deploy && f.t(deploy)].filter(Boolean).join(' · ') + (owner ? ` ${owner}` : '');
 }
 
 const ongoingLine = (f: Fmt, l: Line, s: Summary) => [`${f.dot} ${head(f, l)}${variants(f, l, false)}`, `now ${sum(l.rows, (r) => r.counts.now)}`, since(l, s)].filter(Boolean).join(' · ');
@@ -218,6 +223,7 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
   const title = `Patrol ${minute(s.at)}: ${[n.look ? `${n.look} to look at` : 'nothing new to look at', n.ongoing ? `${n.ongoing} still ongoing` : '', n.quiet ? `${n.quiet} quiet` : ''].filter(Boolean).join(' · ')}`;
   const down = s.sources.filter((x) => !x.ok).map((x) => x.source);
   const footer = (f: Fmt, cut: boolean) => [f.t(why), down.length ? `blind spots: ${f.t(down.join(', '))}` : '', cut && o.ref ? `full list: ${f.t(o.ref)}` : ''].filter(Boolean).join(' · ');
+  const deploys = recentDeploys(s.deploys);
   const ongoingHead = 'Still ongoing (reported before, not worse)';
   const quietHead = `Quiet (new, fewer than ${floor} events)`;
 
@@ -240,6 +246,7 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
     ...(d.look.length ? [section(['*To look at*', ...look.shown, ...more(look.hidden, ' to look at', mentions(look.hidden))].join('\n'))] : []),
     ...(d.ongoing.length ? [section([`*${ongoingHead}*`, ...ongoing.shown, ...more(ongoing.hidden)].join('\n'))] : []),
     ...(d.quiet.length ? [context(`_${quietHead}:_ ${[...quiet.shown, ...more(quiet.hidden)].join(' · ')}`)] : []),
+    ...(deploys ? [context(SLACK.t(deploys))] : []),
     context(footer(SLACK, cut)),
   ];
 
@@ -249,6 +256,7 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
     ...(d.look.length ? ['', '**To look at**', ...d.look.map((l) => lookLine(MD, l, s, owner(l)))] : []),
     ...(d.ongoing.length ? ['', `**${ongoingHead}**`, ...d.ongoing.map((l) => ongoingLine(MD, l, s))] : []),
     ...(d.quiet.length ? ['', `**${quietHead}**`, ...d.quiet.map((l) => `- ${quietItem(MD, l)}`)] : []),
+    ...(deploys ? ['', `_${MD.t(deploys)}_`] : []),
     '',
     `_${footer(MD, false)}_`,
   ].join('\n');
@@ -268,7 +276,8 @@ const rowName = (k: string) => {
 };
 
 export function recoveredCard(keys: string[], at: string, issue?: string): Card {
-  const lines = keys.map(rowName);
+  // A stalled rollout back to normal is a rollout that completed.
+  const lines = keys.map((k) => (/^rollout\|[^|]+\|stalled\|/.test(k) ? `${k.split('|')[1]} · rollout complete` : rowName(k)));
   const head = `✅ Back to normal at ${minute(at).slice(11)}${issue ? ` · ${issue} resolved` : ''}`;
   const text = `${head}: ${lines.length === 1 ? lines[0] : `${lines.length} signals`}`;
   const blocks = [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(redact(`${head}\n${lines.map((l) => `• ${l}`).join('\n')}`)), 2900) }] }];
