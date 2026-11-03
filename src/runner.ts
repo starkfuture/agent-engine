@@ -13,7 +13,7 @@ import { bucketOf } from './patrol/digest.js';
 import { MUTE_DAYS, type Disposition, type Issue, type Issues, type Severity } from './patrol/issues.js';
 import type { Noise } from './patrol/noise.js';
 import type { Owners } from './patrol/owners.js';
-import type { State } from './patrol/state.js';
+import { ATTEMPTS, type State } from './patrol/state.js';
 import { buildSummary, renderSummary, type FlaggedRow, type Summary } from './patrol/summary.js';
 import { redact, safeJson } from './engine/text.js';
 
@@ -241,11 +241,13 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       log(`${id}: Not an issue ended after ${MUTE_DAYS} days; its rows are investigated again`);
       if (o.post) sink.outbox?.updateRoot(id);
     }
-  if (!summary.send.length) return finish(); // quiet patrol: no LLM call, no card, $0
 
+  // Rows still owed an answer from an earlier patrol (see below) are held back
+  // by a click too. A big one breaks through Not an issue, as a new one does.
+  const owedKnown = summary.known.filter((r) => state.needsInvestigation(r.key));
   // The buttons: rows of an issue someone is on, or said is not an issue, are
   // left out of the AI run and of the rows card (see claimedRows).
-  const claims = record('reading the buttons', () => claimedRows(o.buttons ? o.issues : undefined, summary.send, noise, at), new Map());
+  const claims = record('reading the buttons', () => claimedRows(o.buttons ? o.issues : undefined, [...summary.send, ...owedKnown], noise, at), new Map());
   const send = claims.size ? summary.send.filter((r) => !claims.has(r.key)) : summary.send;
   const shown = claims.size ? { ...summary, send } : summary; // for the rows card and the investigator
   const byIssue = new Map<string, FlaggedRow[]>();
@@ -265,15 +267,23 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
 
   // New or worse only: a 6-hour reminder of something already posted isn't news.
   const urgentRows = send.filter((r) => r.novelty !== 'reminder' && urgent(r, noise));
-  // A run only for something new and big enough to read (the card's "to look
-  // at"): small or still-firing rows on their own don't spend one.
-  const worthALook = urgentRows.length > 0 || send.some((r) => bucketOf(r, cfg.attentionFloor, noise.protected(r)) === 'look');
+  // The rows the investigator still owes an answer: new or worse, or left
+  // uncovered by an earlier run. A reminder of a row it already explained is
+  // not one: it would only be reported again. A row held back by a click isn't
+  // in the run, so its record is left as it is: neither an attempt nor a deferral.
+  const pending = [...send, ...owedKnown.filter((r) => !claims.has(r.key))].filter((r) => state.needsInvestigation(r.key));
+  // A run only for a row big enough to read (the card's "to look at", sized as
+  // if new): small rows on their own don't spend one.
+  const worthALook = pending.some((r) => urgent(r, noise) || bucketOf({ ...r, novelty: 'fresh' }, cfg.attentionFloor, noise.protected(r)) === 'look');
 
   let skip: string | undefined;
   if (!o.llm) skip = 'LLM disabled for this run';
   else if (!monitor) skip = 'no monitor agent loaded';
   else if (!monitor.engine.llmAvailable) skip = 'no LLM credentials configured';
   else if (!worthALook) skip = send.length ? 'nothing new above the attention floor' : 'every row belongs to an issue someone clicked On it or Not an issue on';
+  // Quiet patrol: no LLM call, no card, $0. Rows owed an answer from an
+  // earlier patrol make it a patrol only when they can be investigated now.
+  if (!summary.send.length && skip) return finish();
 
   // Code's own card goes to Slack only for urgent rows, and first: the AI never
   // delays or hides those. Otherwise it stays on disk and the AI's reports decide.
@@ -288,7 +298,8 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   });
   // Urgent rows that all belong to one open issue go into its thread, still broadcast.
   const rowsIssue = urgentRows.length && o.issues ? record('finding the issue of urgent rows', () => o.issues!.holding(urgentRows.map((r) => r.key)), undefined) : undefined;
-  emit(card, `${stamp(summary.at)}-rows`, urgentRows.length ? { kind: 'rows', keys: urgentRows.map((r) => r.key), broadcast: true, issue: rowsIssue?.id } : undefined);
+  // A patrol with only rows owed from earlier patrols writes no card: its run is the record.
+  if (summary.send.length) emit(card, `${stamp(summary.at)}-rows`, urgentRows.length ? { kind: 'rows', keys: urgentRows.map((r) => r.key), broadcast: true, issue: rowsIssue?.id } : undefined);
   // The channel heard about the issue: that restarts its reminder clock.
   if (rowsIssue && o.post) record(`noting the rows card on ${rowsIssue.id}`, () => o.issues!.rowsPosted(rowsIssue.id, at, urgentRows.map((r) => r.key)), undefined);
   if (urgentRows.length) {
@@ -297,14 +308,27 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   }
 
   if (!skip && monitor) {
-    const rowKeys = new Set(send.map((r) => r.key));
+    const rowKeys = new Set(pending.map((r) => r.key));
     // The issues the investigator may link to: open, or resolved in the last 24 h.
     const none = { issues: [], more: 0 };
     const listed = o.issues ? record('listing issues', () => o.issues!.listed(at), none) : none;
     const issueIds = new Set(listed.issues.map((i) => i.id));
-    const challenge = needsChallenge(send, noise);
-    log(`investigating ${send.length} row(s) with ${monitor.agent.spec.model}${challenge ? ', then a challenger' : ''}…`);
+    const challenge = needsChallenge(pending, noise);
+    log(`investigating ${pending.length} row(s) with ${monitor.agent.spec.model}${challenge ? ', then a challenger' : ''}…`);
+    // Rows no report covered stay pending for another attempt, then are given
+    // up: in the log and the state file, never a Slack post.
+    const investigated = (covered: Set<string>, outcome: string, attempted: boolean, runId?: string) => {
+      const gaveUp = state.investigated(pending, covered, outcome, attempted, runId);
+      if (gaveUp.length) log(`gave up on ${gaveUp.length} row(s) after ${ATTEMPTS} attempts: ${gaveUp.join(', ')}`);
+    };
+    // One skipped run per hold, not one per patrol: while the cap or the kill
+    // switch that refused an earlier run still holds, the refusal isn't recorded
+    // again. A daily cap ends with its UTC day.
+    const now = monitor.engine.now?.() ?? new Date();
+    const hold = state.data.held;
+    const heldBy = hold && (!/daily cap/.test(hold.reason) || hold.since.slice(0, 10) === now.toISOString().slice(0, 10)) ? hold.reason : undefined;
     let inv: RunResult<Report>;
+    let admitted = false;
     try {
       inv = await runAgent<Report>(monitor.engine, {
         agent: monitor.agent,
@@ -320,18 +344,33 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
           check: (r) => checkReport(r, rowKeys, issueIds),
         },
         challenge,
+        heldBy,
+        onAdmitted: () => {
+          admitted = true;
+        },
       });
     } catch (e) {
       // The rows card already went out; record why there is no report and keep the state moving.
       result.skippedLlm = `investigator crashed: ${(e as Error).message.slice(0, 200)}`;
       log(result.skippedLlm);
+      // Before admission (the store locked, say), nothing ran: a deferral. After it, an attempt.
+      investigated(new Set(), result.skippedLlm, admitted);
       for (const r of summary.send) state.reported(r, at);
       return finish();
     }
+    if (hold && heldBy !== undefined && inv.status === 'skipped' && inv.note === heldBy) {
+      investigated(new Set(), hold.reason, false, hold.runId);
+      result.skippedLlm = `deferred: ${hold.reason} (since ${hold.since}, run ${hold.runId})`;
+      log(result.skippedLlm);
+      for (const r of summary.send) state.reported(r, at);
+      return finish();
+    }
+    if (inv.status === 'skipped') state.data.held = { reason: inv.note ?? 'skipped', since: now.toISOString(), runId: inv.runId };
+    else delete state.data.held;
     result.investigation = inv;
     log(`investigation ${inv.status}: ${inv.outputs.length} report(s), ${inv.evidence.items.size} tool call(s), ${inv.turns} turn(s), $${inv.cost.toFixed(3)}${inv.challenge ? `, challenge ${inv.challenge.verdict}` : ''}${inv.note ? ` (${inv.note})` : ''}`);
     const footer = `${monitor.agent.spec.model} · ${inv.evidence.items.size} tool calls · $${inv.cost.toFixed(2)} · run ${inv.runId}`;
-    const byKey = new Map(summary.send.map((r) => [r.key, r]));
+    const byKey = new Map(pending.map((r) => [r.key, r]));
     const ownersOf = (rep: Report) => [...new Set(rep.rows.map((k) => byKey.get(k) && o.owners?.ownerOf(byKey.get(k)!.service)).filter((x): x is string => !!x))];
     const answer: string[] = [];
     let toSlack = 0;
@@ -357,6 +396,9 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       answer.push(`### Report ${i + 1} · ${filingNote(f, r)}`, '', card.markdown, '');
     }
     log(`${toSlack} of ${inv.outputs.length} report(s) go to Slack${quiet ? ` (${quiet} as a quiet reply in an issue's thread)` : ''}`);
+    // Only now, with the reports queued: if queueing threw, the rows are still owed.
+    // Not admitted (caps, the kill switch on) or stopped (the kill switch, a cancel): deferred, not an attempt.
+    investigated(new Set(inv.outputs.flatMap((r) => r.rows)), inv.note ?? inv.status, inv.status !== 'skipped' && inv.status !== 'stopped', inv.runId);
     // get_run reads answer.md: the reports, with the issue each one went to.
     if (inv.dir && answer.length)
       try {

@@ -55,6 +55,9 @@ export interface RunInput<T> {
   user?: { name: string; usdPerDay?: number; maxRunning?: number }; // who asked (MCP)
   signal?: AbortSignal; // cancel this run (status 'stopped')
   onAdmitted?: (runId: string) => void; // called once the run is admitted, before the model starts
+  // Why the caller's last run was skipped, if that still holds (a cap, the kill
+  // switch). A skip for this same reason is returned but not recorded again.
+  heldBy?: string;
 }
 
 // A repo to read and the ref to read it at (default: origin/HEAD, else HEAD).
@@ -134,7 +137,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
   if (input.tools && hasAny(spec.builtin_tools, WEB_TOOLS)) throw new Error(`${spec.name}: credentialed tools and web tools can't share a run (Rule of Two)`);
 
   const skipped = (note: string): RunResult<T> => {
-    engine.store.skipped({ id: runId, agent: spec.name, version: agent.version, trigger: input.trigger, now, note, ...(input.user ? { user: input.user.name } : {}) });
+    if (note !== input.heldBy) engine.store.skipped({ id: runId, agent: spec.name, version: agent.version, trigger: input.trigger, now, note, ...(input.user ? { user: input.user.name } : {}) });
     return { runId, status: 'skipped', outputs: [], evidence, cost: 0, turns: 0, note };
   };
   const settleSkipped = (note: string): RunResult<T> => {

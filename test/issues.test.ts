@@ -237,6 +237,32 @@ test('linking to a resolved issue reopens it and is broadcast', async () => {
   assert.ok(w.logs.includes(`report 1 reopened ${id}: it came back (broadcast)`));
 });
 
+test('a row back after it recovered is a new episode: investigated again and reopening its issue, on the reminder cadence', async () => {
+  // Same cause only when the report covers login; anything else is a new issue.
+  const sameAsLogin: Decide = (s) => ({ issue: s.rows.includes(key('/v1/auth/login')) && s.issues[0] ? s.issues[0].id : 'new' });
+
+  // Back more than 6 h after its last report, next to a fresh row.
+  const late = setup(bot(), sameAsLogin);
+  const lateTel = schedule({ '/v1/auth/login': (t) => between(0, 0.25)(t) || between(6.5, 40)(t), '/v1/auth/signup': between(6.5, 40) });
+  const first = await late.patrol(lateTel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  assert.deepEqual((await late.patrol(lateTel, 0.25)).resolved, [id]);
+  const back = await late.patrol(lateTel, 6.5);
+  assert.deepEqual([...late.session.seen[1]!.rows].sort(), [key('/v1/auth/login'), key('/v1/auth/signup')], 'login is investigated again');
+  assert.equal(back.filed[0]?.action, 'reopened');
+  assert.equal(late.issues!.get(id)!.status, 'open');
+
+  // Back within 6 h: not on every flicker, but at its reminder, as before.
+  const soon = setup(bot(), sameAsLogin);
+  const soonTel = schedule({ '/v1/auth/login': (t) => between(0, 0.25)(t) || between(2, 40)(t), '/v1/auth/signup': between(6.25, 40) });
+  for (const h of [0, 0.25, 2, 2.25]) await soon.patrol(soonTel, h);
+  assert.equal(soon.session.seen.length, 1, 'no run for the flicker itself');
+  await soon.patrol(soonTel, 6.25);
+  assert.deepEqual([...soon.session.seen[1]!.rows].sort(), [key('/v1/auth/login'), key('/v1/auth/signup')]);
+  const again = await soon.patrol(soonTel, 12.5); // explained since: a steady reminder stays out
+  assert.equal(again.investigation, undefined);
+});
+
 test('an issue resolves when every row is back, with one recovery note in its thread', async () => {
   const tel = schedule({ '/v1/auth/login': between(0, 0.25), '/v1/ownership/transfer': between(0, 0.5) });
   const t = bot();
