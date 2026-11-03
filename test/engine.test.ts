@@ -107,6 +107,9 @@ test('malformed numbers and legacy variables stop the program instead of disabli
   assert.equal(loadConfig({ ENGINE_DAILY_CAP_USD: '7' }, root).llm.dailyCapUsd, 7);
   assert.throws(() => loadConfig({ ENGINE_MONTHLY_CAP_USD: '-1' }, root), /non-negative number/);
   assert.equal(loadConfig({ ENGINE_MONTHLY_CAP_USD: '50' }, root).llm.monthlyCapUsd, 50);
+  assert.equal(loadConfig({}, root).llm.monitorMonthlyCapUsd, 200);
+  assert.equal(loadConfig({ ENGINE_MONITOR_MONTHLY_CAP_USD: '150' }, root).llm.monitorMonthlyCapUsd, 150);
+  assert.throws(() => loadConfig({ ENGINE_MONITOR_MONTHLY_CAP_USD: '$200' }, root), /ENGINE_MONITOR_MONTHLY_CAP_USD must be a non-negative number/);
 });
 
 // ---------- evidence ----------
@@ -377,6 +380,20 @@ test('the monthly cap sums every day of the UTC month and resets on the 1st', ()
   assert.equal(adm('d', '2026-11-01T00:00:00Z', 3).ok, true);
 });
 
+test("an agent's monthly share stops that agent only: the rest of the monthly cap stays for the others", () => {
+  const s = new Store(':memory:');
+  const adm = (id: string, agent: string, at: string, reserve: number) =>
+    s.admit({ id, agent, version: 'v', trigger: 't', now: new Date(at), deadlineMs: 60_000, reserve, agentCap: 100, ...(agent === 'monitor' ? { agentMonthlyCap: 8 } : {}), globalCap: 100, monthlyCap: 10 });
+  const done = (id: string, cost: number) => s.settle(id, { status: 'ok', cost, turns: 1, outputs: 1, now: new Date() });
+  assert.equal(adm('m1', 'monitor', '2026-10-02T10:00:00Z', 4).ok, true);
+  done('m1', 4);
+  assert.equal(adm('m2', 'monitor', '2026-10-20T10:00:00Z', 4).ok, true); // other day, same month
+  done('m2', 3.5);
+  assert.match((adm('m3', 'monitor', '2026-10-21T10:00:00Z', 1) as { reason: string }).reason, /^agent monthly cap \$8 reached$/);
+  assert.equal(adm('p1', 'prod', '2026-10-21T10:00:00Z', 2).ok, true, "people's runs still fit under the monthly cap");
+  assert.equal(adm('m4', 'monitor', '2026-11-01T00:00:00Z', 4).ok, true, 'a new month, a new share');
+});
+
 test('skips are recorded with a reason: no credentials, caps, STOP, busy', async () => {
   const d = agentDir(`${web}\nlimits: { usd_per_run: 1, usd_per_day: 3 }`);
   const e = engine(fakeSession(), { now: () => new Date('2026-10-14T11:00:00Z') });
@@ -387,6 +404,7 @@ test('skips are recorded with a reason: no credentials, caps, STOP, busy', async
   assert.match((await runAgent(e, { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput })).note!, /agent daily cap/);
   assert.match((await runAgent(engine(fakeSession(), { dailyCapUsd: 0.5 }), { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput })).note!, /global daily cap/);
   assert.match((await runAgent(engine(fakeSession(), { monthlyCapUsd: 0.5 }), { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput })).note!, /monthly cap/);
+  assert.match((await runAgent(engine(fakeSession(), { agentMonthlyCapUsd: { demo: 0.5 } }), { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput })).note!, /agent monthly cap \$0\.5 reached/);
   assert.match((await runAgent(engine(fakeSession(), { llmAvailable: false }), { agent: loadAgent(d), trigger: 't', task: 'q', output: findingsOutput })).note!, /no LLM credentials/);
   assert.ok(e.store.recent(10).some((r) => r.status === 'skipped' && /cap/.test(r.note ?? '')));
 });

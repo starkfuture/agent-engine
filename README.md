@@ -135,6 +135,14 @@ Slack gets at most 10 lines to look at, 6 ongoing and 8 quiet, cut at whole line
 
 **Owners** (`config/owners.yaml`, or `SRE_OWNERS_FILE`) map a service name, a `prefix-*` or a `/regex/` to `<@U…>` (a person) or `<!subteam^S…>` (a user group). Lines to look at mention the owner and the summary line lists everyone mentioned; a service that matches nothing gets no mention. Only these two forms load (anything else, such as `<!channel>`, stops the engine), and they are the only text on the card that reaches Slack unescaped. `mentions: false` in the file turns them off. The shipped file has examples only.
 
+**On-call** (`SLACK_ONCALL`) is one Slack user id (`U…`) or user-group id (`S…`). Code adds it as `<@U…>` or `<!subteam^S…>` to posts that need a person now:
+- a new issue rated critical;
+- an issue raised to critical;
+- an issue back as critical after it recovered;
+- an urgent rows card with a protected journey (`never_suppress`).
+
+Repeats in an issue's thread, reminders, majors, minors and recoveries never mention it. A protected rows card and a critical report in the same patrol can both mention the on-call, on purpose: a lost page is worse than a second one. The mention works with the bot and the webhook. Model text stays escaped, so the model can't mention anyone. Unset means no mention. Anything other than one id stops the engine.
+
 ## Run it
 
 ```bash
@@ -189,6 +197,7 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 - **PII and secrets are redacted** before anything reaches the model, a card or disk. Log text is fenced as untrusted data.
 - **Reports are checked in code:** the zod schema, cited evidence ids must exist, row keys must be real, a linked issue must be one the investigator was shown, and a critical report must have measured impact.
 - **Spend is capped** by the engine: `agents/monitor/agent.yaml` limits plus `ENGINE_DAILY_CAP_USD` and `ENGINE_MONTHLY_CAP_USD` (all agents). Set a spend limit on the Anthropic workspace too: the SDK checks a run's budget between turns, so one run can overshoot by a turn. The patrol keeps reporting when a cap is reached.
+- **The monitor gets only part of the month.** `ENGINE_MONITOR_MONTHLY_CAP_USD` (default 200) is its share of `ENGINE_MONTHLY_CAP_USD`. Past it, the patrol runs without the AI, as at any other cap, and urgent rows are still posted. The rest of the month stays for people's questions over MCP. The `spend` tool shows it: `monitor $31.44 of $200 this month (the other $50 of $250 is kept for people)`.
 
 ## Not built yet
 

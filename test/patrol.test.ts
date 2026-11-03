@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { test } from 'node:test';
 import type { Config } from '../src/config.js';
 import { checkReport, type Report } from '../src/investigate/report.js';
@@ -13,6 +13,7 @@ import { State } from '../src/patrol/state.js';
 import { buildSummary, renderSummary } from '../src/patrol/summary.js';
 import { loadAgent } from '../src/engine/agent.js';
 import { Store } from '../src/engine/store.js';
+import type { Engine } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
 import type { FlaggedRow } from '../src/patrol/summary.js';
 import { needsChallenge, patrolOnce, type MonitorAgent, patrolLoop } from '../src/runner.js';
@@ -166,6 +167,38 @@ test('the rows card goes out before the AI; reports cite real tool results; prot
   assert.equal(session.requests[0]!.builtin.length, 0, 'monitor gets no built-in tools');
 });
 
+test('past its monthly share the monitor patrols without the AI, exactly as at any other cap, and the urgent rows card still goes out', async () => {
+  const patrol = async (caps: Partial<Engine>) => {
+    const c = cfg();
+    const sent: string[] = [];
+    const box = new SlackOutbox(':memory:', { threads: true, post: async (m) => { sent.push(m.text); return `ts${sent.length}`; } }, { sleep: async () => {}, gapMs: 0 });
+    const session = fakeSession();
+    const m = monitor(c, session);
+    Object.assign(m.engine, { now: () => new Date('2026-09-29T12:15:30Z'), ...caps });
+    // The monitor has spent $8 this month.
+    m.engine.store.admit({ id: 'earlier', agent: 'monitor', version: 'v', trigger: 'patrol', now: new Date('2026-09-10T10:00:00Z'), deadlineMs: 60_000, reserve: 8, agentCap: 25, globalCap: 25 });
+    m.engine.store.settle('earlier', { status: 'ok', cost: 8, turns: 1, outputs: 1, now: new Date('2026-09-10T10:05:00Z') });
+    const r = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir, box), new Date('2026-09-29T12:15:00Z'), { llm: true, post: true }, m);
+    return { r, sent, session };
+  };
+  const share = await patrol({ monthlyCapUsd: 250, agentMonthlyCapUsd: { monitor: 10 } });
+  assert.equal(share.r.investigation?.status, 'skipped');
+  assert.equal(share.r.skippedLlm, 'investigator skipped: agent monthly cap $10 reached');
+  assert.equal(share.session.requests.length, 0, 'no model call');
+  assert.equal(share.r.cards.length, 1);
+  assert.ok(share.r.cards[0]!.endsWith('-rows.md'));
+  assert.deepEqual(share.r.slack, share.r.cards, 'the urgent rows card went to Slack');
+  assert.equal(share.sent.length, 1);
+
+  const month = await patrol({ monthlyCapUsd: 10 }); // what any cap did before the share existed
+  assert.equal(month.r.skippedLlm, 'investigator skipped: monthly cap $10 reached');
+  assert.deepEqual(share.sent, month.sent, 'the same card, the same posts');
+  assert.deepEqual(
+    [share.r.filed, share.r.resolved, share.r.cards.map((f) => basename(f)), share.r.investigation?.outputs],
+    [month.r.filed, month.r.resolved, month.r.cards.map((f) => basename(f)), month.r.investigation?.outputs],
+  );
+});
+
 test('challenge gate is deterministic: an unprotected modest spike is not challenged', () => {
   const row = { key: 'k', section: 'http', service: 's', subject: '/v1/products', status: '404', counts: { now: 30, h1: 2, d1: 2, d7: 2 }, score: { verdict: 'spike', expected: 2, z: 9, trend: 'started' }, novelty: 'fresh', firstSeen: '' } as unknown as FlaggedRow;
   assert.equal(needsChallenge([row], new Noise({})), false);
@@ -203,6 +236,27 @@ test('without the AI only urgent rows reach Slack', async () => {
   assert.equal(small.summary.send.length, 2);
   assert.equal(small.cards.length, 1, 'the rows card is still written');
   assert.deepEqual(small.slack, []);
+});
+
+test('the urgent rows card mentions the on-call only when it holds a protected journey', async () => {
+  const rowsCard = async (noise: Noise, oncall?: string, owners?: Owners) => {
+    const c: Config = { ...cfg(), slackOncall: oncall };
+    const sent: Array<{ text: string; blocks: unknown[] }> = [];
+    const box = new SlackOutbox(':memory:', { threads: true, post: async (m) => { sent.push(m); return `ts${sent.length}`; } }, { sleep: async () => {}, gapMs: 0 });
+    await patrolOnce(new FakeTelemetry(world), c, noise, State.memory(), new CardSink(c.outDir, box), new Date('2026-09-29T12:15:00Z'), { llm: false, post: true, owners });
+    assert.equal(sent.length, 1, 'the rows card');
+    return sent[0]!;
+  };
+  const resetProtected = new Noise({ never_suppress: [{ section: 'http', route: '.*reset.*', status: '4..' }] });
+  const paged = await rowsCard(resetProtected, '<@U0ONCALL1>');
+  assert.match(paged.text, /^Patrol 2026-09-29 12:15Z: [^<]* · cc <@U0ONCALL1>$/);
+  assert.match(JSON.stringify(paged.blocks), /"text":"\*Patrol 2026-09-29 12:15Z: [^"<]*\* · cc <@U0ONCALL1>"/);
+  const spike = await rowsCard(new Noise({}), '<@U0ONCALL1>'); // urgent as a big spike, but nothing protected
+  assert.ok(!JSON.stringify(spike).includes('U0ONCALL1'));
+  const unset = await rowsCard(resetProtected);
+  assert.ok(!/<[@!]/.test(JSON.stringify(unset)), 'no SLACK_ONCALL: no mention, as before');
+  const owner = await rowsCard(resetProtected, '<@U0ONCALL1>', new Owners({ owners: { 'backend-*': '<@U0ONCALL1>' } }));
+  assert.match(owner.text, / · cc <@U0ONCALL1>$/, 'the on-call who also owns the service is mentioned once');
 });
 
 test('Slack down: the patrol still finishes and marks its rows, and the queued card goes out next patrol', async () => {

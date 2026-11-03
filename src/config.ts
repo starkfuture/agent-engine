@@ -60,6 +60,9 @@ export interface Config {
     // Across all agents. Per-agent limits live in agents/<name>/agent.yaml.
     dailyCapUsd: number;
     monthlyCapUsd: number;
+    // The monitor's share of monthlyCapUsd. Past it the patrol runs without the
+    // AI, and the rest of the month's budget stays for people's questions.
+    monitorMonthlyCapUsd: number;
   };
   agentsDir: string;
   memoryDir: string | undefined; // runtime lessons and proposals (a persistent volume when hosted); unset = in the agent folders
@@ -70,6 +73,9 @@ export interface Config {
   // The Slack bot (chat.postMessage, threads); the webhook is the fallback when unset.
   slackBotToken: string | undefined;
   slackChannel: string | undefined; // channel id, e.g. C0…
+  // SLACK_ONCALL as a mention (<@U…> or <!subteam^S…>), added by code to posts
+  // that need a person now (src/runner.ts); unset = no mention.
+  slackOncall: string | undefined;
   mcp: {
     usersFile: string; // hashed tokens, one per person (gitignored)
     reposFile: string; // repos the codebase agent may read on this host (gitignored)
@@ -129,6 +135,16 @@ function slackBot(env: NodeJS.ProcessEnv): Pick<Config, 'slackBotToken' | 'slack
   return { slackBotToken: token, slackChannel: channel };
 }
 
+// SLACK_ONCALL: one user id (U…, W…) or user-group id (S…), nothing else: it
+// reaches Slack unescaped, so it must never become <!channel> or a link.
+function oncall(env: NodeJS.ProcessEnv): string | undefined {
+  const id = opt(env.SLACK_ONCALL?.trim());
+  if (!id) return undefined;
+  if (/^[UW][A-Z0-9]{2,20}$/.test(id)) return `<@${id}>`;
+  if (/^S[A-Z0-9]{2,20}$/.test(id)) return `<!subteam^${id}>`;
+  throw new Error(`SLACK_ONCALL: "${id}" is not a Slack user id (U…) or user-group id (S…)`);
+}
+
 const LOGIN_VARS = ['KEYCLOAK_JWKS_URL', 'ENGINE_KC_CLIENT_ID', 'KEYCLOAK_SCOPES'];
 function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   const issuer = opt(env.KEYCLOAK_ISSUER)?.replace(/\/+$/, '');
@@ -184,6 +200,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
       available: Boolean(env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_USE_BEDROCK === '1'),
       dailyCapUsd: num(env.ENGINE_DAILY_CAP_USD, 30, 'ENGINE_DAILY_CAP_USD'),
       monthlyCapUsd: num(env.ENGINE_MONTHLY_CAP_USD, 300, 'ENGINE_MONTHLY_CAP_USD'),
+      monitorMonthlyCapUsd: num(env.ENGINE_MONITOR_MONTHLY_CAP_USD, 200, 'ENGINE_MONITOR_MONTHLY_CAP_USD'),
     },
     agentsDir: r(env.ENGINE_AGENTS_DIR ?? 'agents'),
     memoryDir: env.ENGINE_MEMORY_DIR ? r(env.ENGINE_MEMORY_DIR) : undefined,
@@ -192,6 +209,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     retentionDays: num(env.ENGINE_RETENTION_DAYS, 30, 'ENGINE_RETENTION_DAYS'),
     slackWebhookUrl: opt(env.SLACK_WEBHOOK_URL),
     ...slackBot(env),
+    slackOncall: oncall(env),
     mcp: {
       usersFile: r(env.ENGINE_USERS_FILE ?? 'config/users.local.json'),
       reposFile: r(env.ENGINE_REPOS_FILE ?? 'config/repos.local.yaml'),

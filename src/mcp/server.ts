@@ -280,10 +280,20 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
     async () => {
       const st = ctx.engine.store;
       const d = today();
-      const agents = agentsHere(ctx).map((a) => `  ${a.spec.name.padEnd(9)} $${st.spent(d, a.spec.name).toFixed(2)} of $${a.spec.limits.usd_per_day}`);
+      const here = agentsHere(ctx);
+      const agents = here.map((a) => `  ${a.spec.name.padEnd(9)} $${st.spent(d, a.spec.name).toFixed(2)} of $${a.spec.limits.usd_per_day}`);
+      // An agent's monthly share (the monitor's): what it leaves of the monthly cap is kept for people.
+      const month = ctx.engine.monthlyCapUsd;
+      const shares = here.flatMap((a) => {
+        const cap = ctx.engine.agentMonthlyCapUsd?.[a.spec.name];
+        if (cap === undefined) return [];
+        const kept = month !== undefined && month > cap ? ` (the other $${month - cap} of $${month} is kept for people)` : '';
+        return [`${a.spec.name} $${st.spent(d.slice(0, 7), a.spec.name).toFixed(2)} of $${cap} this month${kept}`];
+      });
       return text(
         [
           `today: $${st.spent(d).toFixed(2)} of $${ctx.engine.dailyCapUsd} · this month: $${st.spent(d.slice(0, 7)).toFixed(2)} of $${ctx.engine.monthlyCapUsd ?? '∞'}`,
+          ...shares,
           `you today: $${st.spent(d, undefined, user.name).toFixed(2)} of $${user.usd_per_day ?? ctx.cfg.mcp.userDailyCapUsd}`,
           'by agent today:',
           ...agents,

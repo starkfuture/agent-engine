@@ -287,6 +287,23 @@ test('per-person caps: daily spend and runs at once', async () => {
   assert.equal(ctx.engine.store.recent(10).filter((r) => r.status === 'running').length, 0);
 });
 
+test("spend shows the monitor's monthly share and what it keeps for people, who still get runs once the monitor is at it", async () => {
+  const { ctx, who } = context(fakeSession(researchOk));
+  ctx.engine.agentMonthlyCapUsd = { monitor: 80 }; // of the $100 monthly cap
+  ctx.engine.dailyCapUsd = 1000; // the monitor's spend lands today; only the month matters here
+  const st = ctx.engine.store;
+  st.admit({ id: 'patrols', agent: 'monitor', version: 'v', trigger: 'patrol', now: new Date(), deadlineMs: 60_000, reserve: 80, agentCap: 100, globalCap: 100 });
+  st.settle('patrols', { status: 'ok', cost: 79.5, turns: 1, outputs: 1, now: new Date() });
+  const ana = await connect(ctx, who('ana'));
+  assert.match((await ana.call('spend')).text, /^monitor \$79\.50 of \$80 this month \(the other \$20 of \$100 is kept for people\)$/m);
+  const r = await ana.call('run_agent', { agent: 'research', task: 'Where is feature X configured?', wait_seconds: 10 });
+  assert.match(r.text, /: ok/, r.text);
+  // A deployment that doesn't run the monitor doesn't show its share.
+  const web = context(fakeSession(), { agents: ['research'] });
+  web.ctx.engine.agentMonthlyCapUsd = { monitor: 80 };
+  assert.doesNotMatch((await (await connect(web.ctx, web.who('ana'))).call('spend')).text, /monitor/);
+});
+
 test('the requester is mentioned in Slack when the run ends, with a cleaned, escaped title', async () => {
   const sent: string[] = [];
   const s = fakeSession(async function* (sim) {

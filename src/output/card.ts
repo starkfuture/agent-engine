@@ -34,9 +34,10 @@ export interface IssueRef {
   from?: Report['severity']; // with 'raised': the severity before
 }
 
-// `cc`: owner mentions from the owners file (validated there), the only text
-// that reaches Slack unescaped. `issue`: a new issue shows its id; an update on
-// an existing one is headed by that issue, not by this report's title.
+// `cc`: the on-call (SLACK_ONCALL) and owner mentions from the owners file
+// (each validated where it is loaded), the only text that reaches Slack
+// unescaped. `issue`: a new issue shows its id; an update on an existing one
+// is headed by that issue, not by this report's title.
 export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult, cc: string[] = [], issue?: IssueRef): Card {
   const r: Report = {
     ...raw,
@@ -143,9 +144,10 @@ export function brief(s: string, n: number): string {
 // ---- the patrol card ------------------------------------------------------------
 // Code's own card, posted before (or without) the LLM: one summary line, then
 // what to look at by severity, what is still going on, and what is too small to
-// page anyone. Only owner mentions from the owners file reach Slack unescaped.
+// page anyone. Only the on-call and owners-file mentions reach Slack unescaped.
 export interface PatrolCardOptions extends DigestOptions {
   owners?: Owners | undefined;
+  oncall?: string | undefined; // the on-call mention (SLACK_ONCALL), first in cc; the caller decides when
   ref?: string | undefined; // where the full list is, shown when lines were cut
 }
 
@@ -211,7 +213,7 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
   const floor = o.floor ?? DEFAULT_FLOOR;
   const owner = (l: Line) => o.owners?.ownerOf(l.service);
   const mentions = (ls: Line[]) => uniq(ls.map(owner).filter((x): x is string => !!x));
-  const cc = mentions(d.look);
+  const cc = uniq([...(o.oncall ? [o.oncall] : []), ...mentions(d.look)]);
   const n = d.counts;
   const title = `Patrol ${minute(s.at)}: ${[n.look ? `${n.look} to look at` : 'nothing new to look at', n.ongoing ? `${n.ongoing} still ongoing` : '', n.quiet ? `${n.quiet} quiet` : ''].filter(Boolean).join(' · ')}`;
   const down = s.sources.filter((x) => !x.ok).map((x) => x.source);

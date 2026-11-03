@@ -162,6 +162,16 @@ test('config: the bot token needs its channel id, and both are checked', async (
   assert.throws(() => loadConfig({ SLACK_BOT_TOKEN: 'xoxb-1', SLACK_CHANNEL_ID: '#prod-monitor' }), /not a channel id/);
 });
 
+test('config: SLACK_ONCALL is one user or user-group id, rendered as its mention; unset means none', async () => {
+  const { loadConfig } = await import('../src/config.js');
+  assert.equal(loadConfig({}).slackOncall, undefined);
+  assert.equal(loadConfig({ SLACK_ONCALL: '' }).slackOncall, undefined);
+  assert.equal(loadConfig({ SLACK_ONCALL: 'U0ONCALL1' }).slackOncall, '<@U0ONCALL1>');
+  assert.equal(loadConfig({ SLACK_ONCALL: ' S0ONCALL1 ' }).slackOncall, '<!subteam^S0ONCALL1>');
+  for (const bad of ['<@U0ONCALL1>', '<!channel>', 'channel', 'here', '@oncall', 'C0CHANNEL1', 'u0oncall1', 'U0ONCALL1,S0ONCALL1', 'S0ONCALL1|@team'])
+    assert.throws(() => loadConfig({ SLACK_ONCALL: bad }), /SLACK_ONCALL: .* is not a Slack user id \(U…\) or user-group id \(S…\)/, bad);
+});
+
 test('two senders sharing a database deliver each entry once and preserve thread order', async () => {
   const file = join(mkdtempSync(join(tmpdir(), 'outbox-')), 'engine.db');
   const sent: Sent[] = [];

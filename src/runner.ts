@@ -97,6 +97,15 @@ export function postFor(f: Filing, r: Report): EmitSlack | undefined {
   return { kind: 'report', keys: r.rows, broadcast: true, issue: f.issue.id };
 }
 
+// Posts that @mention the on-call (SLACK_ONCALL): critical news only, as a new
+// issue, a rise to critical or a return as critical. Never a quiet repeat, a
+// reminder, a major or a recovery. Without an issue record, a critical report
+// the model calls new.
+export function pagesOncall(f: Filing, r: Report): boolean {
+  if (r.severity !== 'critical') return false;
+  return f.action === 'opened' || f.action === 'raised' || f.action === 'reopened' || (f.action === 'none' && r.issue === 'new');
+}
+
 const issueRef = (f: Filing): IssueRef | undefined =>
   f.action === 'none' ? undefined : { id: f.issue.id, title: f.issue.title, change: f.action === 'opened' ? 'new' : f.action === 'linked' || f.action === 'reminded' ? 'update' : f.action, ...(f.action === 'raised' ? { from: f.from } : {}) };
 
@@ -198,8 +207,11 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
 
   // Code's own card goes to Slack only for urgent rows, and first: the AI never
   // delays or hides those. Otherwise it stays on disk and the AI's reports decide.
+  // A protected journey among the urgent rows needs a person now: the card mentions the on-call.
+  const oncall = urgentRows.some((r) => noise.protected(r)) ? cfg.slackOncall : undefined;
   const card = patrolCard(summary, skip ? `not investigated: ${skip}` : 'AI investigation started', {
     owners: o.owners,
+    oncall,
     floor: cfg.attentionFloor,
     protected: (r) => noise.protected(r),
     ref: `patrols/${stamp(summary.at)}.md`,
@@ -257,7 +269,8 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     for (const [i, r] of inv.outputs.entries()) {
       const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId), { action: 'none' }) : { action: 'none' };
       result.filed.push(f);
-      const card = reportCard(r, summary.at, footer, inv.challenge, ownersOf(r), issueRef(f));
+      const cc = [...new Set([...(cfg.slackOncall && pagesOncall(f, r) ? [cfg.slackOncall] : []), ...ownersOf(r)])];
+      const card = reportCard(r, summary.at, footer, inv.challenge, cc, issueRef(f));
       const post = postFor(f, r);
       emit(card, `${stamp(summary.at)}-${i + 1}`, post);
       if (post) toSlack++;
