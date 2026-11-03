@@ -289,7 +289,7 @@ test('the report card carries the deploys line it is given, in the file and in S
   assert.doesNotMatch(reportCard(report(), '2026-09-29T12:15:00Z', 'footer').markdown, /Deploys/);
 });
 
-test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app and a failed sync are urgent rows, the first sync of a phase counts, and a missing scrape is blind', async () => {
+test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app and a failed sync are urgent rows, the first sync of a phase counts but not a counter that only became visible, and a missing scrape is blind', async () => {
   const off = cluster([]);
   const s = await buildSummary(off, cfg(), new Noise({}), State.memory(), AT);
   assert.ok(!off.calls.some((q) => q.includes('argocd')));
@@ -301,11 +301,19 @@ test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app a
   const argo = (q: string, at: Date) => {
     if (q.startsWith('count(argocd_app_info')) return [{ labels: {}, value: 232 }];
     if (q.startsWith('count_over_time(argocd_app_info')) return [{ labels: { ...app, health_status: 'Degraded' }, value: 5 }];
-    if (q.includes('argocd_app_sync_total{phase=~"Error|Failed"}')) return [{ labels: { name: ECOM.workload, phase: 'Failed' }, value: 1 }];
+    // A counter that only became visible (the scrape began after the window's start) is not a sync in the window:
+    // web-admin's 7 failures and frontend-next's 48 syncs since the controller started.
+    const visibleOnly = !q.includes(' and on (name) argocd_app_info offset ');
+    if (q.includes('argocd_app_sync_total{phase=~"Error|Failed"}'))
+      return [{ labels: { name: ECOM.workload, phase: 'Failed' }, value: 1 }, ...(visibleOnly ? [{ labels: { name: 'web-admin-production', phase: 'Failed' }, value: 7 }] : [])];
     if (q.startsWith('count by (name, sync_status, health_status)')) return [{ labels: { ...app, health_status: 'Degraded' }, value: 1 }];
     // The context's syncs: ecom failed again; keycloak synced for the first time since the controller started (a new series).
     if (q.startsWith('(sum by (name, phase) (increase(argocd_app_sync_total{}[360m])) > 0'))
-      return [{ labels: { name: ECOM.workload, phase: 'Failed' }, value: 1 }, ...(q.includes(' unless argocd_app_sync_total{} offset 360m') ? [{ labels: { name: 'keycloak-production', phase: 'Succeeded' }, value: 1 }] : [])];
+      return [
+        { labels: { name: ECOM.workload, phase: 'Failed' }, value: 1 },
+        ...(q.includes(' unless argocd_app_sync_total{} offset 360m') ? [{ labels: { name: 'keycloak-production', phase: 'Succeeded' }, value: 1 }] : []),
+        ...(visibleOnly ? [{ labels: { name: 'frontend-next-production', phase: 'Succeeded' }, value: 48 }] : []),
+      ];
     return world(q, at);
   };
   const on = await buildSummary(cluster([], argo), c, new Noise({}), State.memory(), AT);
@@ -315,7 +323,7 @@ test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app a
   // argocd_app_sync_total has no dest_namespace: it is matched to the apps by name.
   const failed = on.send.find((r) => r.subject === 'argocd sync')!.query!;
   assert.match(failed, /\) and on \(name\) argocd_app_info\{dest_namespace=~"microservices"\}$/);
-  assert.match(failed, /unless argocd_app_sync_total\{phase=~"Error\|Failed"\} offset 15m/, "an app's first failure is a new series");
+  assert.match(failed, /unless argocd_app_sync_total\{phase=~"Error\|Failed"\} offset 15m\) and on \(name\) argocd_app_info offset 15m\)/, "an app's first failure is a new series, if the app was scraped at the window's start");
   assert.ok(![...failed.matchAll(/argocd_app_sync_total\{([^}]*)\}/g)].some((m) => m[1]!.includes('dest_namespace')));
 
   const blind = await buildSummary(cluster([]), c, new Noise({}), State.memory(), AT);

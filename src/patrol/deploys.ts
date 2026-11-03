@@ -103,11 +103,15 @@ const statefulsetsQuery = (src: Sources, workload?: string) => {
 // does not depend on the scrape interval).
 const degradedQuery = (src: Sources) => `count_over_time(argocd_app_info{${dest(src)},health_status=~"Degraded|Missing"}[5m:1m]) >= 5`;
 
-// A sync that ended Error or Failed in the window. A phase's counter appears
-// with its first sync, so a series new in the window counts too: increase()
-// needs two samples and would miss an app's first failure.
+// Syncs in the window, by app and phase (failedSyncQuery: those that ended Error
+// or Failed). A phase's counter appears with its first sync, so a series new in
+// the window counts too: increase() needs two samples and would miss an app's
+// first failure. Only while the app was already scraped at the window's start:
+// a counter that merely became visible (the scrape began, or Prometheus missed
+// that moment) carries its count since the controller started, not the window's
+// (live 2026-11-03: frontend-next 48, ecom 42 in "24 h", hours after the scrape began).
 const syncsQuery = (src: Sources, selector: string, windowMin: number) =>
-  `(sum by (name, phase) (increase(${selector}[${windowMin}m])) > 0 or sum by (name, phase) (${selector} unless ${selector} offset ${windowMin}m)) and ${inDest(src)}`;
+  `(sum by (name, phase) (increase(${selector}[${windowMin}m])) > 0 or sum by (name, phase) ((${selector} unless ${selector} offset ${windowMin}m) and on (name) argocd_app_info offset ${windowMin}m)) and ${inDest(src)}`;
 const failedSyncQuery = (src: Sources, windowMin: number) => syncsQuery(src, 'argocd_app_sync_total{phase=~"Error|Failed"}', windowMin);
 
 // ---- rows: stalled rollouts, Argo CD apps (urgent) --------------------------
