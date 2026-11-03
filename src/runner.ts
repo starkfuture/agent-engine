@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { Config } from './config.js';
 import type { Telemetry } from './clients/telemetry.js';
 import type { LoadedAgent } from './engine/agent.js';
-import { verdictOn } from './engine/challenge.js';
+import { notRun, verdictOn } from './engine/challenge.js';
 import { runAgent, type Engine, type RunResult } from './engine/run.js';
 import { monitorTask } from './investigate/prompt.js';
 import { checkReport, Report, ReportShape } from './investigate/report.js';
@@ -430,19 +430,28 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId, filed), { action: 'none' }) : { action: 'none' };
       result.filed.push(f);
       const cc = [...new Set([...(cfg.slackOncall && pagesOncall(f, r) ? [cfg.slackOncall] : []), ...ownersOf(r)])];
-      const card = reportCard(r, summary.at, footer, inv.challenge, cc, issueRef(f), recentDeploys(summary.deploys), item);
       const post = postFor(f, r);
+      // What the channel sees of it: a new message or a broadcast reply, or a
+      // repeat about an issue that never reached Slack (its first post). The
+      // filing can differ from what the check was decided on (the record failed:
+      // a post of its own). Shown with no challenge, it is marked not verified.
+      const visible = !!post && (post.broadcast || (!!post.issue && o.post && !record('reading the outbox', () => sink.outbox?.reached(post.issue!) ?? true, false)));
+      const unchecked = visible && !inv.challenge;
+      const card = reportCard(r, summary.at, footer, unchecked ? notRun('it became news after the check was decided') : inv.challenge, cc, issueRef(f), recentDeploys(summary.deploys), item);
       emit(card, `${stamp(summary.at)}-${i + 1}`, post);
       // Back from resolved, or Not an issue ended: its buttons are back.
       if (o.post && (f.action === 'reopened' || (f.action === 'raised' && f.unmuted))) sink.outbox?.updateRoot(f.issue.id);
       if (post) toSlack++;
       if (post?.repeat) quiet++;
-      const note = `${filingNote(f, r)}${!fails ? '' : kept ? '; the second check says it does not hold up, posted anyway: a protected journey' : `; was ${out.severity}, the second check says it does not hold up`}`;
-      if (o.issues || fails) log(`report ${i + 1} ${note}`);
+      const note = `${filingNote(f, r)}${!fails ? '' : kept ? '; the second check says it does not hold up, posted anyway: a protected journey' : `; was ${out.severity}, the second check says it does not hold up`}${unchecked ? '; not verified: no second check ran' : ''}`;
+      if (o.issues || fails || unchecked) log(`report ${i + 1} ${note}`);
       answer.push(`### Report ${i + 1} · ${note}`, '', card.markdown, '');
     }
     log(`${toSlack} of ${inv.outputs.length} report(s) go to Slack${quiet ? ` (${quiet} as a quiet reply in an issue's thread)` : ''}${held ? `; ${held} held back by the second check` : ''}`);
     // Only now, with the reports queued: if queueing threw, the rows are still owed.
+    // A report the challenger says doesn't hold up still covers its rows: it is
+    // kept as minor, and asking again would bring the same report back for
+    // another challenge. Its rows are owed again when worse or after they recover.
     // Not admitted (caps, the kill switch on) or stopped (the kill switch, a cancel): deferred, not an attempt.
     investigated(new Set(inv.outputs.flatMap((r) => r.rows)), inv.note ?? inv.status, inv.status !== 'skipped' && inv.status !== 'stopped', inv.runId);
     // get_run reads answer.md: the reports, with the issue each one went to.

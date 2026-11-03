@@ -694,6 +694,30 @@ test("a repeat about an issue Slack never took is that issue's first post in the
   assert.match(JSON.stringify(t.sent[0]!.blocks), /second check agrees/);
 });
 
+test('a report that becomes news only after the check was decided (the record failed) is posted, marked not verified', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(2, 40) });
+  const t = recorder(true);
+  const w = setup(t, linker());
+  await w.patrol(tel, 0); // opens the issue, challenged
+  // The record fails once while the report is filed: a lock, say.
+  const issues = w.issues!;
+  const link = issues.link.bind(issues);
+  issues.link = () => {
+    issues.link = link;
+    throw new Error('database is locked');
+  };
+  const sibling = await w.patrol(tel, 2); // a quiet repeat when the check was decided
+  assert.equal(sibling.investigation?.challenge, undefined, 'not challenged: it was going to be a quiet reply');
+  assert.equal(w.session.challenges.length, 1, 'and no second challenge run now');
+  assert.deepEqual(sibling.filed, [{ action: 'none' }], 'the record failed: posted on its own');
+  assert.ok(w.logs.includes('issues: filing report 1 failed: database is locked'));
+  assert.ok(w.logs.includes('report 1 no issue record: posted on its own; not verified: no second check ran'));
+  assert.equal(t.sent.length, 2);
+  assert.equal(t.sent[1]!.thread_ts, undefined, 'shown in the channel');
+  assert.match(JSON.stringify(t.sent[1]!.blocks), /not verified by a second check/);
+  assert.match(readFileSync(sibling.cards.at(-1)!, 'utf8'), /Not verified: the challenge did not complete \(not run: it became news after the check was decided\)\./);
+});
+
 const BOT = 'The 400s are one bot retrying a bad payload.';
 const doesNotHold: Judge = ({ mine }) => ({ items: [{ item: 1, holds: 'no', reason: BOT, evidence: [mine] }], overall: 'Does not hold up.' });
 
@@ -712,6 +736,15 @@ test('"does not hold up": not posted, minor in get_run, and no issue opened', as
   assert.match(got, /### Report 1 · minor: not posted; was major, the second check says it does not hold up\n\n## 🟡 Sign-in rejects emails/);
   assert.match(got, /\*\*Severity:\*\* minor/);
   assert.match(got, new RegExp(`On this report: does not hold up\\. ${BOT.replaceAll('.', '\\.')}`));
+});
+
+test('a report that does not hold up still covers its rows: they are not owed another run until they get worse', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const w = setup(recorder(true), linker(), { judge: doesNotHold });
+  await w.patrol(tel, 0);
+  assert.equal(w.state.data.rows[key('/v1/auth/login')]!.investigation?.status, 'complete');
+  await w.patrol(tel, 6.25); // its 6-hour reminder: still firing, not worse
+  assert.equal(w.session.seen.length, 1, 'no second AI run on it');
 });
 
 test('"partly holds": posted, with the objections on the card', async () => {
