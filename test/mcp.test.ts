@@ -498,6 +498,11 @@ test('get_run on a monitor run: reports from before answer.md, an unreadable cha
   assert.match(recent, /Slack delivery: unknown/);
   assert.match(recent, /### Report 1 · opened I-7f3a \(major\)/);
 
+  // Any agent's challenge shows its dissent on single items, with reason and evidence.
+  const items = [{ item: 1, holds: 'no', reason: 'The pool was never full', evidence: ['E-abcd-2'] }, { item: 2, holds: 'partly', reason: 'Only one pod', evidence: [] }, { item: 3, holds: 'yes', reason: 'Fine', evidence: [] }];
+  run('20261103T103000Z-research-abcdef', 'research', { 'answer.md': '# The answer\n', 'challenge.json': JSON.stringify({ ...challenge, blocking: [], items }) });
+  assert.ok((await call('get_run', { run_id: '20261103T103000Z-research-abcdef' })).text.endsWith('## Challenge: escalate\nThe cause is disputed\n- Item 1 does not hold up: The pool was never full (E-abcd-2)\n- Item 2 partly holds: Only one pod'));
+
   // Other agents' runs are not reports, and a private run stays private.
   run('20261103T100000Z-research-abcdef', 'research', { 'output.json': JSON.stringify([answer('E-abcd-1', 'quote')]) }, 'bo');
   const research = (await call('get_run', { run_id: '20261103T100000Z-research-abcdef' })).text;

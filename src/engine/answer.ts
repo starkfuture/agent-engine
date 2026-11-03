@@ -4,23 +4,26 @@ import { z } from 'zod';
 import { Report } from '../investigate/report.js';
 import { reportCard } from '../output/card.js';
 import type { LoadedAgent } from './agent.js';
-import { verdictOn, type ChallengeResult } from './challenge.js';
+import { finished, itemDissent, verdictOn, type ChallengeResult } from './challenge.js';
 import { renderFindings, type Findings } from './output.js';
 import type { RunResult } from './run.js';
 import type { RunRow } from './store.js';
 import { redact, stripImages } from './text.js';
 
 // The human-readable answer of a findings run, with the challenger's blocking
-// objections as dissent. Written to answer.md in the run folder. Images are
+// objections and its "no" or "partly" on the answer as dissent. Written to
+// answer.md in the run folder. Images are
 // removed (they load by themselves); links stay, since research answers cite
 // sources, and a requester asked for this answer.
 export function writeAnswer(agent: LoadedAgent, r: RunResult<Findings>): string | undefined {
   const f = r.outputs[0];
   if (!f) return undefined;
-  const dissent = (r.challenge?.blocking ?? []).map((o) => `- ${o.claim}\n  - if acted on: ${o.failure_scenario}\n  - check: ${o.settling_check} (${o.evidence.join(', ')})`);
+  const dissent = [...(r.challenge?.blocking ?? []).map((o) => `- ${o.claim}\n  - if acted on: ${o.failure_scenario}\n  - check: ${o.settling_check} (${o.evidence.join(', ')})`), ...itemDissent(r.challenge?.items)];
   const verdict = r.challenge ? ` · challenge ${r.challenge.verdict}${r.challenge.note ? ` (${r.challenge.note})` : ''}` : '';
   const read = (r.sources ?? []).map((s) => ` · read ${basename(s.path)} at ${s.ref} ${s.commit.slice(0, 10)} (${s.date.slice(0, 10)})`).join('');
-  const md = stripImages(redact(renderFindings(f, `${agent.spec.name}@${agent.version} · run ${r.runId} · $${r.cost.toFixed(2)}${verdict}${read}`, dissent)));
+  const c = r.challenge;
+  const head = c && !finished(c) ? '⚠️ Challenge did not finish: not verified. Its objections so far' : c?.verdict === 'upheld' ? 'Challenge: upheld, with objections' : undefined;
+  const md = stripImages(redact(renderFindings(f, `${agent.spec.name}@${agent.version} · run ${r.runId} · $${r.cost.toFixed(2)}${verdict}${read}`, dissent, head)));
   if (r.dir) writeFileSync(join(r.dir, 'answer.md'), md + '\n');
   return md;
 }

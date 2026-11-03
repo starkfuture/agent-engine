@@ -50,8 +50,10 @@ export interface ChallengeResult {
   cost: number;
   turns: number;
   toolCalls: number;
-  note?: string;
+  note?: string; // set when the challenge didn't finish, or didn't run: why
 }
+
+export const HOLDS = { yes: 'holds up', partly: 'partly holds', no: 'does not hold up' } as const;
 
 const SYSTEM = `You are a challenger. Another analyst was given the task below and produced the output below. Your job is to find what is wrong with it, not to agree with it or rewrite it.
 
@@ -101,18 +103,30 @@ export function judge(objections: Objection[], evidence: Evidence, verdicts: Arr
   return { verdict: blocking.length || items.some((i) => i.holds === 'no') ? 'escalate' : 'upheld', blocking, notes, items };
 }
 
-// A challenge that broke off or checked nothing itself never upholds and never
-// hides an item: its "no" counts as "partly". Its blocking objections stand.
+// A challenge that broke off or checked nothing itself never upholds, never
+// agrees with an item and never hides one: its "yes" verdicts are dropped and
+// its "no" counts as "partly". Its blocking objections stand.
 export function unsound(c: ChallengeResult, note: string): ChallengeResult {
-  const items = c.items.map((i): ItemVerdict => (i.holds === 'no' ? { ...i, holds: 'partly', downgraded: note } : i));
+  const items = c.items.filter((i) => i.holds !== 'yes').map((i): ItemVerdict => (i.holds === 'no' ? { ...i, holds: 'partly', downgraded: note } : i));
   return { ...c, verdict: c.blocking.length ? 'escalate' : 'error', items, note };
 }
+
+// Only a finished challenge's verdicts count as a check; an unfinished one
+// leaves its outputs not verified, with whatever objections it made.
+export const finished = (c: ChallengeResult): boolean => c.verdict !== 'error' && c.note === undefined;
 
 // A challenge that was due but never started: a spend cap, or the run stopped first.
 export const notRun = (why: string): ChallengeResult => ({ verdict: 'error', blocking: [], notes: [], items: [], overall: '', cost: 0, turns: 0, toolCalls: 0, note: `not run: ${why}` });
 
-// The verdict on one item (numbered from 1), from a challenge that finished.
-export const verdictOn = (c: ChallengeResult | undefined, item: number): ItemVerdict | undefined => (c && c.verdict !== 'error' ? c.items.find((i) => i.item === item) : undefined);
+// The verdict on one item (numbered from 1). From an unfinished challenge it
+// can only be dissent ("partly"): unsound() dropped the rest.
+export const verdictOn = (c: ChallengeResult | undefined, item: number): ItemVerdict | undefined => c?.items.find((i) => i.item === item);
+
+// Dissent on single items, for answers and get_run: every "no" and "partly",
+// with its reason and evidence.
+export function itemDissent(items: Array<{ item: number; holds: ItemVerdict['holds']; reason: string; evidence?: string[] | undefined }> = []): string[] {
+  return items.filter((i) => i.holds !== 'yes').map((i) => `- Item ${i.item} ${HOLDS[i.holds]}: ${i.reason}${i.evidence?.length ? ` (${i.evidence.join(', ')})` : ''}`);
+}
 
 export async function challengeLite(a: ChallengeArgs): Promise<ChallengeResult> {
   let submitted: { objections: Objection[]; items: Array<z.infer<typeof Item>>; overall: string } | undefined;

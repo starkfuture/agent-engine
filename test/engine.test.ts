@@ -539,9 +539,10 @@ test('judge: a "no" on one item of the output needs a real evidence id; a broken
   ]);
   assert.equal(j.verdict, 'escalate', 'an item that does not hold up is a dissent');
   assert.deepEqual(j.items.map((i) => [i.item, i.holds, i.downgraded ?? '']), [[1, 'no', ''], [2, 'partly', 'said no without a valid evidence id']], 'the first verdict on an item counts');
-  const broke = unsound({ ...j, overall: 'o', cost: 0, turns: 0, toolCalls: 1 }, 'same call 3×: promql');
+  const yes = { item: 3, holds: 'yes' as const, reason: 'Checks out.', evidence: [] };
+  const broke = unsound({ ...j, items: [...j.items, yes], overall: 'o', cost: 0, turns: 0, toolCalls: 1 }, 'same call 3×: promql');
   assert.equal(broke.verdict, 'error');
-  assert.deepEqual(broke.items.map((i) => i.holds), ['partly', 'partly']);
+  assert.deepEqual(broke.items.map((i) => [i.item, i.holds]), [[1, 'partly'], [2, 'partly']], 'no agreement from a broken challenge');
 });
 
 // Author that answers with one fetched fact.
@@ -550,6 +551,25 @@ const author = async function* (sim: import('./fake-session.js').Sim) {
   await sim.mcp('submit_findings', answer([{ id: evId(page), quote: 'it is configured' }]));
   yield ok(0.2);
 };
+
+test('a "no" or "partly" on the answer is dissent in answer.md, with its reason and evidence, also without a blocking objection', async () => {
+  const d = agentDir(`${web}\nchallenge: { when: always }`);
+  for (const [holds, verdict, head, says] of [
+    ['no', 'escalate', '## ⚠️ Challenge: ESCALATE (a human decides)', 'does not hold up'],
+    ['partly', 'upheld', '## Challenge: upheld, with objections', 'partly holds'],
+  ] as const) {
+    let own = '';
+    const s = fakeSession(author, async function* (sim) {
+      own = evId(await sim.builtin('WebFetch', { url: 'https://b' }, fetchResponse('https://b', 'it was removed last week')));
+      await sim.mcp('submit_challenge', { objections: [], items: [{ item: 1, holds, reason: 'The config was removed last week.', evidence: [own] }], overall: 'See the item.' });
+      yield ok(0.3);
+    });
+    const r = await runAgent(engine(s), { agent: loadAgent(d), trigger: 't', task: 'What is configured?', output: findingsOutput });
+    assert.deepEqual([r.challenge?.verdict, r.challenge?.blocking.length], [verdict, 0]);
+    const md = writeAnswer(loadAgent(d), r)!;
+    assert.ok(md.includes(`${head}\n- Item 1 ${says}: The config was removed last week. (${own})`), md);
+  }
+});
 
 test('challenger runs blind with the task, gathers its own evidence, and can escalate', async () => {
   const d = agentDir(`${web}\nchallenge: { when: always, model: claude-opus-5-5, usd: 0.5 }`);

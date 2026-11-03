@@ -17,7 +17,7 @@ import type { Engine } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
 import type { FlaggedRow } from '../src/patrol/summary.js';
 import { needsChallenge, patrolOnce, type MonitorAgent, patrolLoop } from '../src/runner.js';
-import { fakeSession, ok, say, type Script } from './fake-session.js';
+import { fail, fakeSession, ok, say, type Script } from './fake-session.js';
 import { DAY, FakeTelemetry, H, INCIDENT_START, testConfig as cfg, world } from './fake.js';
 
 test('incident rows are flagged, steady noise is not', async () => {
@@ -400,6 +400,47 @@ test('the AI decides the rest: critical and major are posted with their owners, 
   assert.equal(r.slack.length, 1, 'only the major report');
   assert.ok(r.slack[0]!.endsWith('-1.md'));
   assert.match(readFileSync(r.slack[0]!, 'utf8'), /\*\*Severity:\*\* major · \*\*Confidence:\*\* medium · cc <@U0BACKEND1>/);
+});
+
+test('a challenge that runs out of budget verifies nothing: its objection stays, every card says not verified', async () => {
+  const c = cfg();
+  const sent: Array<{ text: string; blocks: unknown[] }> = [];
+  const box = new SlackOutbox(':memory:', { threads: true, post: async (m) => (sent.push(m), `ts${sent.length}`) }, { sleep: async () => {}, gapMs: 0 });
+  const session = fakeSession(
+    async function* (sim) {
+      const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+      const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+      const quote = /\/v1\/auth\/password\/reset 400 \| \d+/.exec(out.text)![0];
+      for (const rows of [[RESET], [SIGNUP]]) assert.equal((await sim.mcp('submit_report', report({ severity: 'major', rows, evidence: [{ id, quote, claim: 'reset requests return 400' }] }))).isError, false);
+      yield ok(0.3, 4);
+    },
+    async function* (sim) {
+      const own = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec((await sim.mcp('route_timeline', { service: 'backend-production', route: '/v1/auth/password/reset', hours: 2 })).text)![1]!;
+      await sim.mcp('submit_challenge', {
+        objections: [{ claim: 'The /v1/auth/password/reset 400s are one client retrying', failure_scenario: 'the team rolls back a working release', settling_check: 'count the 400s by client', evidence: [own], blocking: true }],
+        items: [
+          { item: 1, holds: 'no', reason: 'One client retrying.', evidence: [own] },
+          { item: 2, holds: 'yes', reason: 'Sign-up checks out.' },
+        ],
+        overall: 'Report 1 does not hold up.',
+      });
+      yield fail('error_max_budget_usd', 1);
+    },
+  );
+  const r = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir, box), new Date('2026-09-29T12:15:00Z'), { llm: true, post: true }, monitor(c, session));
+  assert.deepEqual([r.investigation?.challenge?.verdict, r.investigation?.challenge?.note], ['escalate', 'error_max_budget_usd']);
+  assert.equal(sent.length, 2, 'both posted: a challenge that broke off hides nothing');
+  const [reset, signup] = sent.map((m) => JSON.stringify(m.blocks));
+  assert.match(reset!, /A second AI check disputes this, a human decides:\* The \/v1\/auth\/password\/reset 400s are one client retrying/, 'its objection stays');
+  for (const b of [reset!, signup!]) {
+    assert.match(b, /not verified by a second check/);
+    assert.doesNotMatch(b, /second check agrees/);
+  }
+  for (const f of r.cards.slice(1)) {
+    const md = readFileSync(f, 'utf8');
+    assert.match(md, /Not verified: the challenge did not complete \(error_max_budget_usd\)\./);
+    assert.doesNotMatch(md, /On this report: holds up/);
+  }
 });
 
 test('nothing new above the floor: no AI run, nothing posted', async () => {

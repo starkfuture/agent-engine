@@ -240,6 +240,12 @@ export class SlackOutbox {
     return this.db.prepare(`SELECT ts, opened_at, controls_at FROM slack_issue_threads WHERE issue = ?`).get(issue) as { ts: string | null; opened_at: string; controls_at: string | null } | undefined;
   }
 
+  // Whether anything about the issue was delivered. Until then a repeat about
+  // it is sent as its first post, shown in the channel (see sendPost).
+  reached(issue: string): boolean {
+    return !!this.issueThread(issue);
+  }
+
   // The issue whose first message this is (a button click names the message).
   issueAt(ts: string): string | undefined {
     const rows = this.db.prepare(`SELECT issue FROM slack_issue_threads WHERE ts = ?`).all(ts) as Array<{ issue: string }>;

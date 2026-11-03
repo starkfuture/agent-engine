@@ -1,4 +1,4 @@
-import type { ChallengeResult, ItemVerdict } from '../engine/challenge.js';
+import { finished, HOLDS, type ChallengeResult, type ItemVerdict } from '../engine/challenge.js';
 import type { Report } from '../investigate/report.js';
 import { recentDeploys } from '../patrol/deploys.js';
 import { DEFAULT_FLOOR, digest, shortSubject, type DigestOptions, type Line } from '../patrol/digest.js';
@@ -15,17 +15,15 @@ export interface Card {
   markdown: string;
 }
 
-const HOLDS = { yes: 'holds up', partly: 'partly holds', no: 'does not hold up' } as const;
-
 // What the challenger concluded, in one block. Escalate = a human decides.
-// `item`: its verdict on this report, when it gave one per report.
+// `item`: its verdict on this report, when it gave one per report. A challenge
+// that didn't finish verifies nothing; its objections still show.
 function challengeLines(c: ChallengeResult | undefined, item?: ItemVerdict): string[] {
   if (!c) return [];
-  if (c.verdict === 'error') return [`Not verified: the challenge did not complete (${c.note ?? 'unknown'}); this report is unchallenged.`];
-  const head = c.verdict === 'upheld' ? `Challenge: upheld. ${c.overall}` : `⚠️ Challenge: ESCALATE, needs a human decision. ${c.overall}`;
+  const head = !finished(c) ? `Not verified: the challenge did not complete (${c.note ?? 'unknown'}).` : c.verdict === 'upheld' ? `Challenge: upheld. ${c.overall}` : `⚠️ Challenge: ESCALATE, needs a human decision. ${c.overall}`;
   return [
     head,
-    ...(item ? [`On this report: ${HOLDS[item.holds]}. ${item.reason}${item.downgraded ? ` (${item.downgraded})` : ''}`] : []),
+    ...(item ? [`On this report: ${HOLDS[item.holds]}. ${item.reason}${item.evidence.length ? ` (${item.evidence.join(', ')})` : ''}${item.downgraded ? ` (${item.downgraded})` : ''}`] : []),
     ...c.blocking.map((o) => `• Objection: ${o.claim} (if acted on: ${o.failure_scenario}; check: ${o.settling_check}; ${o.evidence.join(', ')})`),
     ...(c.notes.length ? [`${c.notes.length} non-blocking note(s) in the run folder.`] : []),
   ];
@@ -100,7 +98,8 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
   const own = new Set(r.evidence.map((e) => e.id));
   const subjects = r.rows.map((k) => k.split('|')[2]).filter((x): x is string => !!x && x.length > 3);
   const against = challenge?.verdict === 'escalate' ? challenge.blocking.filter((o) => o.evidence.some((id) => own.has(id)) || subjects.some((s) => o.claim.includes(s))) : [];
-  const elsewhere = challenge?.verdict === 'escalate' && !against.length;
+  const verified = !!challenge && finished(challenge);
+  const elsewhere = verified && challenge?.verdict === 'escalate' && !against.length;
   // Its own verdict on this report, when it gave one, says more than the objections.
   const doubt =
     item?.holds === 'no'
@@ -127,7 +126,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
               [
                 `${r.evidence.length} evidence ${r.evidence.length === 1 ? 'item' : 'items'}`,
                 r.not_checked.length ? `${r.not_checked.length} not checked` : '',
-                challenge?.verdict === 'error' ? 'not verified by a second check' : doubt ? '' : item?.holds === 'yes' || challenge?.verdict === 'upheld' ? 'second check agrees' : elsewhere ? 'second check disputes another finding' : '',
+                challenge && !verified ? 'not verified by a second check' : doubt ? '' : item?.holds === 'yes' || challenge?.verdict === 'upheld' ? 'second check agrees' : elsewhere ? 'second check disputes another finding' : '',
                 `patrol ${when(patrolAt, patrolAt)}`,
                 footer,
               ]

@@ -51,7 +51,8 @@ Code-driven parts (a deterministic gate, credentialed tools, output checks) live
   - A blocking objection needs a failure scenario, a settling check and a real evidence id; otherwise it becomes a note.
   - The verdict is `upheld` or `escalate` (a human decides), with no rebuttal round and no consensus-seeking.
   - A challenge that failed, ended without a result, or checked nothing itself is `error`, never `upheld`. Only the first submission counts. The challenger has its own loop detector.
-  - It also judges each item of the output: holds, partly holds, or doesn't hold up. "Doesn't hold up" needs a real evidence id, and a broken challenge can't give it.
+  - It also judges each item of the output: holds, partly holds, or doesn't hold up. "Doesn't hold up" needs a real evidence id, and a broken challenge can't give it. `answer.md` and `get_run` show every "partly" and "doesn't hold up" as dissent, with the reason and evidence, for every agent.
+  - A challenge that didn't finish verifies nothing: it keeps its objections but agrees with nothing.
   - A caller can decide on the challenge once the outputs exist (the monitor does). If the caps can't hold that challenge, the run goes ahead without it, and the challenge is recorded as not run.
 - **Run folder** `runs/<agent>/<run>/`: `input.md`, `transcript.jsonl`, `evidence.jsonl`, `output.json`, `challenge.json`, `answer.md` (with any dissent). All of them are redacted.
 - **Model-written text for humans** (cards): redacted per field, image syntax removed, links to unknown hosts defanged.
@@ -179,9 +180,9 @@ When a run has a report the channel would see as critical or major (the "yes" ro
 - **Partly holds:** posted, with the objection on the card.
 - **Doesn't hold up:** the report becomes minor. It is not posted, and it opens or raises no issue. The run, `answer.md` and `get_run` keep it, with the challenger's reason. This verdict needs an evidence id. A challenge that broke off or checked nothing can't hide a report.
 - **A protected journey is never hidden.** A report on a `never_suppress` row that doesn't hold up is posted anyway, with the objection. Urgent rows still get their rows card first, before any AI.
-- **Not verified:** when the challenger can't run (a spend cap, an error, a timeout), the report is posted as before, marked "not verified by a second check". A broken challenger never silences a post.
+- **Not verified:** when the challenger can't run or doesn't finish (a spend cap, an error, a timeout), the report is posted as before, marked "not verified by a second check". Objections it made before it stopped stay on the card. A broken challenger never silences a post.
 
-Urgent rows are challenged as before. Quiet replies in an issue's thread are not, nor reports the buttons keep quiet (On it, Not an issue). A report that breaks a Not an issue mute (a rise to critical, a protected row, a big jump) is checked. A 24 h reminder only goes out from a run the challenger saw; otherwise a later patrol's report reminds. One challenge covers the whole run and costs at most $1 (`challenge.usd` in `agents/monitor/agent.yaml`). It is reserved with the run; when the caps can't hold both, the investigator runs alone. The patrol log and the run ledger show each challenge's verdict and cost.
+Urgent rows are challenged as before. So is a repeat about an issue that never reached Slack (it was opened without posting, or Slack refused its first message): the outbox sends it as the issue's first message. Quiet replies in an issue's thread are not, nor reports the buttons keep quiet (On it, Not an issue). A report that breaks a Not an issue mute (a rise to critical, a protected row, a big jump) is checked. A 24 h reminder only goes out from a run the challenger saw; otherwise a later patrol's report reminds. One challenge covers the whole run and costs at most $1 (`challenge.usd` in `agents/monitor/agent.yaml`). It is reserved with the run; when the caps can't hold both, the investigator runs alone. The patrol log and the run ledger show each challenge's verdict and cost.
 
 ### The rows card
 

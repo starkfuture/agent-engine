@@ -88,6 +88,9 @@ export interface FileOptions {
   newsPending?: ((issue: string) => boolean) | undefined; // news for the channel about it still queued: no reminder on top
   clicks?: boolean | undefined; // the buttons are on: On it and Not an issue apply
   breaksMute?: ((key: string) => boolean) | undefined; // a row Not an issue can't silence (see breaksMute)
+  // Whether anything about the issue reached Slack (the outbox). Until it has,
+  // a repeat is the issue's first post: shownInChannel counts it as shown.
+  reached?: ((issue: string) => boolean) | undefined;
   // false: no challenger saw this report, so it may not be a reminder (a later
   // patrol's report reminds instead). A click or a delivery while the run was
   // going can make a reminder due that wasn't when the challenge was decided.
@@ -129,6 +132,7 @@ export function shownInChannel(issues: Issues | undefined, r: Report, at: Date, 
   if (!i || i.status === 'resolved' || RANK[r.severity] > RANK[i.severity]) return true; // on its own, reopened, raised (a rise also ends a mute)
   const d = o.clicks ? issues.disposition(i.id, at) : undefined;
   if (d?.kind === 'dismissed') return r.rows.some((k) => o.breaksMute?.(k)); // muted, unless a row breaks the mute
+  if (o.reached && !o.reached(i.id)) return true; // opened without posting, or its first post failed: this one is its first
   if (d?.kind === 'acknowledged' || o.newsPending?.(i.id)) return false; // On it, or news still queued: no reminder
   const news = o.newsAt?.(i.id) ?? issues.lastNewsAt(i.id);
   return !!news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000; // the 24 h reminder
@@ -341,6 +345,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     const filing: FileOptions = {
       newsAt: o.post && sink.outbox ? (id) => sink.outbox!.newsAt(id) : undefined,
       newsPending: o.post && sink.outbox ? (id) => sink.outbox!.newsPending(id) : undefined,
+      reached: o.post && sink.outbox ? (id) => sink.outbox!.reached(id) : undefined,
       clicks: o.buttons,
       breaksMute: (k) => !!byKey.get(k) && breaksMute(byKey.get(k)!, noise),
     };

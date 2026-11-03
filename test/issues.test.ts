@@ -678,6 +678,22 @@ test('no reminder goes out unchallenged: a click while the run settles leaves it
   assert.equal(next.investigation?.challenge?.verdict, 'upheld');
 });
 
+test("a repeat about an issue Slack never took is that issue's first post in the channel: it is challenged", async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(2, 40) });
+  const t = recorder(true);
+  // Slack refuses the new issue's message for good; everything else goes out.
+  const refusing: Transport = { threads: true, post: async (m) => (/^🟠 Major: /.test(m.text) ? Promise.reject(new SlackError('Slack: invalid_blocks', undefined, true)) : t.post(m)) };
+  const w = setup(refusing, linker());
+  assert.equal((await w.patrol(tel, 0)).filed[0]?.action, 'opened');
+  assert.equal(t.sent.length, 0, 'the issue never reached Slack');
+  const sibling = await w.patrol(tel, 2); // same cause, same severity, 2 h later: a repeat
+  assert.equal(sibling.filed[0]?.action, 'linked');
+  assert.equal(sibling.investigation?.challenge?.verdict, 'upheld', 'challenged, because it goes out as the first post');
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.sent[0]!.thread_ts, undefined, 'top-level: shown in the channel');
+  assert.match(JSON.stringify(t.sent[0]!.blocks), /second check agrees/);
+});
+
 const BOT = 'The 400s are one bot retrying a bad payload.';
 const doesNotHold: Judge = ({ mine }) => ({ items: [{ item: 1, holds: 'no', reason: BOT, evidence: [mine] }], overall: 'Does not hold up.' });
 
