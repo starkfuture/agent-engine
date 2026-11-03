@@ -87,9 +87,9 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 - **A thread takes replies for 24 h** after its last post; after a quiet day the rows start a new message. An issue's thread has no such limit while the issue is open.
 
 Every post goes through an outbox in the engine's SQLite file (`slack_outbox`):
-- **Delivered means Slack answered ok.** A failure waits for the next patrol and gives up after a day.
+- **Delivered means Slack answered ok.** A failed post waits before its next attempt: the next flush, then 30 s, doubling up to 15 min, and never before Slack's `Retry-After`. It gives up after a day.
 - **Slack being down never stops a patrol or re-runs the model.**
-- **One message a second per channel.** A `Retry-After` of up to 10 s is waited out; a longer one, or an outage, leaves the rest for the next patrol.
+- **One message a second per channel.** A `Retry-After` of up to 10 s is waited out; a longer one, or an outage, holds the rest until that post is due. Posts go out in order, because a reply needs its thread.
 - **One sender per database, with a renewable lease.** Overlapping patrols cannot flush the same entries concurrently; an abandoned lease expires after a minute. The channel's rate limit is shared across flushes.
 - **Posting off means no delivery**, including messages left queued by an earlier patrol.
 - **Recovery requires healthy observers.** A missing or failed source leaves its issues unresolved; recovery is recorded once when the source returns, including after a restart. Suppressing a signal does not resolve it.
@@ -110,14 +110,35 @@ What a report posts:
 |---|---|---|
 | `new`, critical or major | a new message (or a reply on its urgent rows card, as before); opens the issue | a message |
 | same issue, same or lower severity | a reply in the issue's thread, **not** shown in the channel, also after 24 h | nothing (the card and `get_run` keep it) |
-| same issue, but the channel has heard nothing about it for 24 h (no new, raised, reopened or reminder post, and no urgent rows card in its thread) | a reply in its thread, also shown in the channel (at most once a day per open issue, so a chronic one isn't hidden for good) | a message |
+| same issue, but the channel has heard nothing about it for 24 h (no new, raised, reopened or reminder post, and no urgent rows card in its thread, counted when Slack accepted it, not when it was queued) | a reply in its thread, also shown in the channel (at most once a day per open issue, so a chronic one isn't hidden for good) | a message |
 | same issue, severity rises (major → critical) | a reply in its thread, also shown in the channel | a message |
 | a resolved issue (it came back) | reopens it; a reply in its thread, also shown in the channel | a message |
 | minor or noise | not posted, as before; a linked one's rows still join the issue | nothing |
 
 The rows of a linked report join the issue. Urgent rows that all belong to one open issue are posted in its thread, still shown in the channel. When every row of an open issue is back to normal (healthy observers required, as for any recovery), the issue is resolved and its thread gets one "✅ Back to normal · I-7f3a resolved" note; its rows get no recovery note of their own, also while some of them still fire.
 
-Patrol logs say what each report did (`report 1 linked to I-7f3a (no broadcast)`, `I-7f3a resolved: all 3 row(s) back to normal`); `get_run` on a monitor run shows each report with its issue. A linked repeat still costs an AI run: this changes what is posted, not what triggers a run.
+Patrol logs say what each report did (`report 1 linked to I-7f3a (no broadcast)`, `I-7f3a resolved: all 3 row(s) back to normal`); `get_run` on a monitor run shows each report with its issue. A linked repeat still costs an AI run: this changes what is posted, not what triggers a run. The buttons below do cut runs.
+
+### The buttons: On it and Not an issue
+
+With Socket Mode on (`SLACK_APP_TOKEN`; setup in `slack/README.md`), an issue's first message carries two buttons. Anyone in the channel can click them. A click updates that message in place and sends a reply only the clicker sees. It posts nothing in the channel.
+
+| On the issue | On it | Not an issue |
+|---|---|---|
+| a report linked to it, same or lower severity | a reply in its thread, not shown in the channel (as before) | not posted (the card and `get_run` keep it) |
+| no news in the channel for 24 h | no reminder | not posted |
+| its rows get worse | one line by code in its thread, naming who is on it; no AI run | nothing; no AI run |
+| a report raises it to critical | a reply in its thread, also shown in the channel | the same, and the mute ends |
+| a protected journey (`never_suppress`) | the usual path: the rows card in the channel, an AI run | the same: a person can't silence a protected journey |
+| it resolves | the message says resolved and loses its buttons; On it ends | the same; the mute ends |
+| it never resolves | On it stays | the mute ends after 7 days |
+
+- **Undo** takes either back. Not an issue asks to confirm first.
+- **The latest click wins**, and the same click twice changes nothing. Two clicks before Slack is reached make one update.
+- **Not an issue is a noise-rule candidate**, recorded with its rows, who and when. Admins read the list with the MCP tool `noise_candidates`. A rule that hides rows for good stays a reviewed change to `config/noise.yaml`.
+- **Every click is checked:** our app, our workspace, our channel, and a message that is an open issue's first message. Anything else gets a reply that nothing changed.
+- **The click is recorded before Slack is acknowledged**, in `issues` and the append-only `issue_events` (acknowledged, dismissed, undone, mute_lifted, worse_noted). The message update goes through the outbox, after any post queued before it.
+- **Without `SLACK_APP_TOKEN`** there are no buttons and no updates, and nothing above changes what is posted.
 
 The baseline is `min(1 d, 7 d)`, scaled by current traffic, so a one-day incident doesn't become its own baseline the next day. The 1 h window only labels a row "started" or "ongoing".
 
@@ -187,6 +208,7 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 | `agents/` | Agent folders: `monitor`, `research`, `codebase`. |
 | `src/investigate/` | Monitor: telemetry tools, task prompt (with the issue list), report schema. |
 | `src/output/` | Card rendering (Slack Block Kit and Markdown), the sink and the Slack outbox (bot or webhook). |
+| `src/slack/` | The buttons on an issue's message: rendering, clicks, and the Socket Mode connection. |
 | `slack/` | The Slack app (manifest and Slack CLI project). |
 | `src/runner.ts`, `src/cli.ts` | Patrol orchestration (card first, challenge gate) and commands. |
 

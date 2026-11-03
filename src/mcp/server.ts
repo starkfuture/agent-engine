@@ -15,6 +15,7 @@ import type { Telemetry } from '../clients/telemetry.js';
 import { monitorTools } from '../investigate/tools.js';
 import { METADATA_PATH, Refused, serverName, type Login } from './login.js';
 import { expiresAt, type User, type Users } from './users.js';
+import type { Issues } from '../patrol/issues.js';
 
 // The engine over MCP, for several developers. One process holds the engine:
 // budgets, run history and the kill switch stay in one place; people connect
@@ -30,6 +31,7 @@ export interface McpContext {
   login?: Login; // Keycloak sign-in; absent = tokens only from the CLI
   log?: (s: string) => void;
   telemetry?: Telemetry; // production metrics/logs/traces, for agents with tool_pack: telemetry
+  issues?: Issues; // the monitor's issue record, for noise_candidates
 }
 
 interface Active {
@@ -384,6 +386,26 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       if (target.name === user.name) return err('you cannot remove yourself');
       return ctx.users.remove(target.name) ? text(`${target.name} removed`) : err(`no user ${name}`);
     });
+    // "Not an issue" clicks in Slack. Read-only: a permanent rule stays a
+    // reviewed change to config/noise.yaml.
+    if (ctx.issues)
+      s.registerTool(
+        'noise_candidates',
+        {
+          description: 'Admin: issues people marked Not an issue in Slack, most often first, with their rows and who clicked when. Candidates for a reviewed config/noise.yaml change; nothing is muted for good.',
+          inputSchema: {},
+          annotations: { readOnlyHint: true },
+        },
+        async () => {
+          const denied = notAdminNow();
+          if (denied) return denied;
+          const list = ctx.issues!.noiseCandidates();
+          const lines = list.map((c) =>
+            [`${c.issue} · ${c.status} · Not an issue ${c.dismissals.length}× · ${c.title}`, `  rows: ${c.rows.join(', ')}`, `  ${c.dismissals.map((d) => `${d.at.slice(0, 16)}Z by ${d.by}`).join('; ')}`].join('\n'),
+          );
+          return text(lines.length ? redact(`${lines.join('\n\n')}\n\nA rule that hides rows for good is a reviewed change to config/noise.yaml.`) : 'none');
+        },
+      );
     s.registerTool('list_users', { description: 'Admin: users, roles and how they sign in.', inputSchema: {} }, async () => {
       const denied = notAdminNow();
       if (denied) return denied;

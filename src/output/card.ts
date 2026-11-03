@@ -259,17 +259,31 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
 // A short reply in the thread where the rows were posted. Row keys are
 // section|service|subject|status; the subject may itself contain '|'. With an
 // issue id: every row of that issue is back, and the issue is resolved.
+const rowName = (k: string) => {
+  const parts = k.split('|');
+  const [section, service] = parts;
+  const status = parts.length > 3 ? parts[parts.length - 1] : '';
+  const subject = parts.slice(2, parts.length > 3 ? -1 : undefined).join('|');
+  return `${service} · ${shortSubject({ section: section as FlaggedRow['section'], subject })}${status ? ` ${status}` : ''}`;
+};
+
 export function recoveredCard(keys: string[], at: string, issue?: string): Card {
-  const line = (k: string) => {
-    const parts = k.split('|');
-    const [section, service] = parts;
-    const status = parts.length > 3 ? parts[parts.length - 1] : '';
-    const subject = parts.slice(2, parts.length > 3 ? -1 : undefined).join('|');
-    return `${service} · ${shortSubject({ section: section as FlaggedRow['section'], subject })}${status ? ` ${status}` : ''}`;
-  };
-  const lines = keys.map(line);
+  const lines = keys.map(rowName);
   const head = `✅ Back to normal at ${minute(at).slice(11)}${issue ? ` · ${issue} resolved` : ''}`;
   const text = `${head}: ${lines.length === 1 ? lines[0] : `${lines.length} signals`}`;
   const blocks = [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(redact(`${head}\n${lines.map((l) => `• ${l}`).join('\n')}`)), 2900) }] }];
   return { text: esc(redact(text)), blocks, markdown: `**${head}**\n${lines.map((l) => `- ${l}`).join('\n')}` };
+}
+
+// ---- worse, on an issue someone is on ---------------------------------------------
+// Code's line in the issue's thread when rows of it got worse after someone
+// clicked On it: no AI run, not shown in the channel. It mentions who is on it
+// (a Slack user id from the click, checked here too).
+export function worseCard(rows: Array<{ key: string; now: number; was?: number | undefined }>, at: string, issue: string, by: string): Card {
+  const lines = rows.map((r) => `${rowName(r.key)} now ${r.now}${r.was !== undefined ? ` (was ${r.was})` : ''}`);
+  const head = `📈 Worse at ${minute(at).slice(11)} on ${issue}`;
+  const who = /^[UW][A-Z0-9]{2,30}$/.test(by) ? ` · On it: <@${by}>` : '';
+  const text = `${head}: ${lines.length === 1 ? lines[0] : `${lines.length} signals`}`;
+  const blocks = [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(`${esc(redact(`${head}\n${lines.map((l) => `• ${l}`).join('\n')}`))}${who}`, 2900) }] }];
+  return { text: `${esc(redact(text))}${who}`, blocks, markdown: `**${head}** (On it: ${by}, no AI run)\n${lines.map((l) => `- ${l}`).join('\n')}` };
 }

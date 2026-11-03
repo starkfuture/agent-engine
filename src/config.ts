@@ -76,6 +76,10 @@ export interface Config {
   // SLACK_ONCALL as a mention (<@U…> or <!subteam^S…>), added by code to posts
   // that need a person now (src/runner.ts); unset = no mention.
   slackOncall: string | undefined;
+  // Socket Mode, for the buttons on an issue's message (On it, Not an issue):
+  // the app-level token (xapp-, connections:write) and the app it belongs to.
+  // Buttons are on only with the bot too, in the process that posts the patrol.
+  slackApp?: { token: string; appId: string } | undefined;
   mcp: {
     usersFile: string; // hashed tokens, one per person (gitignored)
     reposFile: string; // repos the codebase agent may read on this host (gitignored)
@@ -145,6 +149,17 @@ function oncall(env: NodeJS.ProcessEnv): string | undefined {
   throw new Error(`SLACK_ONCALL: "${id}" is not a Slack user id (U…) or user-group id (S…)`);
 }
 
+// SLACK_APP_TOKEN turns the buttons on. The app id is in the token
+// (xapp-1-A…-…); SLACK_APP_ID only if it isn't.
+function slackApp(env: NodeJS.ProcessEnv): Config['slackApp'] {
+  const token = opt(env.SLACK_APP_TOKEN);
+  if (!token) return undefined;
+  if (!/^xapp-/.test(token)) throw new Error('SLACK_APP_TOKEN must be an app-level token (xapp-…), not a bot or user token');
+  const appId = opt(env.SLACK_APP_ID) ?? /^xapp-\d+-(A[A-Z0-9]+)-/.exec(token)?.[1];
+  if (!appId || !/^A[A-Z0-9]{6,}$/.test(appId)) throw new Error('SLACK_APP_TOKEN does not name its app: set SLACK_APP_ID (A…)');
+  return { token, appId };
+}
+
 const LOGIN_VARS = ['KEYCLOAK_JWKS_URL', 'ENGINE_KC_CLIENT_ID', 'KEYCLOAK_SCOPES'];
 function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   const issuer = opt(env.KEYCLOAK_ISSUER)?.replace(/\/+$/, '');
@@ -210,6 +225,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     slackWebhookUrl: opt(env.SLACK_WEBHOOK_URL),
     ...slackBot(env),
     slackOncall: oncall(env),
+    slackApp: slackApp(env),
     mcp: {
       usersFile: r(env.ENGINE_USERS_FILE ?? 'config/users.local.json'),
       reposFile: r(env.ENGINE_REPOS_FILE ?? 'config/repos.local.yaml'),

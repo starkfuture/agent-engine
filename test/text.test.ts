@@ -10,6 +10,11 @@ test('engine and GitHub App tokens are redacted', () => {
   assert.ok(!out.includes('eng_AbCd') && !out.includes('ghs_AbCd'), out);
 });
 
+test('Slack app-level tokens (Socket Mode) are redacted', () => {
+  const out = redact('SLACK_APP_TOKEN=xapp-1-A0CCRGAHVGF-1234567890123-0a1b2c3d4e5f and in text xapp-1-A0CCRGAHVGF-9876543210987-ffeeddcc');
+  assert.ok(!out.includes('0a1b2c3d4e5f') && !out.includes('ffeeddcc'), out);
+});
+
 test('redacts PII and secrets', () => {
   const s = redact(
     'user jane.doe+x@example.com from 10.1.2.3 called +44 20 7946 0958 with Bearer abcdefghijkl12345 token=s3cr3tvalue ' +

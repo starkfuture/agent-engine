@@ -7,10 +7,10 @@ import { runAgent, type Engine, type RunResult } from './engine/run.js';
 import { monitorTask } from './investigate/prompt.js';
 import { checkReport, Report, ReportShape } from './investigate/report.js';
 import { monitorTools } from './investigate/tools.js';
-import { patrolCard, recoveredCard, reportCard, type Card, type IssueRef } from './output/card.js';
+import { patrolCard, recoveredCard, reportCard, worseCard, type Card, type IssueRef } from './output/card.js';
 import type { CardSink, EmitSlack } from './output/sink.js';
 import { bucketOf } from './patrol/digest.js';
-import type { Issue, Issues, Severity } from './patrol/issues.js';
+import { MUTE_DAYS, type Disposition, type Issue, type Issues, type Severity } from './patrol/issues.js';
 import type { Noise } from './patrol/noise.js';
 import type { Owners } from './patrol/owners.js';
 import type { State } from './patrol/state.js';
@@ -64,23 +64,40 @@ export type Filing =
   | { action: 'none' } // no issue record, or "new" and not posted (minor, noise)
   | { action: 'opened'; issue: Issue }
   | { action: 'linked'; issue: Issue } // same cause, same or lower severity; or not posted
-  | { action: 'raised'; issue: Issue; from: Severity }
+  | { action: 'raised'; issue: Issue; from: Severity; unmuted?: boolean } // unmuted: it ended a Not an issue mute
   | { action: 'reopened'; issue: Issue } // it was resolved and came back
-  | { action: 'reminded'; issue: Issue }; // same cause, but the channel has heard nothing about it for REMIND_HOURS
+  | { action: 'reminded'; issue: Issue } // same cause, but the channel has heard nothing about it for REMIND_HOURS
+  | { action: 'muted'; issue: Issue }; // same cause, and someone said Not an issue: not posted
 
 // An open issue whose rows never all recover (a chronic one) would otherwise
 // hide every later report in its thread for good: at most once in this many
 // hours, a report linked to it is shown in the channel again.
 export const REMIND_HOURS = 24;
 
-export function fileReport(issues: Issues, r: Report, at: Date, run?: string): Filing {
+export interface FileOptions {
+  // When the channel last saw a post about the issue, once Slack accepted it
+  // (the outbox). Unset, or nothing delivered yet: the record's queued news.
+  newsAt?: ((issue: string) => string | undefined) | undefined;
+  protected?: ((key: string) => boolean) | undefined; // a never_suppress row: Not an issue can't silence it
+}
+
+export function fileReport(issues: Issues, r: Report, at: Date, run?: string, o: FileOptions = {}): Filing {
   const filed = { title: r.title, severity: r.severity, rows: r.rows, hypothesis: r.cause.hypothesis, run };
   if (r.issue === 'new') return POSTED.has(r.severity) ? { action: 'opened', issue: issues.open(filed, at) } : { action: 'none' };
   // A recurrence reopens the issue only when it is worth posting.
   const l = issues.link(r.issue, filed, at, { reopen: POSTED.has(r.severity) });
   if (l.reopenedFrom) return { action: 'reopened', issue: l.issue };
-  if (l.raisedFrom) return { action: 'raised', issue: l.issue, from: l.raisedFrom };
-  if (POSTED.has(r.severity) && l.lastNewsAt && at.getTime() - Date.parse(l.lastNewsAt) >= REMIND_HOURS * 3600_000) {
+  // The buttons: On it and Not an issue last until the issue resolves.
+  const d = issues.disposition(l.issue.id, at);
+  if (l.raisedFrom) {
+    // A rise to critical ends Not an issue: it is news again.
+    if (d?.kind === 'dismissed') issues.liftMute(l.issue.id, at, run);
+    return { action: 'raised', issue: l.issue, from: l.raisedFrom, ...(d?.kind === 'dismissed' ? { unmuted: true } : {}) };
+  }
+  if (d?.kind === 'dismissed' && !r.rows.some((k) => o.protected?.(k))) return { action: 'muted', issue: l.issue };
+  // Someone is on it: no reminder in the channel.
+  const news = o.newsAt?.(l.issue.id) ?? l.lastNewsAt;
+  if (POSTED.has(r.severity) && d?.kind !== 'acknowledged' && news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000) {
     issues.remind(l.issue.id, at, run);
     return { action: 'reminded', issue: l.issue };
   }
@@ -91,7 +108,7 @@ export function fileReport(issues: Issues, r: Report, at: Date, run?: string): F
 // new message or a broadcast reply; the same cause again is a quiet reply in
 // the issue's thread, or nothing where there is no thread (the webhook).
 export function postFor(f: Filing, r: Report): EmitSlack | undefined {
-  if (!POSTED.has(r.severity)) return undefined;
+  if (!POSTED.has(r.severity) || f.action === 'muted') return undefined;
   if (f.action === 'none') return { kind: 'report', keys: r.rows, broadcast: true };
   if (f.action === 'linked') return { kind: 'report', keys: r.rows, broadcast: false, issue: f.issue.id, repeat: true };
   return { kind: 'report', keys: r.rows, broadcast: true, issue: f.issue.id };
@@ -107,7 +124,7 @@ export function pagesOncall(f: Filing, r: Report): boolean {
 }
 
 const issueRef = (f: Filing): IssueRef | undefined =>
-  f.action === 'none' ? undefined : { id: f.issue.id, title: f.issue.title, change: f.action === 'opened' ? 'new' : f.action === 'linked' || f.action === 'reminded' ? 'update' : f.action, ...(f.action === 'raised' ? { from: f.from } : {}) };
+  f.action === 'none' ? undefined : { id: f.issue.id, title: f.issue.title, change: f.action === 'opened' ? 'new' : f.action === 'linked' || f.action === 'reminded' || f.action === 'muted' ? 'update' : f.action, ...(f.action === 'raised' ? { from: f.from } : {}) };
 
 function filingNote(f: Filing, r: Report): string {
   switch (f.action) {
@@ -118,12 +135,22 @@ function filingNote(f: Filing, r: Report): string {
     case 'linked':
       return `linked to ${f.issue.id} (${POSTED.has(r.severity) ? 'no broadcast' : `${r.severity}: not posted`})`;
     case 'raised':
-      return `linked to ${f.issue.id}: severity ${f.from} → ${r.severity} (broadcast)`;
+      return `linked to ${f.issue.id}: severity ${f.from} → ${r.severity} (broadcast${f.unmuted ? '; ends Not an issue' : ''})`;
     case 'reopened':
       return `reopened ${f.issue.id}: it came back (broadcast)`;
     case 'reminded':
       return `linked to ${f.issue.id}: open with no news in the channel for ${REMIND_HOURS} h (broadcast)`;
+    case 'muted':
+      return `linked to ${f.issue.id} (Not an issue: not posted)`;
   }
+}
+
+// Rows of an issue someone clicked On it or Not an issue on get no AI run.
+// On it: rows that got worse (or came back) get one line by code in its
+// thread, not shown in the channel. Not an issue: nothing, while the mute lasts.
+// Protected journeys are never claimed: they take the usual path.
+export function claimedRows(issues: Issues | undefined, rows: FlaggedRow[], noise: Noise, at: Date): Map<string, Disposition & { issue: string }> {
+  return issues ? issues.claims(rows.filter((r) => !noise.protected(r)).map((r) => r.key), at) : new Map();
 }
 
 export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, state: State, sink: CardSink, at: Date, o: PatrolOptions, monitor?: MonitorAgent): Promise<PatrolResult> {
@@ -184,6 +211,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
         result.resolved.push(i.id);
         log(`${i.id} resolved: all ${i.rows.length} row(s) back to normal`);
         emit(recoveredCard(i.rows, summary.at, i.id), `${stamp(summary.at)}-resolved-${i.id}`, sink.outbox?.threads ? { kind: 'recovered', keys: i.rows, broadcast: false, issue: i.id } : undefined);
+        if (o.post) sink.outbox?.updateRoot(i.id); // its message says resolved, without buttons
       }
     }
     if (o.post && sink.outbox?.threads && loose.length)
@@ -191,25 +219,51 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     await flush();
     return result;
   };
+  // A Not an issue mute ends after MUTE_DAYS even if the issue never resolves.
+  if (o.issues)
+    for (const id of record('ending mutes', () => o.issues!.endMutes(at), [])) {
+      log(`${id}: Not an issue ended after ${MUTE_DAYS} days; its rows are investigated again`);
+      if (o.post) sink.outbox?.updateRoot(id);
+    }
   if (!summary.send.length) return finish(); // quiet patrol: no LLM call, no card, $0
 
+  // The buttons: rows of an issue someone is on, or said is not an issue, are
+  // left out of the AI run and of the rows card (see claimedRows).
+  const claims = record('reading the buttons', () => claimedRows(o.issues, summary.send, noise, at), new Map());
+  const send = claims.size ? summary.send.filter((r) => !claims.has(r.key)) : summary.send;
+  const shown = claims.size ? { ...summary, send } : summary; // for the rows card and the investigator
+  const byIssue = new Map<string, FlaggedRow[]>();
+  for (const r of summary.send) {
+    const c = claims.get(r.key);
+    if (c) byIssue.set(c.issue, [...(byIssue.get(c.issue) ?? []), r]);
+  }
+  for (const [id, rows] of byIssue) {
+    const c = claims.get(rows[0]!.key)!;
+    const worse = c.kind === 'acknowledged' ? rows.filter((r) => r.novelty === 'worse' || r.novelty === 'fresh') : [];
+    log(`${id}: ${rows.length} row(s) not investigated: ${c.kind === 'acknowledged' ? `On it${worse.length ? `, ${worse.length} worse: a line in its thread` : ''}` : 'Not an issue'}`);
+    if (!worse.length) continue;
+    const lines = worse.map((r) => ({ key: r.key, now: r.counts.now, was: state.data.rows[r.key]?.lastReportedNow }));
+    emit(worseCard(lines, summary.at, id, c.by), `${stamp(summary.at)}-worse-${id}`, { kind: 'rows', keys: worse.map((r) => r.key), broadcast: false, issue: id, repeat: true });
+    record(`noting worse rows on ${id}`, () => o.issues!.noteWorse(id, at, worse.map((r) => r.key)), undefined);
+  }
+
   // New or worse only: a 6-hour reminder of something already posted isn't news.
-  const urgentRows = summary.send.filter((r) => r.novelty !== 'reminder' && urgent(r, noise));
+  const urgentRows = send.filter((r) => r.novelty !== 'reminder' && urgent(r, noise));
   // A run only for something new and big enough to read (the card's "to look
   // at"): small or still-firing rows on their own don't spend one.
-  const worthALook = urgentRows.length > 0 || summary.send.some((r) => bucketOf(r, cfg.attentionFloor, noise.protected(r)) === 'look');
+  const worthALook = urgentRows.length > 0 || send.some((r) => bucketOf(r, cfg.attentionFloor, noise.protected(r)) === 'look');
 
   let skip: string | undefined;
   if (!o.llm) skip = 'LLM disabled for this run';
   else if (!monitor) skip = 'no monitor agent loaded';
   else if (!monitor.engine.llmAvailable) skip = 'no LLM credentials configured';
-  else if (!worthALook) skip = 'nothing new above the attention floor';
+  else if (!worthALook) skip = send.length ? 'nothing new above the attention floor' : 'every row belongs to an issue someone clicked On it or Not an issue on';
 
   // Code's own card goes to Slack only for urgent rows, and first: the AI never
   // delays or hides those. Otherwise it stays on disk and the AI's reports decide.
   // A protected journey among the urgent rows needs a person now: the card mentions the on-call.
   const oncall = urgentRows.some((r) => noise.protected(r)) ? cfg.slackOncall : undefined;
-  const card = patrolCard(summary, skip ? `not investigated: ${skip}` : 'AI investigation started', {
+  const card = patrolCard(shown, skip ? `not investigated: ${skip}` : 'AI investigation started', {
     owners: o.owners,
     oncall,
     floor: cfg.attentionFloor,
@@ -227,20 +281,20 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   }
 
   if (!skip && monitor) {
-    const rowKeys = new Set(summary.send.map((r) => r.key));
+    const rowKeys = new Set(send.map((r) => r.key));
     // The issues the investigator may link to: open, or resolved in the last 24 h.
     const none = { issues: [], more: 0 };
     const listed = o.issues ? record('listing issues', () => o.issues!.listed(at), none) : none;
     const issueIds = new Set(listed.issues.map((i) => i.id));
-    const challenge = needsChallenge(summary.send, noise);
-    log(`investigating ${summary.send.length} row(s) with ${monitor.agent.spec.model}${challenge ? ', then a challenger' : ''}…`);
+    const challenge = needsChallenge(send, noise);
+    log(`investigating ${send.length} row(s) with ${monitor.agent.spec.model}${challenge ? ', then a challenger' : ''}…`);
     let inv: RunResult<Report>;
     try {
       inv = await runAgent<Report>(monitor.engine, {
         agent: monitor.agent,
         trigger: o.trigger ?? 'patrol',
         task: monitorTask([...rowKeys], listed),
-        data: renderSummary(summary),
+        data: renderSummary(shown),
         tools: monitorTools(tel, cfg, at),
         output: {
           tool: 'submit_report',
@@ -266,13 +320,19 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     const answer: string[] = [];
     let toSlack = 0;
     let quiet = 0;
+    const filing: FileOptions = {
+      newsAt: o.post && sink.outbox ? (id) => sink.outbox!.newsAt(id) : undefined,
+      protected: (k) => !!byKey.get(k) && noise.protected(byKey.get(k)!),
+    };
     for (const [i, r] of inv.outputs.entries()) {
-      const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId), { action: 'none' }) : { action: 'none' };
+      const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId, filing), { action: 'none' }) : { action: 'none' };
       result.filed.push(f);
       const cc = [...new Set([...(cfg.slackOncall && pagesOncall(f, r) ? [cfg.slackOncall] : []), ...ownersOf(r)])];
       const card = reportCard(r, summary.at, footer, inv.challenge, cc, issueRef(f));
       const post = postFor(f, r);
       emit(card, `${stamp(summary.at)}-${i + 1}`, post);
+      // Back from resolved, or Not an issue ended: its buttons are back.
+      if (o.post && (f.action === 'reopened' || (f.action === 'raised' && f.unmuted))) sink.outbox?.updateRoot(f.issue.id);
       if (post) toSlack++;
       if (post?.repeat) quiet++;
       if (o.issues) log(`report ${i + 1} ${filingNote(f, r)}`);
