@@ -78,7 +78,7 @@ export interface FileOptions {
   // When the channel last saw a post about the issue, once Slack accepted it
   // (the outbox). Unset, or nothing delivered yet: the record's queued news.
   newsAt?: ((issue: string) => string | undefined) | undefined;
-  protected?: ((key: string) => boolean) | undefined; // a never_suppress row: Not an issue can't silence it
+  breaksMute?: ((key: string) => boolean) | undefined; // a row Not an issue can't silence (see breaksMute)
 }
 
 export function fileReport(issues: Issues, r: Report, at: Date, run?: string, o: FileOptions = {}): Filing {
@@ -94,7 +94,7 @@ export function fileReport(issues: Issues, r: Report, at: Date, run?: string, o:
     if (d?.kind === 'dismissed') issues.liftMute(l.issue.id, at, run);
     return { action: 'raised', issue: l.issue, from: l.raisedFrom, ...(d?.kind === 'dismissed' ? { unmuted: true } : {}) };
   }
-  if (d?.kind === 'dismissed' && !r.rows.some((k) => o.protected?.(k))) return { action: 'muted', issue: l.issue };
+  if (d?.kind === 'dismissed' && !r.rows.some((k) => o.breaksMute?.(k))) return { action: 'muted', issue: l.issue };
   // Someone is on it: no reminder in the channel.
   const news = o.newsAt?.(l.issue.id) ?? l.lastNewsAt;
   if (POSTED.has(r.severity) && d?.kind !== 'acknowledged' && news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000) {
@@ -145,12 +145,22 @@ function filingNote(f: Filing, r: Report): string {
   }
 }
 
+// Rows Not an issue can't silence: protected journeys, and new or worse big
+// jumps (urgent). They take the usual path: the rows card in the issue's
+// thread, shown in the channel, and an AI run. The mute itself stays.
+export function breaksMute(r: FlaggedRow, noise: Noise): boolean {
+  return noise.protected(r) || (r.novelty !== 'reminder' && urgent(r, noise));
+}
+
 // Rows of an issue someone clicked On it or Not an issue on get no AI run.
 // On it: rows that got worse (or came back) get one line by code in its
 // thread, not shown in the channel. Not an issue: nothing, while the mute lasts.
-// Protected journeys are never claimed: they take the usual path.
+// Protected journeys are never claimed, nor big jumps under Not an issue.
 export function claimedRows(issues: Issues | undefined, rows: FlaggedRow[], noise: Noise, at: Date): Map<string, Disposition & { issue: string }> {
-  return issues ? issues.claims(rows.filter((r) => !noise.protected(r)).map((r) => r.key), at) : new Map();
+  if (!issues) return new Map();
+  const claims = issues.claims(rows.filter((r) => !noise.protected(r)).map((r) => r.key), at);
+  for (const r of rows) if (claims.get(r.key)?.kind === 'dismissed' && breaksMute(r, noise)) claims.delete(r.key);
+  return claims;
 }
 
 export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, state: State, sink: CardSink, at: Date, o: PatrolOptions, monitor?: MonitorAgent): Promise<PatrolResult> {
@@ -322,7 +332,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     let quiet = 0;
     const filing: FileOptions = {
       newsAt: o.post && sink.outbox ? (id) => sink.outbox!.newsAt(id) : undefined,
-      protected: (k) => !!byKey.get(k) && noise.protected(byKey.get(k)!),
+      breaksMute: (k) => !!byKey.get(k) && breaksMute(byKey.get(k)!, noise),
     };
     for (const [i, r] of inv.outputs.entries()) {
       const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId, filing), { action: 'none' }) : { action: 'none' };

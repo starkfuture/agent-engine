@@ -130,6 +130,7 @@ With Socket Mode on (`SLACK_APP_TOKEN`; setup in `slack/README.md`), an issue's 
 | its rows get worse | one line by code in its thread, naming who is on it; no AI run | nothing; no AI run |
 | a report raises it to critical | a reply in its thread, also shown in the channel | the same, and the mute ends |
 | a protected journey (`never_suppress`) | the usual path: the rows card in the channel, an AI run | the same: a person can't silence a protected journey |
+| a big jump on its rows (urgent: 50+ events and 5× expected) | one line by code in its thread; no AI run | the usual path: the rows card in its thread, shown in the channel, and an AI run; the mute stays |
 | it resolves | the message says resolved and loses its buttons; On it ends | the same; the mute ends |
 | it never resolves | On it stays | the mute ends after 7 days |
 

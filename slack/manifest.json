@@ -9,7 +9,7 @@
     "bot_user": { "display_name": "Agent Engine", "always_online": false }
   },
   "oauth_config": {
-    "scopes": { "bot": ["chat:write"] }
+    "scopes": { "bot": ["chat:write", "incoming-webhook"] }
   },
   "settings": {
     "org_deploy_enabled": false,

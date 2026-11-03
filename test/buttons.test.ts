@@ -282,6 +282,24 @@ test('a protected journey breaks through Not an issue: its rows card is shown in
   assert.equal(w.issues.disposition(id, at(9))?.kind, 'dismissed', 'still muted for its other rows');
 });
 
+test('a big jump breaks through Not an issue: its rows card is shown in the issue thread and the AI investigates it; the mute stays', async () => {
+  const jump = (t: number) => (t >= T0 && t < T0 + 40 * H ? (t >= T0 + 9 * H ? 300 : 20) : 0); // 15 times worse at +9 h: urgent
+  const tel = schedule({ '/v1/auth/login': jump, '/v1/ownership/transfer': doubles(0, 9) });
+  const w = setup();
+  const id = opened(await w.patrol(tel, 0));
+  await w.click('dismissed', id, { user: 'U0BOB' }, 0.25);
+  const r = await w.patrol(tel, 9);
+  assert.deepEqual(w.session.seen.at(-1), [key('/v1/auth/login')], 'the jump is investigated; the row that merely doubled is not');
+  const sent = w.t.sent.slice(1);
+  assert.match(sent[0]!.text, /^Patrol 2026-11-02 17:00Z/);
+  assert.deepEqual([sent[0]!.thread_ts, sent[0]!.reply_broadcast], [ROOT, true], 'the rows card, in the issue thread and shown in the channel');
+  assert.ok(!JSON.stringify(sent[0]!.blocks).includes('/v1/ownership/transfer'), 'the muted row is not on the card');
+  assert.equal(r.filed[0]?.action, 'linked', 'its report follows the usual rule');
+  assert.deepEqual([sent[1]!.thread_ts, sent[1]!.reply_broadcast], [ROOT, false]);
+  assert.equal(sent.length, 2);
+  assert.equal(w.issues.disposition(id, at(9))?.kind, 'dismissed', 'the mute stays');
+});
+
 test('the mute ends after 7 days even if the issue never resolves', async () => {
   const tel = schedule({ '/v1/auth/login': between(0, 40) });
   const w = setup();
