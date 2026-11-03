@@ -295,6 +295,22 @@ test('an urgent rows card in the issue thread is news: no reminder broadcast 3 h
   assert.deepEqual(t.sent.slice(sent).map((s) => s.reply_broadcast), [false]);
 });
 
+test("a new cause on an open issue's rows gets its own message, not that issue's thread", async () => {
+  const login = (t: number) => (t >= T0 && t < T0 + 40 * H ? (t >= T0 + 0.25 * H ? 45 : 20) : 0);
+  const tel = schedule({ '/v1/auth/login': login });
+  const t = bot();
+  let n = 0;
+  const w = setup(t, () => (++n === 1 ? { issue: 'new' } : { issue: 'new', title: 'Login rate limit rejects a shared office IP' }));
+  const first = await w.patrol(tel, 0);
+  const x = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  const second = await w.patrol(tel, 0.25); // twice as bad 15 min later, and the AI says it is another cause
+  const y = second.filed[0]!.action === 'opened' ? second.filed[0]!.issue.id : '';
+  assert.ok(x && y && x !== y);
+  assert.deepEqual(t.sent.map((s) => s.thread_ts ?? 'root'), ['root', 'root'], 'its own message, shown in the channel');
+  const roots = new DatabaseSync(w.db).prepare(`SELECT issue, ts FROM slack_issue_threads ORDER BY issue`).all() as Array<{ issue: string; ts: string }>;
+  assert.equal(new Set(roots.map((r) => r.ts)).size, 2, 'each issue has its own thread');
+});
+
 test('webhook: a repeat is not posted (the card and the run keep it); news still is', async () => {
   const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(1, 40), '/v1/auth/signup': between(2, 40) });
   const t = webhook();

@@ -249,7 +249,11 @@ export class SlackOutbox {
       // issue that never reached Slack is its first post, so it goes out as one.
       const known = p.issue ? this.issueThread(p.issue) : undefined;
       const inIssue = known?.ts && this.transport.threads ? { ts: known.ts, opened_at: known.opened_at } : undefined;
-      const thread = inIssue ?? this.threadFor(keys, now);
+      // A new issue may start in its rows' thread (this patrol's urgent card),
+      // never in another issue's: a different cause gets its own message.
+      const rowThread = inIssue ? undefined : this.threadFor(keys, now);
+      const taken = !!(p.issue && rowThread && this.db.prepare(`SELECT 1 FROM slack_issue_threads WHERE ts = ? AND issue <> ?`).get(rowThread.ts, p.issue));
+      const thread = inIssue ?? (taken ? undefined : rowThread);
       const noThread = p.kind === 'recovered' ? !thread : !!(p.repeat && known && !inIssue);
       if (noThread) {
         this.db.prepare(`UPDATE slack_outbox SET status = 'skipped' WHERE id = ?`).run(p.id);
