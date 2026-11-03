@@ -58,6 +58,9 @@ export interface RunInput<T> {
   user?: { name: string; usdPerDay?: number; maxRunning?: number }; // who asked (MCP)
   signal?: AbortSignal; // cancel this run (status 'stopped')
   onAdmitted?: (runId: string) => void; // called once the run is admitted, before the model starts
+  // Work that waits for admission (caps, the kill switch), before the roots are
+  // snapshotted: a draft fix clones its repo here. A failure is the run's error.
+  prepare?: () => Promise<void>;
   // Why the caller's last run was skipped, if that still holds (a cap, the kill
   // switch). A skip for this same reason is returned but not recorded again.
   heldBy?: string;
@@ -241,6 +244,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
       }
     };
 
+    await input.prepare?.();
     // File tools read snapshots: one commit's files without secret files.
     let roots: string[] | undefined;
     if (input.roots) {

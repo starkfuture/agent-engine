@@ -99,6 +99,7 @@ export class Fixer implements FixButton {
     if (r.result === 'stale') return reply('That click is already recorded. Nothing changed.');
     if (r.result === 'pending') return reply(`A fix for ${issue.id} is already being drafted, asked by <@${r.fix.by}> at ${hhmm(r.fix.at)}. Nothing changed.`);
     if (r.result === 'drafted' && r.fix.kind === 'drafted') return reply(`${issue.id} already has its draft fix: ${r.fix.url}`);
+    if (r.result === 'busy') return reply(`One fix is drafted at a time, and the fix for ${r.issue} (asked by <@${r.fix.by}>) is still in progress. Click again once it is done. No fix drafted for ${issue.id}.`);
     this.o.log(`${issue.id}: Draft a fix in ${repo} (Slack button)`);
     return reply(`Drafting a fix for ${issue.id} in ${OWNER}/${repo}… The draft pull request's link will be posted in the issue's thread. It runs as the codebase agent, under its caps.`, {
       updated: issue.id,
@@ -177,10 +178,7 @@ export class Fixer implements FixButton {
       const target = await o.github.defaultBranch(repo, token);
       scratch = mkdtempSync(join(tmpdir(), 'engine-fix-'));
       const dir = join(scratch, repo);
-      // A fresh checkout of the default branch. The token goes to git as a
-      // header (never argv, never .git/config); the model reads a snapshot of
-      // the files and never sees it.
-      await git(['clone', '--quiet', '--depth', '1', '--single-branch', '--no-tags', '--branch', target, `${base}/${OWNER}/${repo}.git`, dir], { env: gitAuthEnv(base, token), timeoutMs: 10 * 60_000 });
+      let cloned = false;
       run = await runAgent(o.engine, {
         agent: o.agent,
         trigger: 'fix',
@@ -189,12 +187,21 @@ export class Fixer implements FixButton {
         tools: fixTools(changes),
         output: fixOutput(changes),
         roots: [{ path: dir, ref: 'HEAD' }],
+        // A fresh checkout of the default branch, only once the run is
+        // admitted: a cap, the kill switch or no LLM refuses before any clone.
+        // The token goes to git as a header (never argv, never .git/config);
+        // the model reads a snapshot of the files and never sees it.
+        prepare: async () => {
+          await git(['clone', '--quiet', '--depth', '1', '--single-branch', '--no-tags', '--branch', target, `${base}/${OWNER}/${repo}.git`, dir], { env: gitAuthEnv(base, token), timeoutMs: 10 * 60_000 });
+          cloned = true;
+        },
         challenge: false,
         signal: abort.signal,
       });
       if (run.status === 'skipped') return await failed(run.note ?? 'the run was skipped');
       const fix = run.outputs[0];
       if (run.status === 'stopped') return await failed(`the run was stopped (${run.note ?? 'stop'})`);
+      if (!cloned) return await failed(`the clone of ${OWNER}/${repo} failed (${run.note ?? run.status})`);
       if (!fix) return await failed(`the codebase agent submitted no fix (${run.status}${run.note ? `: ${run.note}` : ''}); get_run ${run.runId} shows its run`);
       // The engine writes the files, commits and pushes: code, not the model.
       const local = { env: localEnv(), timeoutMs: 60_000 };

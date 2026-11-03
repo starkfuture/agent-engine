@@ -55,6 +55,15 @@ export function controlsFor(issues: Issues, now: () => Date = () => new Date(), 
   };
 }
 
+// At start: open issues whose first message was drawn with another set of
+// buttons (Draft a fix turned on, or off) get it redrawn, once. The outbox
+// records the set it drew, so a restart redraws nothing more.
+export function redrawControls(issues: Issues, outbox: SlackOutbox): string[] {
+  const ids = outbox.drawnOtherwise().filter((id) => issues.get(id)?.status === 'open');
+  for (const id of ids) outbox.updateRoot(id);
+  return ids;
+}
+
 // The parts of a block_actions payload we read. Anything else is ignored.
 const TS = /^\d{10}\.\d{6}$/;
 const Payload = z.object({

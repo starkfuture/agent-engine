@@ -199,7 +199,8 @@ What a click does:
 The rules, each checked in code and tested:
 
 - **One draft PR per issue.** A later click links it. A click while one is being drafted changes nothing. A fix branch already on GitHub without a PR is refused before any spend.
-- **It spends as the codebase agent**, under that agent's caps in `agents/codebase/agent.yaml` ($2 a run, $10 a day) and the engine's. When a cap refuses or the kill switch is on, nothing is pushed. However an attempt ends without a PR, the clicker hears why, the issue records it, and the button works again.
+- **One fix at a time.** A click on another issue while a fix is being drafted is recorded as failed (busy), and the clicker is told to click again later. Nothing starts.
+- **It spends as the codebase agent**, under that agent's caps in `agents/codebase/agent.yaml` ($2 a run, $10 a day) and the engine's. The repo is cloned only once the run is admitted: when a cap refuses, the kill switch is on or there is no LLM, nothing is cloned or pushed. However an attempt ends without a PR, the clicker hears why, the issue records it, and the button works again.
 - **The kill switch and a shutdown are checked again** right before the push and right before the PR, since both come after the run.
 - **The model never gets the token.** The token is asked for one repo, with contents and pull requests write only. Git gets it as a header in environment variables, never in argv or `.git/config`. The model reads a snapshot without `.git`, and its session gets only model credentials.
 - **The push refuses any branch but `agent-engine/fix-<issue id>`** and any repo off the list. It never forces and runs no hooks.
@@ -212,7 +213,7 @@ Activation, in order:
 0. **The buttons are on** (`SLACK_APP_TOKEN`, above).
 1. **DevOps creates the GitHub App** `agent-engine-fixes`, owned by the org, with no webhook. Repository permissions: contents and pull requests read and write, metadata read. It is installed on the seven repos only, and it is not a bypass actor on any branch protection or ruleset.
 2. **Add its id and private key to the ASM secret `agent-engine-production`** as `GITHUB_FIX_APP_ID` and `GITHUB_FIX_APP_PRIVATE_KEY`, from files, as for `SLACK_APP_TOKEN` (`slack/README.md`). The key is the PEM itself; one with literal `\n` works too.
-3. **Roll the pod.** The log says `Draft a fix: on`. A bad id or key logs `Draft a fix is off: …`, and everything else runs.
+3. **Roll the pod.** The log says `Draft a fix: on`. A bad id or key logs `Draft a fix is off: …`, and everything else runs. Open issues' messages get the new button once, at that start; the outbox records which buttons each message was drawn with, so later restarts redraw nothing.
 4. **Check `config/fixes.yaml`** maps the services you care about. `ENGINE_FIXES_FILE` points at another file.
 
 Without both settings there is no button, and nothing above changes. The pod needs egress to github.com, which the namespace already allows.

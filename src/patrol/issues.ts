@@ -95,6 +95,7 @@ export type FixAsked =
   | { result: 'resolved' }
   | { result: 'stale' } // Slack delivered this click again
   | { result: 'pending' | 'drafted'; fix: FixState }
+  | { result: 'busy'; issue: string; fix: FixState } // one fix at a time: another issue's holds the slot
   | { result: 'requested' };
 const FIX_EVENTS = `('fix_requested', 'fix_drafted', 'fix_failed')`;
 
@@ -374,14 +375,21 @@ export class Issues {
   // A Draft a fix click on an open issue, recorded with `alongside` (its
   // message update) or not at all. Nothing is recorded while a fix is being
   // drafted or once it has a PR, and the same click delivered again is stale.
+  // One fix at a time, across issues: while another issue's request is open,
+  // the click is recorded as failed (busy) and nothing starts.
   requestFix(id: string, by: string, repo: string, at: Date, actionTs: string, alongside?: (db: DatabaseSync) => void): FixAsked {
     return this.tx((): FixAsked => {
       const row = this.row(id);
       if (!row) return { result: 'unknown' };
       if (row.status !== 'open') return { result: 'resolved' };
-      if (this.db.prepare(`SELECT 1 FROM issue_events WHERE issue_id = ? AND type = 'fix_requested' AND json_extract(data, '$.action_ts') = ? AND json_extract(data, '$.by') = ?`).get(id, actionTs, by)) return { result: 'stale' };
+      if (this.db.prepare(`SELECT 1 FROM issue_events WHERE issue_id = ? AND type IN ('fix_requested', 'fix_failed') AND json_extract(data, '$.action_ts') = ? AND json_extract(data, '$.by') = ?`).get(id, actionTs, by)) return { result: 'stale' };
       const fix = this.fix(id);
       if (fix) return { result: fix.kind, fix };
+      const other = this.pendingFixes().find((x) => x !== id);
+      if (other) {
+        this.event(id, 'fix_failed', at, { by, repo, action_ts: actionTs, reason: `busy: the fix for ${other} is still being drafted` });
+        return { result: 'busy', issue: other, fix: this.fix(other)! };
+      }
       this.event(id, 'fix_requested', at, { by, repo, action_ts: actionTs });
       alongside?.(this.db);
       return { result: 'requested' };

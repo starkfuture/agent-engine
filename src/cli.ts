@@ -31,7 +31,7 @@ import { InstallationTokens } from './mcp/github-app.js';
 import { RepoSync } from './mcp/reposync.js';
 import { Metrics, startHealth, startMetrics } from './metrics.js';
 import { sweep } from './engine/retention.js';
-import { controlsFor } from './slack/buttons.js';
+import { controlsFor, redrawControls } from './slack/buttons.js';
 import { startButtons } from './slack/socket.js';
 import { Fixer } from './fix/draft.js';
 import { FixGitHub, type FixAppCreds } from './fix/github.js';
@@ -315,13 +315,19 @@ async function main() {
   // GITHUB_FIX_APP_PRIVATE_KEY) and the buttons. Without them, no button.
   if (cfg.fixApp && posting && !clicks) log('GITHUB_FIX_APP_ID is set but the buttons are off (SLACK_APP_TOKEN and the bot): no Draft a fix');
   const fixApp = clicks ? fixAppOf(cfg) : undefined;
-  const sink = new CardSink(cfg.outDir, transport ? new SlackOutbox(join(cfg.runsDir, 'engine.db'), transport, clicks ? { controls: controlsFor(clicks, undefined, !!fixApp) } : {}) : undefined);
+  const sink = new CardSink(cfg.outDir, transport ? new SlackOutbox(join(cfg.runsDir, 'engine.db'), transport, clicks ? { controls: controlsFor(clicks, undefined, !!fixApp), controlsSet: fixApp ? 'fix' : 'base' } : {}) : undefined);
   const fixer =
     fixApp && clicks && sink.outbox
       ? new Fixer({ issues: clicks, outbox: sink.outbox, engine: makeEngine(cfg), agent: loadAgent(join(cfg.agentsDir, 'codebase'), cfg.memoryDir), map: FixMap.load(cfg.fixesFile!), github: new FixGitHub(fixApp), log })
       : undefined;
   const buttons = () => {
     if (!clicks || !bot || !sink.outbox) return undefined;
+    // Draft a fix turned on or off: open issues' messages get their buttons redrawn, once.
+    const redrawn = redrawControls(clicks, sink.outbox);
+    if (redrawn.length) {
+      log(`buttons: redrawing ${redrawn.length} open issue message(s) with ${fixApp ? 'Draft a fix' : 'no Draft a fix'}`);
+      void sink.outbox.flush(log);
+    }
     if (fixer) {
       fixer.recover();
       // A request recorded but never started (its dispatch went wrong) ends after 15 min.

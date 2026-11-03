@@ -19,7 +19,7 @@ import { buildServer, type McpContext } from '../src/mcp/server.js';
 import { Users } from '../src/mcp/users.js';
 import { SlackOutbox, type SlackMessage, type Transport } from '../src/output/slack.js';
 import { Issues } from '../src/patrol/issues.js';
-import { ACTION, controlsFor, FIX_ACTION, onClick, type ButtonIds } from '../src/slack/buttons.js';
+import { ACTION, controlsFor, FIX_ACTION, onClick, redrawControls, type ButtonIds } from '../src/slack/buttons.js';
 import { startButtons, type SocketClient } from '../src/slack/socket.js';
 import { Fixer, prBody } from '../src/fix/draft.js';
 import { FixGitHub, pushFixBranch } from '../src/fix/github.js';
@@ -129,7 +129,7 @@ const note = (blocks: unknown[]) => (blocks as Block[]).filter((b) => b.type ===
 const IDS: ButtonIds = { app: 'A0TESTAPP', team: 'T0TESTTEAM', channel: 'C0TEST123' };
 const RESPONSE = 'https://hooks.slack.com/actions/T0TESTTEAM/1700000100/AbCdEf';
 let clicks = 0;
-function payload(action: string, issue: string, o: { user?: string; channel?: string; team?: string; app?: string; actionTs?: string } = {}) {
+function payload(action: string, issue: string, o: { user?: string; channel?: string; team?: string; app?: string; actionTs?: string; ts?: string } = {}) {
   const channel = o.channel ?? IDS.channel;
   return {
     type: 'block_actions',
@@ -137,7 +137,7 @@ function payload(action: string, issue: string, o: { user?: string; channel?: st
     team: { id: o.team ?? IDS.team },
     user: { id: o.user ?? 'U0ALICE', team_id: o.team ?? IDS.team },
     channel: { id: channel },
-    container: { type: 'message', message_ts: ROOT, channel_id: channel, is_ephemeral: false },
+    container: { type: 'message', message_ts: o.ts ?? ROOT, channel_id: channel, is_ephemeral: false },
     response_url: RESPONSE,
     actions: [{ action_id: action, block_id: 'issue_buttons', value: issue, type: 'button', action_ts: o.actionTs ?? `1700000100.${String(++clicks).padStart(6, '0')}` }],
   };
@@ -206,7 +206,7 @@ function setup(o: { model?: Script; engine?: Partial<Engine>; github?: Omit<Para
   const clock = { now: at(0) };
   const issues = new Issues(db);
   const t = bot();
-  const box = new SlackOutbox(db, t, { now: () => clock.now, sleep: async () => {}, gapMs: 0, controls: controlsFor(issues, () => clock.now, o.fix !== false) });
+  const box = new SlackOutbox(db, t, { now: () => clock.now, sleep: async () => {}, gapMs: 0, controls: controlsFor(issues, () => clock.now, o.fix !== false), controlsSet: o.fix !== false ? 'fix' : 'base' });
   mkdirSync(join(c.runsDir, 'monitor', MONITOR_RUN), { recursive: true });
   writeFileSync(join(c.runsDir, 'monitor', MONITOR_RUN, 'output.json'), JSON.stringify([report]));
   const issue = issues.open({ title: TITLE, severity: 'major', rows: ROWS, hypothesis: HYPOTHESIS, run: MONITOR_RUN }, at(0));
@@ -252,6 +252,13 @@ function setup(o: { model?: Script; engine?: Partial<Engine>; github?: Omit<Para
     return res;
   };
   return { c, db, clock, issues, t, box, issue, r, gh, seen, session, engine, fixer, ctx, click, replies, logs, gits };
+}
+// Another open issue in the same world, posted with its buttons: its id and its message's ts.
+async function another(w: ReturnType<typeof setup>, route: string) {
+  const i = w.issues.open({ title: `${route} returns 400 for valid input`, severity: 'major', rows: [`http|backend-production|${route}|400`], hypothesis: 'validation is too strict' }, at(1));
+  w.box.enqueue({ kind: 'report', message: { text: `${i.id} report`, blocks: [] }, keys: i.rows, broadcast: true, issue: i.id });
+  await w.box.flush();
+  return { id: i.id, ts: `1700000000.${String(w.t.sent.length).padStart(6, '0')}` };
 }
 const flushed = async (w: ReturnType<typeof setup>) => {
   await w.box.flush();
@@ -472,6 +479,7 @@ test("a spend cap refuses: the clicker hears it, it is recorded, nothing is push
   const id = w.issue.id;
   await w.click(id);
   assert.equal(w.session.requests.length, 0, 'no model run');
+  assert.ok(!w.gits.some((g) => g.includes('clone')), 'no clone: the cap refused first');
   assert.match(w.replies.at(-1)![1], new RegExp(`^No fix drafted for ${id}: agent daily cap \\$10 reached\\. Nothing was pushed\\.$`));
   assert.deepEqual(fixEvents(w).map((e) => [e.type, e.data.reason ?? null]), [['fix_requested', null], ['fix_failed', 'agent daily cap $10 reached']]);
   assert.deepEqual(w.r.branches(), ['main']);
@@ -479,6 +487,28 @@ test("a spend cap refuses: the clicker hears it, it is recorded, nothing is push
   assert.ok(buttons(w.t.updates.at(-1)!.blocks).includes(FIX_ACTION));
   assert.equal(note(w.t.updates.at(-1)!.blocks), '', 'no pending line');
   assert.equal(w.t.sent.length, 1, 'nothing posted in the channel or thread');
+});
+
+test('one fix at a time, and no clone before the run is admitted: five clicks with no LLM clone nothing', async () => {
+  const w = await flushed(setup({ engine: { llmAvailable: false } }));
+  const others = [];
+  for (const route of ['/v1/a', '/v1/b', '/v1/c', '/v1/d']) others.push(await another(w, route));
+  const first = onClick(payload(FIX_ACTION, w.issue.id), w.ctx);
+  assert.ok(first.after, 'the first click gets the slot');
+  for (const x of others) {
+    const busyClick = payload(FIX_ACTION, x.id, { ts: x.ts });
+    const r = onClick(busyClick, w.ctx);
+    assert.equal(r.reply, `One fix is drafted at a time, and the fix for ${w.issue.id} (asked by <@U0ALICE>) is still in progress. Click again once it is done. No fix drafted for ${x.id}.`);
+    assert.equal(r.after, undefined, 'nothing starts');
+    assert.equal(onClick(busyClick, w.ctx).reply, 'That click is already recorded. Nothing changed.', 'a redelivery records nothing more');
+    assert.deepEqual(w.issues.events(x.id).filter((e) => e.type.startsWith('fix_')).map((e) => [e.type, e.data.reason]), [['fix_failed', `busy: the fix for ${w.issue.id} is still being drafted`]]);
+  }
+  await first.after!();
+  assert.equal(fixEvents(w).at(-1)!.data.reason, 'no LLM credentials configured');
+  assert.equal(w.replies.at(-1)![1], `No fix drafted for ${w.issue.id}: no LLM credentials configured. Nothing was pushed.`);
+  assert.ok(!w.gits.some((g) => g.includes('clone')), 'no clone at all');
+  // The slot is free again.
+  assert.ok(onClick(payload(FIX_ACTION, others[0]!.id, { ts: others[0]!.ts }), w.ctx).after);
 });
 
 test('a run stopped by the kill switch pushes nothing, even with a fix submitted', async () => {
@@ -636,6 +666,30 @@ test('recovery ends a request that never started, but not one being drafted or j
   assert.deepEqual(other.fixer.recover({ olderThanMs: 15 * 60_000 }), [other.issue.id]);
   assert.equal(fixEvents(other).at(-1)!.data.reason, 'it never started');
   assert.equal(other.issues.fix(other.issue.id), undefined, 'the button works again');
+});
+
+test('turning Draft a fix on redraws open issues\' messages once, and turning it off redraws them back', async () => {
+  const w = await flushed(setup({ fix: false })); // posted before the fix App was configured
+  const closed = await another(w, '/v1/closed');
+  w.issues.resolve(closed.id, at(2));
+  const restart = (fix: boolean) => new SlackOutbox(w.db, w.t, { now: () => w.clock.now, sleep: async () => {}, gapMs: 0, controls: controlsFor(w.issues, () => w.clock.now, fix), controlsSet: fix ? 'fix' : 'base' });
+  assert.deepEqual(redrawControls(w.issues, restart(false)), [], 'nothing changed: nothing to redraw');
+
+  const on = restart(true);
+  assert.deepEqual(redrawControls(w.issues, on), [w.issue.id], 'the open issue, not the resolved one');
+  await on.flush();
+  assert.deepEqual(w.t.updates.map((u) => [u.ts, buttons(u.blocks)]), [[ROOT, [ACTION.acknowledged, ACTION.dismissed, FIX_ACTION]]]);
+  assert.deepEqual(redrawControls(w.issues, restart(true)), [], 'a restart redraws nothing more');
+
+  const off = restart(false);
+  assert.deepEqual(redrawControls(w.issues, off), [w.issue.id]);
+  await off.flush();
+  assert.deepEqual(buttons(w.t.updates.at(-1)!.blocks), [ACTION.acknowledged, ACTION.dismissed]);
+
+  // Messages drawn before the set was recorded had the base set.
+  new DatabaseSync(w.db).exec(`UPDATE slack_issue_threads SET controls_set = NULL`);
+  assert.deepEqual(redrawControls(w.issues, restart(false)), []);
+  assert.deepEqual(redrawControls(w.issues, restart(true)), [w.issue.id]);
 });
 
 test('after a restart, a fix left half drafted ends and the button is back', async () => {
