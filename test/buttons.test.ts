@@ -491,3 +491,35 @@ test('admins read Not an issue clicks as noise-rule candidates over MCP; members
   const member = await connect('dev');
   assert.ok(!(await member.listTools()).tools.some((t) => t.name === 'noise_candidates'));
 });
+
+// ---- 11-02/03, simulated (the schedule of issues.test.ts) ---------------------------
+
+test('11-02/03 simulated: a click after the first post saves the AI runs its own rows would trigger, and the channel sees one message', async () => {
+  const NOV2: Schedule = {
+    '/v1/auth/login': doubles(0, 9, 21),
+    '/v1/ownership/transfer': doubles(1.5, 17, 21),
+    '/v1/auth/signup': between(4, 21),
+    '/v1/auth/password/reset': between(12, 21),
+    '/v1/account/email': between(14.5, 21),
+  };
+  const hours = Array.from({ length: 21 * 4 }, (_, i) => i / 4);
+  const visible = (s: Sent[]) => s.filter((x) => !x.thread_ts || x.reply_broadcast).length;
+  const run = async (click?: Click) => {
+    const w = setup();
+    for (const h of hours) {
+      await w.patrol(schedule(NOV2), h);
+      if (click && h === 0) await w.click(click, w.issues.openIssues()[0]!.id, {}, 0.1);
+    }
+    return w;
+  };
+  const none = await run();
+  assert.equal(none.session.seen.length, 7, 'as in issues.test.ts: two of them for rows that got worse');
+  const onIt = await run('acknowledged');
+  assert.equal(onIt.session.seen.length, 5, 'new sibling rows still get a run: only the investigator links them');
+  assert.equal(visible(onIt.t.sent), 1);
+  assert.equal(onIt.t.sent.filter((s) => s.text.startsWith('📈 Worse')).length, 2, 'the two worse rows: a line each, in the thread');
+  const notAnIssue = await run('dismissed');
+  assert.equal(notAnIssue.session.seen.length, 5);
+  assert.equal(notAnIssue.t.sent.length, 1, 'nothing after the first message');
+  assert.equal(notAnIssue.issues.openIssues()[0]!.rows.length, 5, 'the linked rows joined the issue');
+});
