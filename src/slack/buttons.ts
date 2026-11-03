@@ -1,15 +1,18 @@
 import { z } from 'zod';
-import { MUTE_DAYS, type Click, type Disposition, type Issue, type Issues } from '../patrol/issues.js';
+import { MUTE_DAYS, type Click, type Disposition, type FixState, type Issue, type Issues } from '../patrol/issues.js';
 import { queueRootUpdate, type SlackOutbox } from '../output/slack.js';
 
 // The buttons on an issue's Slack message: "On it" and "Not an issue", and
 // Undo. A click is recorded on the issue (patrol/issues.ts) and changes what
 // the patrol posts and investigates (runner.ts); Slack gets one update of that
 // message and a reply only the clicker sees. Nothing is posted to the channel.
-// Anyone in the channel may click; the issue's events say who did.
+// Anyone in the channel may click; the issue's events say who did. With the
+// fix App configured, a third button, Draft a fix, goes through the same
+// checks to src/fix/draft.ts.
 
 export const ACTION: Record<Click, string> = { acknowledged: 'issue_on_it', dismissed: 'issue_not_an_issue', undo: 'issue_undo' };
 const CLICK = Object.fromEntries(Object.entries(ACTION).map(([k, v]) => [v, k as Click])) as Record<string, Click>;
+export const FIX_ACTION = 'issue_draft_fix';
 
 const hhmm = (iso: string) => `${iso.slice(11, 16)}Z`;
 const day = (iso: string) => iso.slice(5, 10);
@@ -26,23 +29,29 @@ const NOT_AN_ISSUE_CONFIRM = {
 };
 
 // The blocks under the issue's first message: who clicked what, and the buttons that apply.
-export function issueControls(issue: Issue, d: Disposition | undefined, before: Array<{ by: string; at: string }> = []): unknown[] {
+// `fix`: Draft a fix is on, and where the issue's fix stands.
+export function issueControls(issue: Issue, d: Disposition | undefined, before: Array<{ by: string; at: string }> = [], fix?: { state: FixState | undefined }): unknown[] {
   const context = (text: string) => ({ type: 'context', elements: [{ type: 'mrkdwn', text }] });
   if (issue.status === 'resolved') return [context(`✅ ${issue.id} resolved at ${when(issue.resolved_at ?? '')}`)];
   const lines: string[] = [];
   if (d?.kind === 'acknowledged') lines.push(`👀 On it: <@${d.by}> since ${when(d.at)}. Reports stay in the thread; no daily reminder.`);
   if (d?.kind === 'dismissed') lines.push(`🔕 Not an issue: <@${d.by}> at ${when(d.at)}. Muted until it resolves, at most until ${when(d.until ?? '')}.`);
   if (!d && before.length) lines.push(`Marked Not an issue before by <@${before.at(-1)!.by}> on ${day(before.at(-1)!.at)}${before.length > 1 ? ` (${before.length} times)` : ''}.`);
+  const f = fix?.state;
+  if (f?.kind === 'pending') lines.push(`🛠 Drafting a fix in ${f.repo}: asked by <@${f.by}> at ${when(f.at)}.`);
+  if (f?.kind === 'drafted') lines.push(`🛠 Draft fix: <${f.url}|${f.repo}#${f.number}>, asked by <@${f.by}>. Review it before marking it ready.`);
   const notAnIssue = button('dismissed', issue.id, 'Not an issue', { confirm: NOT_AN_ISSUE_CONFIRM });
   const buttons = !d ? [button('acknowledged', issue.id, 'On it', { style: 'primary' }), notAnIssue] : d.kind === 'acknowledged' ? [notAnIssue, button('undo', issue.id, 'Undo')] : [button('undo', issue.id, 'Undo')];
+  if (fix && f?.kind !== 'pending') buttons.push({ type: 'button', action_id: FIX_ACTION, text: plain('Draft a fix'), value: issue.id });
   return [...(lines.length ? [context(lines.join('\n'))] : []), { type: 'actions', block_id: 'issue_buttons', elements: buttons }];
 }
 
-// The outbox's `controls`: the blocks for an issue as it now stands.
-export function controlsFor(issues: Issues, now: () => Date = () => new Date()): (id: string) => unknown[] | undefined {
+// The outbox's `controls`: the blocks for an issue as it now stands. `fix`:
+// Draft a fix is on (its GitHub App is configured).
+export function controlsFor(issues: Issues, now: () => Date = () => new Date(), fix = false): (id: string) => unknown[] | undefined {
   return (id) => {
     const i = issues.get(id);
-    return i && issueControls(i, issues.disposition(id, now()), issues.dismissals(id));
+    return i && issueControls(i, issues.disposition(id, now()), issues.dismissals(id), fix ? { state: issues.fix(id) } : undefined);
   };
 }
 
@@ -72,18 +81,26 @@ export interface ClickResult {
   reply?: string; // for the clicker only
   respondTo?: string; // where to send it (the payload's response_url)
   updated?: string; // the issue whose message was queued for an update
+  after?: () => Promise<void>; // work that starts once Slack is acknowledged (a draft fix)
+}
+
+// Draft a fix (src/fix/draft.ts), when its GitHub App is configured. Called
+// after the checks below, before Slack is acknowledged.
+export interface FixButton {
+  click(c: { issue: string; by: string; actionTs: string; now: Date; respondTo?: string | undefined }): ClickResult;
 }
 
 // One button click, recorded before Slack is acknowledged. The ids are checked
 // on every payload; a click from elsewhere, or on a message that isn't an
 // open issue's, changes nothing and gets a reply saying so.
-export function onClick(body: unknown, o: { issues: Issues; outbox: SlackOutbox; ids: ButtonIds; now?: () => Date; log?: (s: string) => void }): ClickResult {
+export function onClick(body: unknown, o: { issues: Issues; outbox: SlackOutbox; ids: ButtonIds; now?: () => Date; log?: (s: string) => void; fix?: FixButton | undefined }): ClickResult {
   const p = Payload.safeParse(body);
   if (!p.success) return {};
   const b = p.data;
   const a = b.actions[0]!;
   const click = CLICK[a.action_id];
-  if (!click) return {};
+  const fix = a.action_id === FIX_ACTION;
+  if (!click && !fix) return {};
   const respondTo = b.response_url && RESPONSE_URL.test(b.response_url) ? b.response_url : undefined;
   const nothing = (reply: string): ClickResult => ({ reply: `${reply} Nothing changed.`, ...(respondTo ? { respondTo } : {}) });
   const team = b.team?.id ?? b.user.team_id;
@@ -92,6 +109,8 @@ export function onClick(body: unknown, o: { issues: Issues; outbox: SlackOutbox;
   const id = ts ? o.outbox.issueAt(ts) : undefined;
   if (!id || a.value !== id) return nothing("This message isn't an issue the engine tracks.");
   const now = (o.now ?? (() => new Date()))();
+  if (fix) return o.fix ? o.fix.click({ issue: id, by: b.user.id, actionTs: a.action_ts, now, respondTo }) : nothing('Draft a fix is off on this engine.');
+  if (!click) return {};
   // The click and its message update commit together.
   const r = o.issues.click(id, click, b.user.id, now, a.action_ts, o.outbox.buttons ? (db) => queueRootUpdate(db, id, now) : undefined);
   if (r.result === 'unknown') return nothing("This message isn't an issue the engine tracks.");

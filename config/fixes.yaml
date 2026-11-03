@@ -1,0 +1,48 @@
+# Which repo "Draft a fix" works on, from the issue's rows (src/fix/). Each
+# row key is section|service|subject|status; a rule matches a row like a
+# noise.yaml entry: section, service, route (the row's subject), status, all
+# regexes, anchored, case-insensitive. The first rule that matches a row names
+# its repo, and the issue goes to the repo most of its rows name (a tie goes to
+# the rule listed first). No match: the clicker is told no repo maps, and
+# nothing happens.
+#
+# Only these repos may be named, whatever this file says: frontend-next,
+# admin-next, web-admin, web-admin-cms, backend, backend-nest, argo-cd.
+# keycloak (keycloak-stark) is not one of them, so its rows never map.
+#
+# Service names: the workload or `app` label (http v3, logs, SQS counters,
+# workloads) is <name>-production; the legacy backend's rows say
+# backend-production, and its mesh view backend-production-mesh. Trace rows
+# carry the service name the app reports to Tempo: UNVERIFIED, so the
+# -production suffix is optional below.
+# ENGINE_FIXES_FILE points the engine at another file.
+
+repos:
+  # The legacy /v1 backend, and its mesh view.
+  - repo: backend
+    service: 'backend-production(-mesh)?'
+
+  # The Nest services: packages/<name> in backend-nest, deployed as
+  # <name>-production (microservices namespace; specs-rag in its own).
+  - repo: backend-nest
+    service: '(admin-mcp|app|auth|customer-support|ecom|erp-broker|file|fx|notification|payment|product-catalog|specs-rag|stock-sync|translation|utils|vehicle)-service(-production)?'
+
+  # The frontends. frontend-next, web-admin and web-admin-cms run in the
+  # microservices namespace, so their logs and workloads are patrolled.
+  - repo: frontend-next
+    service: 'frontend-next(-production)?'
+  - repo: web-admin-cms
+    service: 'web-admin-cms(-production)?'
+  - repo: web-admin
+    service: 'web-admin(-production)?'
+  # UNSURE: admin-next runs in its own namespace, which the patrol doesn't read;
+  # only a trace row could name it.
+  - repo: admin-next
+    service: 'admin-next(-production)?'
+
+  # UNSURE, so off: pods waiting on a missing secret or a bad image tag need a
+  # change in argo-cd values rather than code. Placed above the service rules,
+  # this would send those rows to argo-cd instead.
+  # - repo: argo-cd
+  #   section: workload
+  #   status: 'CreateContainerConfigError|ImagePullBackOff|ErrImagePull'

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
+import { createPrivateKey } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -32,6 +33,9 @@ import { Metrics, startHealth, startMetrics } from './metrics.js';
 import { sweep } from './engine/retention.js';
 import { controlsFor } from './slack/buttons.js';
 import { startButtons } from './slack/socket.js';
+import { Fixer } from './fix/draft.js';
+import { FixGitHub, type FixAppCreds } from './fix/github.js';
+import { FixMap } from './fix/repos.js';
 
 const USAGE = `engine <command> [options]
 
@@ -173,6 +177,23 @@ function monitorAgent(cfg: Config): MonitorAgent {
 // The buttons (On it, Not an issue) are on: Socket Mode and the bot. Off, the
 // clicks already recorded are kept and ignored.
 const buttonsOn = (cfg: Config) => !!(cfg.slackApp && cfg.slackBotToken);
+// Draft a fix: its GitHub App, checked. A bad id or key turns the button off,
+// never the monitor; the key never reaches the log.
+function fixAppOf(cfg: Config): FixAppCreds | undefined {
+  const app = cfg.fixApp;
+  if (!app) return undefined;
+  let problem: string | undefined;
+  if (!/^\d+$/.test(app.appId)) problem = 'GITHUB_FIX_APP_ID must be a number';
+  else
+    try {
+      createPrivateKey(app.privateKey);
+    } catch {
+      problem = 'GITHUB_FIX_APP_PRIVATE_KEY is not a PEM private key';
+    }
+  if (!problem) return app;
+  log(`Draft a fix is off: ${problem}`);
+  return undefined;
+}
 // The issue record lives in the engine's SQLite file, next to the Slack outbox.
 // A fresh look (--fresh) starts from no issues too.
 const issueRecord = (cfg: Config, fresh = false) => (fresh ? Issues.memory() : new Issues(join(cfg.runsDir, 'engine.db')));
@@ -290,11 +311,23 @@ async function main() {
   const posting = a.post && ((cmd === 'serve' && a.patrol) || cmd === 'loop');
   if (cfg.slackApp && posting && !bot) log('SLACK_APP_TOKEN is set but the bot is not (SLACK_BOT_TOKEN, SLACK_CHANNEL_ID): no buttons');
   const clicks = cfg.slackApp && posting && bot ? issueRecord(cfg) : undefined;
-  const sink = new CardSink(cfg.outDir, transport ? new SlackOutbox(join(cfg.runsDir, 'engine.db'), transport, clicks ? { controls: controlsFor(clicks) } : {}) : undefined);
-  const buttons = () =>
-    clicks && bot && sink.outbox
-      ? startButtons({ appToken: cfg.slackApp!.token, appId: cfg.slackApp!.appId, channel: cfg.slackChannel!, team: () => bot.team(), issues: clicks, outbox: sink.outbox, log })
+  // Draft a fix, the third button: the fix App (GITHUB_FIX_APP_ID and
+  // GITHUB_FIX_APP_PRIVATE_KEY) and the buttons. Without them, no button.
+  if (cfg.fixApp && posting && !clicks) log('GITHUB_FIX_APP_ID is set but the buttons are off (SLACK_APP_TOKEN and the bot): no Draft a fix');
+  const fixApp = clicks ? fixAppOf(cfg) : undefined;
+  const sink = new CardSink(cfg.outDir, transport ? new SlackOutbox(join(cfg.runsDir, 'engine.db'), transport, clicks ? { controls: controlsFor(clicks, undefined, !!fixApp) } : {}) : undefined);
+  const fixer =
+    fixApp && clicks && sink.outbox
+      ? new Fixer({ issues: clicks, outbox: sink.outbox, engine: makeEngine(cfg), agent: loadAgent(join(cfg.agentsDir, 'codebase'), cfg.memoryDir), map: FixMap.load(cfg.fixesFile!), github: new FixGitHub(fixApp), log })
       : undefined;
+  const buttons = () => {
+    if (!clicks || !bot || !sink.outbox) return undefined;
+    if (fixer) {
+      fixer.recover();
+      log('Draft a fix: on (draft pull requests through the fix App; repos from config/fixes.yaml)');
+    }
+    return startButtons({ appToken: cfg.slackApp!.token, appId: cfg.slackApp!.appId, channel: cfg.slackChannel!, team: () => bot.team(), issues: clicks, outbox: sink.outbox, log, fix: fixer });
+  };
   const w = cfg.windowMinutes;
 
   switch (cmd) {

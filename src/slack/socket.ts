@@ -2,7 +2,7 @@ import { LogLevel, SocketModeClient, type Logger } from '@slack/socket-mode';
 import type { Issues } from '../patrol/issues.js';
 import type { SlackOutbox } from '../output/slack.js';
 import { redact } from '../engine/text.js';
-import { onClick, RESPONSE_URL, type ButtonIds, type ClickResult } from './buttons.js';
+import { onClick, RESPONSE_URL, type ButtonIds, type ClickResult, type FixButton } from './buttons.js';
 
 // Button clicks arrive over Socket Mode: an outbound WebSocket opened with the
 // app-level token (connections:write), so the engine needs no public URL. Only
@@ -10,6 +10,7 @@ import { onClick, RESPONSE_URL, type ButtonIds, type ClickResult } from './butto
 // acknowledged (Slack wants that within 3 s); then the clicker gets a reply
 // only they see, and the outbox sends the message update. There is no timer:
 // the outbox is flushed after a click, and a failed post waits for its backoff.
+// A Draft a fix click starts its work only after all that.
 
 export interface SocketClient {
   on(event: string, handler: (arg: { body?: unknown; ack?: () => Promise<void> }) => void): unknown;
@@ -25,6 +26,7 @@ export interface ButtonsOptions {
   issues: Issues;
   outbox: SlackOutbox;
   log: (s: string) => void;
+  fix?: FixButton | undefined; // Draft a fix, when its GitHub App is configured
   client?: (appToken: string) => SocketClient; // tests
   respond?: (url: string, text: string) => Promise<void>; // tests
   now?: () => Date;
@@ -64,7 +66,7 @@ export function startButtons(o: ButtonsOptions): { ready: Promise<void>; stop():
   client.on('interactive', ({ body, ack }) => {
     let r: ClickResult = {};
     try {
-      if (ids) r = onClick(body, { issues: o.issues, outbox: o.outbox, ids, log: o.log, ...(o.now ? { now: o.now } : {}) });
+      if (ids) r = onClick(body, { issues: o.issues, outbox: o.outbox, ids, log: o.log, fix: o.fix, ...(o.now ? { now: o.now } : {}) });
     } catch (e) {
       o.log(`buttons: a click could not be recorded: ${redact((e as Error).message).slice(0, 200)}`);
       const url = (body as { response_url?: unknown } | undefined)?.response_url;
@@ -74,6 +76,7 @@ export function startButtons(o: ButtonsOptions): { ready: Promise<void>; stop():
       .then(async () => {
         if (r.reply && r.respondTo) await (o.respond ?? respond)(r.respondTo, r.reply).catch(() => o.log('buttons: the reply to a click failed'));
         if (r.updated && !stopped) await o.outbox.flush(o.log);
+        if (r.after && !stopped) void r.after().catch(() => o.log('buttons: the work after a click failed'));
       })
       .catch(() => o.log('buttons: Slack did not take the acknowledgement'));
   });

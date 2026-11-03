@@ -41,7 +41,8 @@ export interface OutputSpec<T> {
   max?: number; // how many outputs one run may submit (default 10)
 }
 
-export type ToolFactory = (ev: Evidence, by: 'author' | 'challenger') => SdkMcpToolDefinition<any>[];
+// roots: the snapshots the file tools read, for tools that work on them (a draft fix's edits).
+export type ToolFactory = (ev: Evidence, by: 'author' | 'challenger', roots?: string[]) => SdkMcpToolDefinition<any>[];
 
 export interface RunInput<T> {
   agent: LoadedAgent;
@@ -298,7 +299,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
         model: spec.model,
         system: agent.prompt,
         prompt,
-        tools: [...(input.tools?.(evidence, 'author') ?? []), submit],
+        tools: [...(input.tools?.(evidence, 'author', roots) ?? []), submit],
         maxTurns: spec.limits.max_turns,
         maxBudgetUsd: spec.limits.usd_per_run,
       })) {
@@ -353,7 +354,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
         ...(data ? { data } : {}),
         output: outputs.length === 1 ? outputs[0] : outputs,
         evidence,
-        tools: input.tools?.(evidence, 'challenger') ?? [],
+        tools: input.tools?.(evidence, 'challenger', roots) ?? [],
         onEvent: (e) => {
           transcript('challenger', e);
           watchChallenger(e);

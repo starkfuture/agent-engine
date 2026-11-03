@@ -94,6 +94,11 @@ export interface Config {
   // the app-level token (xapp-, connections:write) and the app it belongs to.
   // Buttons are on only with the bot too, in the process that posts the patrol.
   slackApp?: { token: string; appId: string } | undefined;
+  // Draft a fix (src/fix/): the GitHub App that pushes one fix branch and opens
+  // a draft PR (GITHUB_FIX_APP_ID and GITHUB_FIX_APP_PRIVATE_KEY: both, or it is
+  // off), and the file that maps an issue's rows to a repo.
+  fixApp?: { appId: string; privateKey: string } | undefined;
+  fixesFile?: string;
   mcp: {
     usersFile: string; // hashed tokens, one per person (gitignored)
     reposFile: string; // repos the codebase agent may read on this host (gitignored)
@@ -174,6 +179,15 @@ function slackApp(env: NodeJS.ProcessEnv): Config['slackApp'] {
   return { token, appId };
 }
 
+// The fix App, only with both its id and its key. The key is the PEM itself
+// (a secret value, not a file); one stored with literal \n gets real newlines.
+function fixApp(env: NodeJS.ProcessEnv): Config['fixApp'] {
+  const appId = opt(env.GITHUB_FIX_APP_ID?.trim());
+  const key = opt(env.GITHUB_FIX_APP_PRIVATE_KEY);
+  if (!appId || !key) return undefined;
+  return { appId, privateKey: key.includes('\n') ? key : key.replaceAll('\\n', '\n') };
+}
+
 const LOGIN_VARS = ['KEYCLOAK_JWKS_URL', 'ENGINE_KC_CLIENT_ID', 'KEYCLOAK_SCOPES'];
 function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   const issuer = opt(env.KEYCLOAK_ISSUER)?.replace(/\/+$/, '');
@@ -240,6 +254,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     ...slackBot(env),
     slackOncall: oncall(env),
     slackApp: slackApp(env),
+    fixApp: fixApp(env),
+    fixesFile: r(env.ENGINE_FIXES_FILE ?? 'config/fixes.yaml'),
     mcp: {
       usersFile: r(env.ENGINE_USERS_FILE ?? 'config/users.local.json'),
       reposFile: r(env.ENGINE_REPOS_FILE ?? 'config/repos.local.yaml'),

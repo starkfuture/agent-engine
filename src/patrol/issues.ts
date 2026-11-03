@@ -39,7 +39,11 @@ export type IssueEventType =
   | 'dismissed'
   | 'undone'
   | 'mute_lifted'
-  | 'worse_noted';
+  | 'worse_noted'
+  // Draft a fix (src/fix/): a click asked for one; a draft PR, or why there is none.
+  | 'fix_requested'
+  | 'fix_drafted'
+  | 'fix_failed';
 export interface IssueEvent {
   id: number;
   issue_id: string;
@@ -82,6 +86,17 @@ export type Clicked =
   | { result: 'resolved'; issue: Issue }
   | { result: 'stale'; issue: Issue } // this click, or a later one, is already recorded
   | { result: 'unchanged' | 'changed'; issue: Issue; now?: Disposition | undefined };
+
+// Draft a fix: one being drafted, or the draft PR it opened. One PR per issue;
+// a failed attempt leaves nothing, so the button works again.
+export type FixState = { kind: 'pending'; by: string; at: string; repo: string } | { kind: 'drafted'; by: string; at: string; repo: string; url: string; number: number };
+export type FixAsked =
+  | { result: 'unknown' }
+  | { result: 'resolved' }
+  | { result: 'stale' } // Slack delivered this click again
+  | { result: 'pending' | 'drafted'; fix: FixState }
+  | { result: 'requested' };
+const FIX_EVENTS = `('fix_requested', 'fix_drafted', 'fix_failed')`;
 
 // A noise-rule candidate: an issue someone marked Not an issue (an Undo takes
 // the click back). A permanent rule stays a reviewed noise.yaml change.
@@ -354,6 +369,49 @@ export class Issues {
       out.set(r.key, { issue: r.issue, kind: r.kind, by: r.actor!, at: r.at!, ...(r.until ? { until: r.until } : {}) });
     }
     return out;
+  }
+
+  // A Draft a fix click on an open issue, recorded with `alongside` (its
+  // message update) or not at all. Nothing is recorded while a fix is being
+  // drafted or once it has a PR, and the same click delivered again is stale.
+  requestFix(id: string, by: string, repo: string, at: Date, actionTs: string, alongside?: (db: DatabaseSync) => void): FixAsked {
+    return this.tx((): FixAsked => {
+      const row = this.row(id);
+      if (!row) return { result: 'unknown' };
+      if (row.status !== 'open') return { result: 'resolved' };
+      if (this.db.prepare(`SELECT 1 FROM issue_events WHERE issue_id = ? AND type = 'fix_requested' AND json_extract(data, '$.action_ts') = ? AND json_extract(data, '$.by') = ?`).get(id, actionTs, by)) return { result: 'stale' };
+      const fix = this.fix(id);
+      if (fix) return { result: fix.kind, fix };
+      this.event(id, 'fix_requested', at, { by, repo, action_ts: actionTs });
+      alongside?.(this.db);
+      return { result: 'requested' };
+    });
+  }
+
+  // How the fix ended: a draft PR, or why there is none. Recorded with
+  // `alongside` (its Slack posts) or not at all.
+  fixEnded(id: string, at: Date, data: { by: string; repo: string; run?: string | undefined } & ({ url: string; number: number; branch: string } | { reason: string }), alongside?: (db: DatabaseSync) => void): void {
+    this.tx(() => {
+      this.event(id, 'url' in data ? 'fix_drafted' : 'fix_failed', at, { ...data, ...('reason' in data ? { reason: line(data.reason, 300) } : {}) });
+      alongside?.(this.db);
+    });
+  }
+
+  // The fix as it stands: its latest event decides.
+  fix(id: string): FixState | undefined {
+    const e = this.db.prepare(`SELECT type, at, data FROM issue_events WHERE issue_id = ? AND type IN ${FIX_EVENTS} ORDER BY id DESC LIMIT 1`).get(id) as { type: string; at: string; data: string } | undefined;
+    if (!e || e.type === 'fix_failed') return undefined;
+    const d = JSON.parse(e.data) as { by: string; repo: string; url?: string; number?: number };
+    return e.type === 'fix_drafted' ? { kind: 'drafted', by: d.by, at: e.at, repo: d.repo, url: String(d.url), number: Number(d.number) } : { kind: 'pending', by: d.by, at: e.at, repo: d.repo };
+  }
+
+  // Fixes still being drafted, by issue: after a restart, none really is.
+  pendingFixes(): string[] {
+    return (
+      this.db
+        .prepare(`SELECT e.issue_id AS id FROM issue_events e WHERE e.type = 'fix_requested' AND e.id = (SELECT MAX(x.id) FROM issue_events x WHERE x.issue_id = e.issue_id AND x.type IN ${FIX_EVENTS}) ORDER BY e.id`)
+        .all() as Array<{ id: string }>
+    ).map((r) => r.id);
   }
 
   // Not an issue clicks that stand (an Undo right after one takes it back).

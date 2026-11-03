@@ -33,3 +33,4 @@ Activation, in order:
 
 The app id comes from the token (`xapp-1-A…-…`); set `SLACK_APP_ID` only if the token doesn't carry it. The workspace comes from the bot. Buttons run in the process that posts the patrol (`loop --post`, or `serve --patrol --post`). The namespace already allows external egress; the connected log is the check that Socket Mode gets out.
 
+**Draft a fix**, the third button, needs nothing more from the Slack app: the same Socket Mode, no new scope. It is on with a GitHub App too; see "Draft a fix" in the main README.

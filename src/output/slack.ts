@@ -96,8 +96,9 @@ export function webhookTransport(url: string, timeoutMs = 10_000): Transport {
 // rows: an urgent rows card (or code's line on an issue someone is on).
 // report: an AI report. recovered: a thread reply that rows are back to normal
 // (only when they have a thread). root: an issue's first message again, with
-// its buttons as they now stand (chat.update, not a new message).
-export type PostKind = 'rows' | 'report' | 'recovered' | 'root';
+// its buttons as they now stand (chat.update, not a new message). fix: a draft
+// fix's pull request, a reply in the issue's thread only.
+export type PostKind = 'rows' | 'report' | 'recovered' | 'root' | 'fix';
 
 export interface Post {
   kind: PostKind;
@@ -156,6 +157,13 @@ export function queueRootUpdate(db: DatabaseSync, issue: string, at: Date): void
     was?.attempts ?? 0,
     was?.next_attempt_at ?? null,
   );
+}
+
+// Queue a reply in an issue's thread on any connection to engine.db, inside
+// the caller's transaction (a draft fix's pull request, with its record). It
+// is never shown in the channel, and never sent without the issue's thread.
+export function queueThreadReply(db: DatabaseSync, issue: string, m: SlackMessage, at: Date): void {
+  db.prepare(`INSERT INTO slack_outbox (created_at, kind, keys, broadcast, message, status, issue, repeat) VALUES (?, 'fix', '[]', 0, ?, 'pending', ?, 1)`).run(at.toISOString(), JSON.stringify(m), issue);
 }
 
 type Pending = {
@@ -435,7 +443,7 @@ export class SlackOutbox {
     const rowThread = inIssue ? undefined : this.threadFor(keys, now);
     const taken = !!(p.issue && rowThread && this.db.prepare(`SELECT 1 FROM slack_issue_threads WHERE ts = ? AND issue <> ?`).get(rowThread.ts, p.issue));
     const thread = inIssue ?? (taken ? undefined : rowThread);
-    const noThread = p.kind === 'recovered' ? !thread : !!(p.repeat && known && !inIssue);
+    const noThread = p.kind === 'recovered' ? !thread : p.kind === 'fix' ? !inIssue : !!(p.repeat && known && !inIssue);
     if (noThread) {
       this.db.prepare(`UPDATE slack_outbox SET status = 'skipped' WHERE id = ?`).run(p.id);
       if (p.kind !== 'recovered') log(`slack: ${p.kind} post ${p.id} about ${p.issue} not sent: a repeat, and there is no thread to reply in`);
