@@ -83,6 +83,7 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
 - A 6-hour reminder of a row already explained doesn't join a run, so it isn't reported again. It stays on the card as still ongoing.
 - A row that recovered and fired again is a new episode. It is investigated at its reminder, as before (or sooner if worse), with fresh tries, and its report can reopen its issue. A row that flickers isn't investigated every time it comes back. Tries still owed when a row recovers end there.
 - Rows saved before this was recorded get one investigation at their next reminder.
+- A row of an issue someone clicked On it or Not an issue on stays out of runs, also when it is owed an answer, and its tries are left as they were. It runs once the click is undone or the issue's mute ends. A big one still breaks through Not an issue.
 
 **What reaches Slack** (with `--post`, and the bot or a webhook): the AI decides, except for what it must never hide.
 

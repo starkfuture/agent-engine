@@ -155,7 +155,7 @@ function filingNote(f: Filing, r: Report): string {
 // jumps (urgent). They take the usual path: the rows card in the issue's
 // thread, shown in the channel, and an AI run. The mute itself stays.
 export function breaksMute(r: FlaggedRow, noise: Noise): boolean {
-  return noise.protected(r) || ((r.novelty === 'fresh' || r.novelty === 'worse') && urgent(r, noise));
+  return noise.protected(r) || (r.novelty !== 'reminder' && urgent(r, noise));
 }
 
 // Rows of an issue someone clicked On it or Not an issue on get no AI run.
@@ -243,7 +243,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     }
 
   // Rows still owed an answer from an earlier patrol (see below) are held back
-  // by a click too.
+  // by a click too. A big one breaks through Not an issue, as a new one does.
   const owedKnown = summary.known.filter((r) => state.needsInvestigation(r.key));
   // The buttons: rows of an issue someone is on, or said is not an issue, are
   // left out of the AI run and of the rows card (see claimedRows).

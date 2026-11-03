@@ -169,7 +169,7 @@ function setup(o: { decide?: Decide; buttons?: boolean; noise?: Noise } = {}) {
     await box.flush();
     return r;
   };
-  return { c, db, t, box, issues, session, patrol, click, logs, clock, flags };
+  return { c, db, t, box, issues, session, patrol, click, logs, clock, flags, state };
 }
 const opened = (r: PatrolResult) => (r.filed[0]?.action === 'opened' ? r.filed[0].issue.id : assert.fail(`not opened: ${r.filed[0]?.action}`));
 
@@ -223,6 +223,23 @@ test('without a click the same world spends an AI run on the worse row and remin
   const nextDay = await w.patrol(tel, 26);
   assert.equal(nextDay.filed[0]?.action, 'reminded');
   assert.equal(w.t.sent.at(-1)!.reply_broadcast, true);
+});
+
+test('a row still owed an answer stays out of runs while someone is on its issue, and keeps its record: no attempt, no deferral', async () => {
+  const tel = schedule({ '/v1/auth/login': doubles(0, 9) });
+  const w = setup();
+  const id = opened(await w.patrol(tel, 0));
+  await w.click('acknowledged', id, { user: 'U0ALICE' }, 0.5);
+  const owed = () => w.state.data.rows[key('/v1/auth/login')]!.investigation;
+  await w.patrol(tel, 9); // twice as bad: a line by code, and the row is owed an answer again
+  assert.deepEqual(owed(), { status: 'pending', attempts: 0 });
+  for (const h of [9.25, 9.5]) assert.equal((await w.patrol(tel, h)).investigation, undefined, 'still owed, but held back by On it: no AI run');
+  assert.equal(w.session.seen.length, 1);
+  assert.deepEqual(owed(), { status: 'pending', attempts: 0 }, 'neither an attempt nor a deferral');
+  await w.click('undo', id, { user: 'U0ALICE' }, 9.6);
+  await w.patrol(tel, 9.75);
+  assert.deepEqual(w.session.seen.at(-1), [key('/v1/auth/login')], 'investigated once the click is undone');
+  assert.equal(owed()?.status, 'complete');
 });
 
 // ---- Not an issue -----------------------------------------------------------------
