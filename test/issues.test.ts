@@ -14,7 +14,7 @@ import { checkReport, type Report } from '../src/investigate/report.js';
 import { buildServer, type McpContext } from '../src/mcp/server.js';
 import { Users } from '../src/mcp/users.js';
 import { CardSink } from '../src/output/sink.js';
-import { SlackOutbox, type Transport } from '../src/output/slack.js';
+import { SlackOutbox, webhookTransport, type SlackMessage, type Transport } from '../src/output/slack.js';
 import { Issues } from '../src/patrol/issues.js';
 import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
@@ -130,8 +130,8 @@ function webhook(): Transport & { sent: Sent[] } {
 }
 
 // A patrol world with one engine.db for the issues and the outbox, as in production.
-function setup(transport: Transport, decide: Decide, o: { issues?: boolean } = {}) {
-  const c: Config = testConfig();
+function setup(transport: Transport, decide: Decide, o: { issues?: boolean; oncall?: string | undefined } = {}) {
+  const c: Config = { ...testConfig(), slackOncall: o.oncall };
   const db = join(c.runsDir, 'engine.db');
   const clock = { now: new Date(T0) };
   const box = new SlackOutbox(db, transport, { now: () => clock.now, sleep: async () => {}, gapMs: 0 });
@@ -370,6 +370,89 @@ test('get_run shows the issue a monitor report went to', async () => {
   await client.connect(ct);
   const got = (await client.callTool({ name: 'get_run', arguments: { run_id: r.investigation!.runId } })) as { content: Array<{ text: string }> };
   assert.match(got.content[0]!.text, new RegExp(`### Report 1 · opened ${id} \\(major\\)`));
+});
+
+// ---- the on-call mention ---------------------------------------------------------
+
+const ONCALL = '<@U0ONCALL1>';
+type Posted = SlackMessage & { thread_ts?: string | undefined; reply_broadcast?: boolean | undefined };
+function recorder(threads: boolean): Transport & { sent: Posted[] } {
+  const sent: Posted[] = [];
+  return { threads, sent, post: async (m) => (sent.push(m), threads ? `1700000000.${String(sent.length).padStart(6, '0')}` : undefined) };
+}
+// What Slack parses for controls: the notification text and mrkdwn (not the plain_text header).
+const parsed = (m: SlackMessage) => [m.text, ...(JSON.stringify(m.blocks).match(/"type":"mrkdwn","text":"(?:[^"\\]|\\.)*"/g) ?? [])].join('\n');
+const pinged = (m: SlackMessage) => parsed(m).includes(ONCALL);
+
+test('a new critical issue mentions the on-call, in the text and on the card; its quiet repeats and reminders do not', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(2, 40), '/v1/auth/signup': between(26, 40) });
+  const t = recorder(true);
+  const w = setup(t, linker({ severity: 'critical' }), { oncall: ONCALL });
+  assert.equal((await w.patrol(tel, 0)).filed[0]?.action, 'opened');
+  assert.equal((await w.patrol(tel, 2)).filed[0]?.action, 'linked');
+  assert.equal((await w.patrol(tel, 26)).filed[0]?.action, 'reminded');
+  assert.deepEqual(t.sent.map((m) => [pinged(m), m.reply_broadcast]), [[true, undefined], [false, false], [false, true]]);
+  assert.equal(t.sent[0]!.text, `🔴 Critical: Sign-in rejects emails with a trailing space · cc ${ONCALL}`);
+  assert.match(JSON.stringify(t.sent[0]!.blocks), /"text":"New issue I-[0-9a-f]{4} · \*active\* since 08:00Z · confidence medium · cc <@U0ONCALL1>"/);
+});
+
+test('a rise to critical and a return as critical mention the on-call; majors and recoveries do not', async () => {
+  const rise = recorder(true);
+  const w = setup(rise, (s) => (s.issues.length ? { issue: s.issues[0]!.id, severity: 'critical' } : { issue: 'new' }), { oncall: ONCALL });
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(1, 40) });
+  await w.patrol(tel, 0);
+  assert.equal((await w.patrol(tel, 1)).filed[0]?.action, 'raised');
+  assert.deepEqual(rise.sent.map((m) => [[...m.text][0], pinged(m)]), [['🟠', false], ['🔴', true]]);
+
+  const back = recorder(true);
+  const v = setup(back, (s) => ({ issue: s.issues[0]?.id ?? 'new', severity: s.issues.length ? 'critical' : 'major' }), { oncall: ONCALL });
+  const again = schedule({ '/v1/auth/login': between(0, 0.25), '/v1/ownership/transfer': between(3, 40) });
+  await v.patrol(again, 0);
+  await v.patrol(again, 0.25); // resolved
+  assert.equal((await v.patrol(again, 3)).filed[0]?.action, 'reopened');
+  assert.deepEqual(back.sent.map((m) => [[...m.text][0], pinged(m)]), [['🟠', false], ['✅', false], ['🔴', true]]);
+});
+
+test('without an issue record a new critical report still mentions the on-call; a major does not', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(1, 40) });
+  const t = recorder(true);
+  let n = 0;
+  const w = setup(t, () => ({ issue: 'new', severity: ++n === 1 ? 'critical' : 'major' }), { issues: false, oncall: ONCALL });
+  await w.patrol(tel, 0);
+  await w.patrol(tel, 1);
+  assert.deepEqual(t.sent.map((m) => [[...m.text][0], pinged(m)]), [['🔴', true], ['🟠', false]]);
+});
+
+test('webhook: the mention goes out in the webhook body; a repeat still posts nothing', async (ctx) => {
+  const real = globalThis.fetch;
+  ctx.after(() => (globalThis.fetch = real));
+  const bodies: Array<{ text: string; blocks: unknown[] }> = [];
+  globalThis.fetch = (async (_url: string, init: RequestInit) => (bodies.push(JSON.parse(String(init.body))), new Response('ok'))) as typeof fetch;
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(1, 40) });
+  const w = setup(webhookTransport('https://hooks.slack.test/x'), linker({ severity: 'critical' }), { oncall: '<!subteam^S0ONCALL1>' });
+  await w.patrol(tel, 0);
+  assert.equal((await w.patrol(tel, 1)).filed[0]?.action, 'linked');
+  assert.equal(bodies.length, 1, 'the repeat is not posted');
+  assert.equal(bodies[0]!.text, '🔴 Critical: Sign-in rejects emails with a trailing space · cc <!subteam^S0ONCALL1>');
+  assert.match(JSON.stringify(bodies[0]!.blocks), /"type":"mrkdwn","text":"New issue I-[0-9a-f]{4} · \*active\* since 08:00Z · confidence medium · cc <!subteam\^S0ONCALL1>"/);
+});
+
+test("model text can't mention anyone: the on-call mention is code's, and without SLACK_ONCALL nothing pings", async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const evil = { issue: 'new', severity: 'critical', title: 'Sign-in down <!channel> <@U0EVIL1> <!subteam^S0EVIL1>', what_broke: `ping ${ONCALL} and <!here>, see <https://evil.test|grafana>`, suggested_fix: 'call <!everyone>' } as const;
+  for (const oncall of [ONCALL, undefined]) {
+    const t = recorder(true);
+    const w = setup(t, () => evil, { oncall });
+    await w.patrol(tel, 0);
+    assert.equal(t.sent.length, 1);
+    const slack = parsed(t.sent[0]!);
+    assert.equal(slack.split(ONCALL).length - 1, oncall ? 2 : 0, 'once in the text and once on the card, never from the model');
+    // Remove what code added; nothing Slack would parse may be left.
+    const rest = oncall ? slack.replaceAll(` · cc ${oncall}`, '') : slack;
+    assert.ok(!rest.includes('<'), rest);
+    assert.match(rest, /&lt;!channel&gt; &lt;@U0EVIL1&gt; &lt;!subteam\^S0EVIL1&gt;/);
+    assert.match(rest, /ping &lt;@U0ONCALL1&gt;/);
+  }
 });
 
 // ---- the record and its migration ------------------------------------------------

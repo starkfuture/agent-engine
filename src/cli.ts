@@ -161,6 +161,7 @@ function makeEngine(cfg: Config, runsDir = cfg.runsDir): Engine {
     session: sdkSession,
     dailyCapUsd: cfg.llm.dailyCapUsd,
     monthlyCapUsd: cfg.llm.monthlyCapUsd,
+    agentMonthlyCapUsd: { monitor: cfg.llm.monitorMonthlyCapUsd },
     llmAvailable: cfg.llm.available,
   };
 }

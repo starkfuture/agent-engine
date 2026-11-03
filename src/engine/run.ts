@@ -21,6 +21,8 @@ export interface Engine {
   session: Session;
   dailyCapUsd: number; // across all agents
   monthlyCapUsd?: number; // across all agents, UTC month
+  // An agent's share of monthlyCapUsd: the monitor's leaves the rest for people.
+  agentMonthlyCapUsd?: Record<string, number>;
   llmAvailable: boolean;
   build?: string; // engine code version, recorded on every run
   minFreeBytes?: number; // refuse new runs below this much free space on the runs volume
@@ -158,6 +160,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
     deadlineMs: spec.limits.deadline_min * 60_000,
     reserve,
     agentCap: spec.limits.usd_per_day,
+    ...(engine.agentMonthlyCapUsd?.[spec.name] !== undefined ? { agentMonthlyCap: engine.agentMonthlyCapUsd[spec.name] } : {}),
     globalCap: engine.dailyCapUsd,
     ...(engine.monthlyCapUsd !== undefined ? { monthlyCap: engine.monthlyCapUsd } : {}),
     concurrency: spec.concurrency,

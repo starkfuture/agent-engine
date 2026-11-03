@@ -35,6 +35,7 @@ export interface Admission {
   deadlineMs: number;
   reserve: number;
   agentCap: number;
+  agentMonthlyCap?: number; // this agent, UTC calendar month: its share of monthlyCap
   globalCap: number;
   monthlyCap?: number; // across all agents, UTC calendar month
   concurrency?: number; // runs of this agent at once (default 1)
@@ -135,6 +136,7 @@ export class Store {
       if (a.user && a.userMaxRunning !== undefined && this.running('requested_by', a.user).length >= a.userMaxRunning) return { ok: false as const, reason: `you already have ${a.userMaxRunning} run(s) in progress` };
       if (a.user && a.userCap !== undefined && this.spentIn(day, undefined, a.user) + a.reserve > a.userCap) return { ok: false as const, reason: `your daily cap $${a.userCap} reached` };
       if (this.spentIn(day, a.agent) + a.reserve > a.agentCap) return { ok: false as const, reason: `agent daily cap $${a.agentCap} reached` };
+      if (a.agentMonthlyCap !== undefined && this.spentIn(day.slice(0, 7), a.agent) + a.reserve > a.agentMonthlyCap) return { ok: false as const, reason: `agent monthly cap $${a.agentMonthlyCap} reached` };
       if (this.spentIn(day) + a.reserve > a.globalCap) return { ok: false as const, reason: `global daily cap $${a.globalCap} reached` };
       if (a.monthlyCap !== undefined && this.spentIn(day.slice(0, 7)) + a.reserve > a.monthlyCap) return { ok: false as const, reason: `monthly cap $${a.monthlyCap} reached` };
       this.db
