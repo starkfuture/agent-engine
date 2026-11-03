@@ -418,3 +418,62 @@ test('HTTP with the Keycloak sign-in: discovery, challenge, invited company acco
   ctx.users.remove('dee');
   assert.equal((await post({ authorization: `Bearer ${kc.token({ email: 'dee@starkfuture.com' })}` })).status, 403, 'removal applies on the next request');
 });
+
+test('get_run on a monitor run: reports from before answer.md, an unreadable challenge, and Slack delivery unknown', async () => {
+  const { ctx, who } = context(fakeSession());
+  const run = (id: string, agent: string, files: Record<string, string>, user?: string) => {
+    ctx.engine.store.skipped({ id, agent, version: 'abc', trigger: user ? `mcp:${user}` : 'patrol', now: new Date(), note: 'fixture', ...(user ? { user } : {}) });
+    const dir = join(ctx.engine.runsDir, agent, id);
+    mkdirSync(dir, { recursive: true });
+    for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
+  };
+  // As filed before the issue record: no `issue`.
+  const report = {
+    title: 'Authentication errors',
+    severity: 'major',
+    status: 'unclear',
+    started_at: 'unknown',
+    what_broke: 'Authentication returns errors',
+    impact: 'unknown',
+    cause: { hypothesis: 'Pool exhaustion is possible', confidence: 'low' },
+    evidence: [{ id: 'E-abcd-1', quote: 'waiting=2', claim: 'Two connections are waiting' }],
+    suggested_fix: 'Check the database pool',
+    not_checked: ['Customer impact not measured'],
+    rows: ['http|auth|/login|500'],
+  };
+  const objection = { claim: 'Pool exhaustion is unproven', failure_scenario: 'Restarting could interrupt requests', settling_check: 'Read pool time series', evidence: ['E-abcd-1'], blocking: true };
+  const challenge = { verdict: 'escalate', overall: 'The cause is disputed', blocking: [objection], notes: [], cost: 0.1, turns: 1, toolCalls: 1 };
+  const { call } = await connect(ctx, who('root'));
+
+  run('20261102T100000Z-monitor-abcdef', 'monitor', { 'output.json': JSON.stringify([report]), 'challenge.json': JSON.stringify(challenge) });
+  const old = (await call('get_run', { run_id: '20261102T100000Z-monitor-abcdef' })).text;
+  for (const part of [
+    'Slack delivery: unknown (a run is not linked to its posts yet)',
+    '### Report 1\n\n## 🟠 Authentication errors',
+    '- Customer impact not measured',
+    '• Objection: Pool exhaustion is unproven (if acted on: Restarting could interrupt requests; check: Read pool time series; E-abcd-1)',
+    '## Challenge: escalate',
+  ])
+    assert.ok(old.includes(part), old);
+  assert.doesNotMatch(old, /\(no answer\)/);
+
+  run('20261102T101500Z-monitor-abcdef', 'monitor', { 'output.json': JSON.stringify([report]), 'challenge.json': '{"verdict": "upheld", ' });
+  const broken = await call('get_run', { run_id: '20261102T101500Z-monitor-abcdef' });
+  assert.equal(broken.isError, false);
+  assert.match(broken.text, /## Challenge: unreadable\nThe challenge record could not be read: do not treat this run as upheld\./);
+  assert.match(broken.text, /## 🟠 Authentication errors/);
+
+  // Since answer.md is written, get_run reads it; delivery is still unknown.
+  run('20261103T100000Z-monitor-abcdef', 'monitor', { 'output.json': JSON.stringify([{ ...report, issue: 'new' }]), 'answer.md': '# Monitor reports · patrol 2026-11-03T10:00:00.000Z\n\n### Report 1 · opened I-7f3a (major)\n' });
+  const recent = (await call('get_run', { run_id: '20261103T100000Z-monitor-abcdef' })).text;
+  assert.match(recent, /Slack delivery: unknown/);
+  assert.match(recent, /### Report 1 · opened I-7f3a \(major\)/);
+
+  // Other agents' runs are not reports, and a private run stays private.
+  run('20261103T100000Z-research-abcdef', 'research', { 'output.json': JSON.stringify([answer('E-abcd-1', 'quote')]) }, 'bo');
+  const research = (await call('get_run', { run_id: '20261103T100000Z-research-abcdef' })).text;
+  assert.match(research, /\(no answer\)/);
+  assert.doesNotMatch(research, /Slack delivery/);
+  run('20261103T101500Z-monitor-abcdef', 'monitor', { 'output.json': JSON.stringify([report]) }, 'bo');
+  assert.match((await (await connect(ctx, who('ana'))).call('get_run', { run_id: '20261103T101500Z-monitor-abcdef' })).text, /no run 20261103T101500Z-monitor-abcdef/);
+});

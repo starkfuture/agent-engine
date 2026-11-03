@@ -35,8 +35,9 @@ async function fourWay(
 
 // A source that answers with no series at all is blind, not healthy: an empty
 // result is also what a stopped scrape looks like once its series age out, and
-// the patrol would report "nothing wrong" for as long as it lasts. Not used for
-// error counters: a labelled counter has no series until its first error.
+// the patrol would report "nothing wrong" for as long as it lasts. Not used on
+// an error counter itself (it has no series until its first error), only on
+// its `presence` selector.
 export async function requireSeries(tel: Telemetry, selector: string, at: Date, what: string): Promise<void> {
   const r = await tel.promInstant(`count(${selector})`, at);
   if (!r.length || !(r[0]!.value > 0)) throw new Error(`no ${what} series for ${selector} (missing data, not a quiet system)`);
@@ -117,7 +118,10 @@ export async function collectHttp(tel: Telemetry, f: HttpFamily, at: Date, windo
 // ---- Error counters (SQS consumer errors, …) --------------------------------
 export async function collectCounter(tel: Telemetry, c: ErrorCounter, at: Date, windowMin: number, t: Thresholds = DEFAULT_THRESHOLDS): Promise<Row[]> {
   const query = `sum by (${c.group_by.join(', ')}) (increase(${c.selector}[${windowMin}m]))`;
-  const cells = await fourWay(tel, query, at, (s) => c.group_by.map((g) => s.labels[g] ?? '?').join('\u0000'));
+  const [cells] = await Promise.all([
+    fourWay(tel, query, at, (s) => c.group_by.map((g) => s.labels[g] ?? '?').join('\u0000')),
+    c.presence ? requireSeries(tel, c.presence, at, 'live scrape target') : undefined,
+  ]);
   const rows: Row[] = [];
   for (const [k, { counts }] of cells) {
     const parts = k.split('\u0000');
