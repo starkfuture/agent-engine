@@ -3,6 +3,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import type { Sample } from '../src/clients/telemetry.js';
 import type { Config } from '../src/config.js';
 import { loadAgent } from '../src/engine/agent.js';
@@ -431,6 +432,36 @@ test('with the buttons off, recorded clicks are kept and ignored: posting is as 
   w.flags.buttons = true;
   const back = await w.patrol(tel, 12);
   assert.equal(back.filed[0]?.action, 'muted');
+});
+
+test('a click Slack delivers again at the latest click time changes nothing, also after its mute was lifted', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const w = setup();
+  const id = opened(await w.patrol(tel, 0));
+  const ctx = { issues: w.issues, outbox: w.box, ids: IDS, now: () => w.clock.now };
+  const t = (n: number) => `1700000300.${String(n).padStart(6, '0')}`;
+  onClick(payload(ACTION.dismissed, id, { user: 'U0BOB', actionTs: t(1) }), ctx);
+  const again = payload(ACTION.dismissed, id, { user: 'U0BOB', actionTs: t(2) });
+  onClick(again, ctx); // the same button again before the message changed: nothing new to record
+  w.issues.liftMute(id, w.clock.now); // a rise to critical ended the mute
+  assert.equal(onClick(again, ctx).updated, undefined, 'its redelivery');
+  assert.equal(w.issues.disposition(id, w.clock.now), undefined);
+});
+
+test('a click and its message update commit together: when the update cannot be queued, the click is not recorded', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const w = setup();
+  const id = opened(await w.patrol(tel, 0));
+  const ctx = { issues: w.issues, outbox: w.box, ids: IDS, now: () => w.clock.now };
+  const raw = new DatabaseSync(w.db);
+  raw.exec(`CREATE TRIGGER outbox_full BEFORE INSERT ON slack_outbox BEGIN SELECT RAISE(ABORT, 'disk full'); END`);
+  assert.throws(() => onClick(payload(ACTION.dismissed, id, { user: 'U0BOB' }), ctx), /disk full/);
+  assert.equal(w.issues.disposition(id, w.clock.now), undefined);
+  assert.deepEqual(w.issues.events(id).map((e) => e.type), ['opened']);
+  raw.exec(`DROP TRIGGER outbox_full`);
+  assert.equal(onClick(payload(ACTION.dismissed, id, { user: 'U0BOB' }), ctx).updated, id, 'clicked again, it goes through');
+  await w.box.flush();
+  assert.equal(w.t.updates.length, 1);
 });
 
 test('a duplicate click makes one update; two clicks before a flush make one too', async () => {

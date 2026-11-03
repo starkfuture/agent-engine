@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { MUTE_DAYS, type Click, type Disposition, type Issue, type Issues } from '../patrol/issues.js';
-import type { SlackOutbox } from '../output/slack.js';
+import { queueRootUpdate, type SlackOutbox } from '../output/slack.js';
 
 // The buttons on an issue's Slack message: "On it" and "Not an issue", and
 // Undo. A click is recorded on the issue (patrol/issues.ts) and changes what
@@ -92,18 +92,14 @@ export function onClick(body: unknown, o: { issues: Issues; outbox: SlackOutbox;
   const id = ts ? o.outbox.issueAt(ts) : undefined;
   if (!id || a.value !== id) return nothing("This message isn't an issue the engine tracks.");
   const now = (o.now ?? (() => new Date()))();
-  const r = o.issues.click(id, click, b.user.id, now, a.action_ts);
+  // The click and its message update commit together.
+  const r = o.issues.click(id, click, b.user.id, now, a.action_ts, o.outbox.buttons ? (db) => queueRootUpdate(db, id, now) : undefined);
   if (r.result === 'unknown') return nothing("This message isn't an issue the engine tracks.");
   if (r.result === 'stale') return nothing(`${id} has a later click than this one.`);
   if (r.result === 'resolved') return nothing(`${id} is resolved.`);
   if (r.result === 'unchanged')
     return nothing(click === 'undo' ? `${id} has no On it or Not an issue to undo.` : `${id} is already marked ${click === 'acknowledged' ? 'On it' : 'Not an issue'} by you.`);
   o.log?.(`${id}: ${click === 'undo' ? 'Undo' : click === 'acknowledged' ? 'On it' : 'Not an issue'} (Slack button)`);
-  try {
-    o.outbox.updateRoot(id);
-  } catch (e) {
-    o.log?.(`${id}: the message update could not be queued: ${(e as Error).message.slice(0, 200)}`);
-  }
   const reply =
     click === 'acknowledged'
       ? `On it: ${id} is yours. Its reports stay in the thread with no daily reminder, and a row that gets worse gets one line there instead of an AI run.`

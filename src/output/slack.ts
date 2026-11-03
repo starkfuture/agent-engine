@@ -143,6 +143,21 @@ function retryDelayMs(attempts: number, retryAfterSec?: number): number {
   return Math.max(backoff, after);
 }
 
+// Queue an update of the issue's first message on any connection to
+// engine.db, inside the caller's transaction: a click commits together with
+// its update (patrol/issues.ts click()).
+export function queueRootUpdate(db: DatabaseSync, issue: string, at: Date): void {
+  // The update it replaces may be waiting for Slack's Retry-After: so does this one.
+  const was = db.prepare(`SELECT attempts, next_attempt_at FROM slack_outbox WHERE kind = 'root' AND issue = ? AND status = 'pending_update' ORDER BY id DESC LIMIT 1`).get(issue) as { attempts: number; next_attempt_at: string | null } | undefined;
+  db.prepare(`UPDATE slack_outbox SET status = 'superseded' WHERE kind = 'root' AND issue = ? AND status = 'pending_update'`).run(issue);
+  db.prepare(`INSERT INTO slack_outbox (created_at, kind, keys, broadcast, message, status, issue, attempts, next_attempt_at) VALUES (?, 'root', '[]', 0, '{"text":"","blocks":[]}', 'pending_update', ?, ?, ?)`).run(
+    at.toISOString(),
+    issue,
+    was?.attempts ?? 0,
+    was?.next_attempt_at ?? null,
+  );
+}
+
 type Pending = {
   id: number; created_at: string; kind: PostKind; keys: string; broadcast: number; message: string; attempts: number; issue: string | null; repeat: number; next_attempt_at: string | null;
 };
@@ -259,12 +274,7 @@ export class SlackOutbox {
     if (!this.o.controls) return;
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      // The update it replaces may be waiting for Slack's Retry-After: so does this one.
-      const was = this.db.prepare(`SELECT attempts, next_attempt_at FROM slack_outbox WHERE kind = 'root' AND issue = ? AND status = 'pending_update' ORDER BY id DESC LIMIT 1`).get(issue) as { attempts: number; next_attempt_at: string | null } | undefined;
-      this.db.prepare(`UPDATE slack_outbox SET status = 'superseded' WHERE kind = 'root' AND issue = ? AND status = 'pending_update'`).run(issue);
-      this.db
-        .prepare(`INSERT INTO slack_outbox (created_at, kind, keys, broadcast, message, status, issue, attempts, next_attempt_at) VALUES (?, 'root', '[]', 0, '{"text":"","blocks":[]}', 'pending_update', ?, ?, ?)`)
-        .run(this.o.now().toISOString(), issue, was?.attempts ?? 0, was?.next_attempt_at ?? null);
+      queueRootUpdate(this.db, issue, this.o.now());
       this.db.exec('COMMIT');
     } catch (e) {
       this.db.exec('ROLLBACK');
@@ -323,8 +333,9 @@ export class SlackOutbox {
     }
   }
 
+  // What this sender would send. Message updates wait for one with the buttons.
   private pendingCount(): number {
-    return Number((this.db.prepare(`SELECT COUNT(*) AS n FROM slack_outbox WHERE status IN ('pending', 'pending_update')`).get() as { n: number }).n);
+    return Number((this.db.prepare(`SELECT COUNT(*) AS n FROM slack_outbox WHERE status IN ('pending', ${this.o.controls ? `'pending_update'` : `''`})`).get() as { n: number }).n);
   }
 
   private async sendPending(log: (s: string) => void, renew: () => boolean): Promise<FlushResult> {
@@ -341,6 +352,12 @@ export class SlackOutbox {
         this.db.prepare(`UPDATE slack_outbox SET status = 'gave_up' WHERE id = ?`).run(p.id);
         log(`slack: gave up on ${p.kind} post ${p.id} after ${p.attempts} attempt(s)`);
         out.failed++;
+        last = p.id;
+        continue;
+      }
+      // A sender without the buttons (a one-shot `patrol --post`) leaves message
+      // updates queued for the one that has them, and holds nothing back for them.
+      if (p.kind === 'root' && !this.o.controls) {
         last = p.id;
         continue;
       }

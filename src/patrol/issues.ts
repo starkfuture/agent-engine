@@ -249,8 +249,10 @@ export class Issues {
   // same click again changes nothing (so Slack is updated once). A later click
   // replaces an earlier one: the last person to say On it is on it.
   // `actionTs` is Slack's time of the click: a click Slack delivers again, or
-  // one older than a click already recorded, changes nothing.
-  click(id: string, click: Click, by: string, at: Date, actionTs?: string): Clicked {
+  // one not newer than the latest click, changes nothing. `alongside`: more
+  // writes to engine.db that commit with a change, or not at all (its Slack
+  // message update).
+  click(id: string, click: Click, by: string, at: Date, actionTs?: string, alongside?: (db: DatabaseSync) => void): Clicked {
     return this.tx((): Clicked => {
       const row = this.row(id);
       if (!row) return { result: 'unknown' };
@@ -260,7 +262,7 @@ export class Issues {
       if (actionTs) {
         const mark = (this.db.prepare(`SELECT click_ts FROM issues WHERE id = ?`).get(id) as { click_ts: string | null }).click_ts;
         const recorded = this.db.prepare(`SELECT 1 FROM issue_events WHERE issue_id = ? AND type IN ('acknowledged', 'dismissed', 'undone') AND (json_extract(data, '$.action_ts') > ? OR (json_extract(data, '$.action_ts') = ? AND json_extract(data, '$.by') = ?))`).get(id, actionTs, actionTs, by);
-        if ((mark && mark > actionTs) || recorded) return { result: 'stale', issue };
+        if ((mark && mark >= actionTs) || recorded) return { result: 'stale', issue };
         // The mark older clicks must beat, also when this one changes nothing.
         this.db.prepare(`UPDATE issues SET click_ts = ? WHERE id = ?`).run(actionTs, id);
       }
@@ -270,6 +272,7 @@ export class Issues {
         if (!before) return { result: 'unchanged', issue };
         this.clear(id);
         this.event(id, 'undone', at, { by, ...ts, was: before.kind, was_by: before.by });
+        alongside?.(this.db);
         return { result: 'changed', issue };
       }
       if (before?.kind === click && before.by === by) return { result: 'unchanged', issue, now: before };
@@ -277,6 +280,7 @@ export class Issues {
       this.db.prepare(`UPDATE issues SET disposition = ?, disposed_by = ?, disposed_at = ?, muted_until = ? WHERE id = ?`).run(now.kind, by, now.at, now.until ?? null, id);
       // A dismissal is a noise-rule candidate: it keeps the rows it was about.
       this.event(id, click, at, { by, ...ts, ...(now.until ? { until: now.until, rows: issue.rows } : {}) });
+      alongside?.(this.db);
       return { result: 'changed', issue, now };
     });
   }

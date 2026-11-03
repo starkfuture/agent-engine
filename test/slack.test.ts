@@ -344,3 +344,20 @@ test('a message update a click replaces while it is out stays replaced, and its 
   assert.deepEqual(await box.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
   assert.equal(updates, 2);
 });
+
+test('a sender without the buttons leaves message updates queued for the one that has them', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'outbox-oneshot-')), 'engine.db');
+  const updates: string[] = [];
+  const bot = Object.assign(fakeBot(), { update: async (ts: string) => void updates.push(ts) });
+  const loop = new SlackOutbox(file, bot, { sleep: async () => {}, gapMs: 0, controls: () => [{ type: 'actions', elements: [] }] });
+  loop.enqueue({ kind: 'report', keys: ['k'], broadcast: true, issue: 'I-abcd', message: msg('new issue, with its buttons') });
+  await loop.flush();
+  loop.updateRoot('I-abcd'); // a click
+  // A one-shot `patrol --post` on the same database, without the app token.
+  const oneShot = new SlackOutbox(file, bot, { sleep: async () => {}, gapMs: 0 });
+  oneShot.enqueue({ kind: 'rows', keys: ['k2'], broadcast: true, message: msg('a one-shot patrol card') });
+  assert.deepEqual(await oneShot.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
+  assert.deepEqual(updates, [], 'not sent without the buttons');
+  assert.deepEqual(await loop.flush(), { sent: 1, pending: 0, failed: 0, skipped: 0 });
+  assert.deepEqual(updates, ['1700000000.000001']);
+});

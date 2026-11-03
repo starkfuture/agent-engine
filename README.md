@@ -135,10 +135,10 @@ With Socket Mode on (`SLACK_APP_TOKEN`; setup in `slack/README.md`), an issue's 
 | it never resolves | On it stays | the mute ends after 7 days |
 
 - **Undo** takes either back. Not an issue asks to confirm first.
-- **The latest click wins**, by Slack's click time, and the same click twice changes nothing. A click Slack delivers again, or one older than the latest click (even one that changed nothing), changes nothing. Two clicks before Slack is reached make one update.
+- **The latest click wins**, by Slack's click time, and the same click twice changes nothing. A click Slack delivers again, or one not newer than the latest click (even one that changed nothing), changes nothing. Two clicks before Slack is reached make one update.
 - **Not an issue is a noise-rule candidate**, recorded with its rows, who and when. Admins read the list with the MCP tool `noise_candidates`. A rule that hides rows for good stays a reviewed change to `config/noise.yaml`.
 - **Every click is checked:** our app, our workspace, our channel, and a message that is an open issue's first message. Anything else gets a reply that nothing changed.
-- **The click is recorded before Slack is acknowledged**, in `issues` and the append-only `issue_events` (acknowledged, dismissed, undone, mute_lifted, worse_noted). The message update goes through the outbox, after any post queued before it.
+- **The click is recorded before Slack is acknowledged**, in `issues` and the append-only `issue_events` (acknowledged, dismissed, undone, mute_lifted, worse_noted), in one transaction with its message update in the outbox. The update goes out after any post queued before it, and only from a process with the buttons on.
 - **Without `SLACK_APP_TOKEN`** there are no buttons and no updates, and nothing above changes what is posted. Clicks already recorded are kept, and apply again when the token is back.
 
 The baseline is `min(1 d, 7 d)`, scaled by current traffic, so a one-day incident doesn't become its own baseline the next day. The 1 h window only labels a row "started" or "ongoing".
