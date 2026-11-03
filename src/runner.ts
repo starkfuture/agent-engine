@@ -209,6 +209,8 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   // delays or hides those. Otherwise it stays on disk and the AI's reports decide.
   // A protected journey among the urgent rows needs a person now: the card mentions the on-call.
   const oncall = urgentRows.some((r) => noise.protected(r)) ? cfg.slackOncall : undefined;
+  // Rows the on-call has just been mentioned for: a report on any of them doesn't mention them again.
+  const paged = new Set(oncall ? urgentRows.map((r) => r.key) : []);
   const card = patrolCard(summary, skip ? `not investigated: ${skip}` : 'AI investigation started', {
     owners: o.owners,
     oncall,
@@ -269,7 +271,8 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     for (const [i, r] of inv.outputs.entries()) {
       const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId), { action: 'none' }) : { action: 'none' };
       result.filed.push(f);
-      const cc = [...new Set([...(cfg.slackOncall && pagesOncall(f, r) ? [cfg.slackOncall] : []), ...ownersOf(r)])];
+      const page = pagesOncall(f, r) && !r.rows.some((k) => paged.has(k)) ? cfg.slackOncall : undefined;
+      const cc = [...new Set([...(page ? [page] : []), ...ownersOf(r)])];
       const card = reportCard(r, summary.at, footer, inv.challenge, cc, issueRef(f));
       const post = postFor(f, r);
       emit(card, `${stamp(summary.at)}-${i + 1}`, post);
