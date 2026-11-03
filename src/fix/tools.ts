@@ -15,10 +15,14 @@ import { isSecretFile } from '../engine/snapshot.js';
 
 export const MAX_FILES = 20;
 const MAX_BYTES = 300_000;
+// A repo path: letters, digits and . _ - / @ + [ ] ( ) (Next.js route folders
+// use @, [ ] and ( )). No spaces, newlines, control characters, backticks, <
+// or &: a file name goes into the PR body, and must not break out of it.
+const PATH = /^[A-Za-z0-9._@+\-/[\]()]+$/;
 
 // Where a path the model gave lands, relative to the repo root, or why it can't.
 export function fixPath(root: string, p: string): { rel: string } | { error: string } {
-  if (!p || p.length > 300 || p.includes('\0') || p.includes('\\')) return { error: `not a usable path: ${p.slice(0, 80)}` };
+  if (!p || p.length > 300) return { error: 'a path to a file is needed, 300 characters at most' };
   let rel = p;
   if (isAbsolute(p)) {
     const r = relative(root, p);
@@ -28,6 +32,7 @@ export function fixPath(root: string, p: string): { rel: string } | { error: str
   if (p.startsWith('~') || rel.split('/').includes('..')) return { error: `path is outside the repo: ${p}` };
   rel = normalize(rel).split(sep).join('/').replace(/^\.\//, '');
   if (!rel || rel === '.') return { error: 'a path to a file is needed' };
+  if (!PATH.test(rel)) return { error: `not a plain repo path (letters, digits and . _ - / @ + [ ] ( ) only): ${JSON.stringify(rel.slice(0, 80))}` };
   const parts = rel.toLowerCase().split('/');
   if (parts.includes('.git')) return { error: `git internals are off limits: ${rel}` };
   if (rel.toLowerCase().startsWith('.github/workflows/')) return { error: `CI workflows are off limits: ${rel}` };

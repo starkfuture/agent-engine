@@ -88,6 +88,7 @@ export interface ClickResult {
 // after the checks below, before Slack is acknowledged.
 export interface FixButton {
   click(c: { issue: string; by: string; actionTs: string; now: Date; respondTo?: string | undefined }): ClickResult;
+  stop?(reason: string): void; // the buttons stop: no fix writes to GitHub after this
 }
 
 // One button click, recorded before Slack is acknowledged. The ids are checked

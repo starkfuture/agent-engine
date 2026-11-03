@@ -72,13 +72,17 @@ export function startButtons(o: ButtonsOptions): { ready: Promise<void>; stop():
       const url = (body as { response_url?: unknown } | undefined)?.response_url;
       r = typeof url === 'string' && RESPONSE_URL.test(url) ? { respondTo: url, reply: 'The engine could not record that click. Nothing changed; try again.' } : {};
     }
+    // The rest goes on whether or not Slack took the ack: the click is
+    // recorded, and a recorded Draft a fix must start (Slack's redelivery of
+    // the click is stale).
     void (ack?.() ?? Promise.resolve())
+      .catch(() => o.log('buttons: Slack did not take the acknowledgement'))
       .then(async () => {
         if (r.reply && r.respondTo) await (o.respond ?? respond)(r.respondTo, r.reply).catch(() => o.log('buttons: the reply to a click failed'));
         if (r.updated && !stopped) await o.outbox.flush(o.log);
         if (r.after && !stopped) void r.after().catch(() => o.log('buttons: the work after a click failed'));
       })
-      .catch(() => o.log('buttons: Slack did not take the acknowledgement'));
+      .catch(() => o.log('buttons: the reply or update after a click failed'));
   });
   client.on('connected', () => o.log('Slack Socket Mode connected: buttons on'));
   client.on('disconnected', () => o.log('Slack Socket Mode disconnected'));
@@ -98,6 +102,7 @@ export function startButtons(o: ButtonsOptions): { ready: Promise<void>; stop():
     ready,
     async stop() {
       stopped = true;
+      o.fix?.stop?.('the engine is shutting down');
       await client.disconnect().catch(() => {});
     },
   };

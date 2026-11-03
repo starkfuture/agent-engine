@@ -200,11 +200,12 @@ The rules, each checked in code and tested:
 
 - **One draft PR per issue.** A later click links it. A click while one is being drafted changes nothing. A fix branch already on GitHub without a PR is refused before any spend.
 - **It spends as the codebase agent**, under that agent's caps in `agents/codebase/agent.yaml` ($2 a run, $10 a day) and the engine's. When a cap refuses or the kill switch is on, nothing is pushed. However an attempt ends without a PR, the clicker hears why, the issue records it, and the button works again.
+- **The kill switch and a shutdown are checked again** right before the push and right before the PR, since both come after the run.
 - **The model never gets the token.** The token is asked for one repo, with contents and pull requests write only. Git gets it as a header in environment variables, never in argv or `.git/config`. The model reads a snapshot without `.git`, and its session gets only model credentials.
 - **The push refuses any branch but `agent-engine/fix-<issue id>`** and any repo off the list. It never forces and runs no hooks.
 - **The PR is opened with `draft: true`.** If GitHub answers with a PR ready for review, that is an error, and the clicker is told to mark it draft.
-- **The edit tools take plain repo paths only:** no `..`, no symlinks, no `.git`, no secret files, no CI workflows. Model text on GitHub is redacted, with no images and no @-mentions.
-- **After a restart**, a fix that was being drafted ends as failed, and the button works again.
+- **The edit tools take plain repo paths only:** letters, digits and `. _ - / @ + [ ] ( )`; no `..`, no symlinks, no `.git`, no secret files, no CI workflows. Model and production text on GitHub is redacted, on one line, with no HTML, images or @-mentions; file names and rows sit in code spans.
+- **Every request ends.** After a restart, a fix that was being drafted ends as failed. A request still not started 15 minutes after the click (its Slack acknowledgement or dispatch went wrong) ends the same way. The work starts even when Slack refuses the acknowledgement. The button then works again.
 
 Activation, in order:
 

@@ -324,6 +324,8 @@ async function main() {
     if (!clicks || !bot || !sink.outbox) return undefined;
     if (fixer) {
       fixer.recover();
+      // A request recorded but never started (its dispatch went wrong) ends after 15 min.
+      setInterval(() => fixer.recover({ olderThanMs: 15 * 60_000 }), 5 * 60_000).unref();
       log('Draft a fix: on (draft pull requests through the fix App; repos from config/fixes.yaml)');
     }
     return startButtons({ appToken: cfg.slackApp!.token, appId: cfg.slackApp!.appId, channel: cfg.slackChannel!, team: () => bot.team(), issues: clicks, outbox: sink.outbox, log, fix: fixer });

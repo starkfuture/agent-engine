@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LoadedAgent } from '../engine/agent.js';
@@ -43,13 +43,19 @@ const AUTHOR = ['-c', 'user.name=agent-engine', '-c', 'user.email=agent-engine@n
 const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null']; // the engine never runs the repo's code
 const localEnv = (): NodeJS.ProcessEnv => ({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1' });
 
-// Model and production text that goes on GitHub: redacted, no images, links
-// only to known hosts, one line, and no @-mentions (they would notify people).
-export const prText = (s: string, n = 900): string => {
+// Model and production text that goes on GitHub, on one line: redacted, no
+// images, links only to known hosts, and no @-mentions (they would notify
+// people). For titles and the commit message, which GitHub shows as text.
+const oneLine = (s: string, n: number): string => {
   const t = cleanModelText(redact(s)).replace(/@(?=[A-Za-z0-9_-])/g, '@​').replace(/\s+/g, ' ').trim();
   return t.length > n ? `${t.slice(0, n - 1)}…` : t;
 };
-const code = (s: string) => `\`${s.replace(/`/g, "'")}\``;
+// The same in the PR body's prose, with no HTML at all: an entity
+// (&#104;ttps://…) gets a URL past the link check, so no tag may form.
+export const prText = (s: string, n = 900): string => oneLine(s, n).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// The same in a code span, where HTML is inert: one line and no backtick, so
+// the span can't end early. File names, rows and ids go here.
+const code = (s: string, n = 300): string => `\`${oneLine(s, n).replace(/`/g, "'")}\``;
 
 const TASK = (id: string, repo: string) =>
   [
@@ -68,6 +74,10 @@ const TASK = (id: string, repo: string) =>
   ].join('\n');
 
 export class Fixer implements FixButton {
+  private readonly running = new Set<string>(); // issues with a fix being drafted in this process
+  private readonly aborts = new Set<AbortController>();
+  private closing?: string;
+
   constructor(private readonly o: FixerOptions) {}
 
   private now(): Date {
@@ -96,17 +106,37 @@ export class Fixer implements FixButton {
     });
   }
 
-  // After a restart nothing is being drafted any more: those requests end, so
-  // the button works again.
-  recover(): string[] {
-    const ids = this.o.issues.pendingFixes();
-    for (const id of ids) {
+  // Every recorded request ends: drafted, or recorded as failed. At start
+  // (no olderThanMs) nothing is being drafted any more. Later, a request older
+  // than olderThanMs with no work in this process never started (its Slack
+  // acknowledgement and dispatch went wrong). Either way the button works again.
+  recover(o: { olderThanMs?: number } = {}): string[] {
+    const ended: string[] = [];
+    for (const id of this.o.issues.pendingFixes()) {
       const f = this.o.issues.fix(id);
       const at = this.now();
-      this.o.issues.fixEnded(id, at, { by: f?.by ?? '', repo: f?.repo ?? '', reason: 'the engine restarted while drafting it' }, this.o.outbox.buttons ? (db) => queueRootUpdate(db, id, at) : undefined);
-      this.o.log(`${id}: the fix being drafted was lost in a restart; the button works again`);
+      if (this.running.has(id) || (o.olderThanMs !== undefined && f && at.getTime() - Date.parse(f.at) < o.olderThanMs)) continue;
+      const reason = o.olderThanMs === undefined ? 'the engine restarted while drafting it' : 'it never started';
+      this.o.issues.fixEnded(id, at, { by: f?.by ?? '', repo: f?.repo ?? '', reason }, this.o.outbox.buttons ? (db) => queueRootUpdate(db, id, at) : undefined);
+      this.o.log(`${id}: a fix request ended unfinished (${reason}); the button works again`);
+      ended.push(id);
     }
-    return ids;
+    return ended;
+  }
+
+  // Stop drafting (the buttons are stopping): runs stop, and no fix writes to
+  // GitHub after this.
+  stop(reason: string): void {
+    this.closing = reason;
+    for (const a of this.aborts) a.abort(reason);
+  }
+
+  // Why a fix must not write to GitHub now, if it mustn't: checked right
+  // before the push and before the PR, since either can come long after the run.
+  private halted(): string | undefined {
+    if (this.closing) return `stopped: ${this.closing}`;
+    if (existsSync(this.o.engine.stopFile)) return 'stopped: the kill switch is on';
+    return undefined;
   }
 
   // The work for one click. Never throws: every way it ends is recorded on the
@@ -122,6 +152,9 @@ export class Fixer implements FixButton {
     let outcome = '';
     let pushed = false;
     const changes = new Map<string, string>();
+    const abort = new AbortController();
+    this.running.add(id);
+    this.aborts.add(abort);
     const failed = async (reason: string) => {
       outcome = `No pull request: ${reason}`;
       await this.end(id, { by, repo, reason, run: run?.runId });
@@ -157,6 +190,7 @@ export class Fixer implements FixButton {
         output: fixOutput(changes),
         roots: [{ path: dir, ref: 'HEAD' }],
         challenge: false,
+        signal: abort.signal,
       });
       if (run.status === 'skipped') return await failed(run.note ?? 'the run was skipped');
       const fix = run.outputs[0];
@@ -168,14 +202,20 @@ export class Fixer implements FixButton {
       for (const [rel, content] of changes) writeInto(dir, rel, content);
       await git(['-C', dir, 'add', '--', ...changes.keys()], local);
       if (!(await git(['-C', dir, 'diff', '--cached', '--name-only'], local)).trim()) return await failed("the agent's edits change nothing");
-      await git(['-C', dir, ...AUTHOR, ...NO_HOOKS, 'commit', '--quiet', '--no-verify', '-m', `Draft fix: ${prText(issue.title, 180)}\n\nIssue ${id}, drafted by agent-engine (run ${run.runId}). Review before marking ready.`], local);
+      await git(['-C', dir, ...AUTHOR, ...NO_HOOKS, 'commit', '--quiet', '--no-verify', '-m', `Draft fix: ${oneLine(issue.title, 180)}\n\nIssue ${id}, drafted by agent-engine (run ${run.runId}). Review before marking ready.`], local);
+      let halt = this.halted();
+      if (halt) return await failed(halt);
       await pushFixBranch(git, { dir, repo, branch, base, token });
       pushed = true;
-      const pr = await o.github.openDraft(repo, { branch, base: target, title: `Draft fix: ${prText(issue.title, 200)}`, body: this.body(issue, fix, [...changes.keys()], run) }, token);
+      halt = this.halted();
+      if (halt) return await failed(halt);
+      const pr = await o.github.openDraft(repo, { branch, base: target, title: `Draft fix: ${oneLine(issue.title, 200)}`, body: this.body(issue, fix, [...changes.keys()], run) }, token);
       await drafted(pr);
     } catch (e) {
-      await failed(prText((e as Error).message, 300)).catch((err) => o.log(`${id}: the fix's end could not be recorded: ${redact((err as Error).message).slice(0, 200)}`));
+      await failed(oneLine((e as Error).message, 300)).catch((err) => o.log(`${id}: the fix's end could not be recorded: ${redact((err as Error).message).slice(0, 200)}`));
     } finally {
+      this.running.delete(id);
+      this.aborts.delete(abort);
       if (scratch) rmSync(scratch, { recursive: true, force: true });
       if (run?.dir) this.answer(run, id, issue, outcome, [...changes.keys()]);
     }
@@ -236,33 +276,7 @@ export class Fixer implements FixButton {
   }
 
   private body(issue: Issue, fix: Fix, files: string[], run: RunResult<Fix>): string {
-    const r = this.report(issue);
-    return [
-      `Draft fix for issue **${issue.id}** from the agent-engine monitor: ${prText(issue.title, 200)}`,
-      '',
-      '## Evidence',
-      `Rows: ${issue.rows.map((k) => code(prText(k, 200))).join(', ')}`,
-      ...(r ? ['', `What broke: ${prText(r.what_broke)}`, `Impact: ${prText(r.impact)}`, '', ...r.evidence.map((e) => `- ${prText(e.claim, 300)}: “${prText(e.quote, 300)}”`)] : ['', "The monitor run with the evidence is gone (retention)."]),
-      '',
-      '## Likely cause',
-      `The monitor: ${prText(issue.hypothesis)}`,
-      '',
-      `In the code: ${prText(fix.cause)}`,
-      ...fix.evidence.map((e) => `- ${e.id}: “${prText(e.quote, 300)}”`),
-      '',
-      '## The change',
-      prText(fix.summary, 1500),
-      '',
-      `Test: ${prText(fix.test, 600)}`,
-      '',
-      `Files: ${files.map(code).join(', ')}`,
-      ...(fix.notes.length ? ['', "## The model's notes", ...fix.notes.map((n) => `- ${prText(n, 400)}`)] : []),
-      '',
-      '---',
-      `Asked for with the Draft a fix button on ${issue.id}'s Slack message. ${this.o.agent.spec.name}@${this.o.agent.version} run ${code(run.runId)}, $${run.cost.toFixed(2)}: \`get_run\` and \`get_evidence\` on the agent-engine MCP server show it.`,
-      '',
-      'Generated by agent-engine; review before marking ready.',
-    ].join('\n');
+    return prBody({ issue, report: this.report(issue), fix, files, run, agent: this.o.agent });
   }
 
   // get_run's answer for the fix run.
@@ -285,4 +299,36 @@ export class Fixer implements FixButton {
       /* get_run then shows no answer; the issue's record has the outcome */
     }
   }
+}
+
+// The draft PR's body. Everything the model or production wrote goes through
+// prText (prose) or code (code spans), file names included.
+export function prBody(o: { issue: Issue; report?: StoredReport | undefined; fix: Fix; files: string[]; run: RunResult<Fix>; agent: LoadedAgent }): string {
+  const { issue, report: r, fix, files, run } = o;
+  return [
+    `Draft fix for issue **${issue.id}** from the agent-engine monitor: ${prText(issue.title, 200)}`,
+    '',
+    '## Evidence',
+    `Rows: ${issue.rows.map((k) => code(k, 200)).join(', ')}`,
+    ...(r ? ['', `What broke: ${prText(r.what_broke)}`, `Impact: ${prText(r.impact)}`, '', ...r.evidence.map((e) => `- ${prText(e.claim, 300)}: “${prText(e.quote, 300)}”`)] : ['', "The monitor run with the evidence is gone (retention)."]),
+    '',
+    '## Likely cause',
+    `The monitor: ${prText(issue.hypothesis)}`,
+    '',
+    `In the code: ${prText(fix.cause)}`,
+    ...fix.evidence.map((e) => `- ${e.id}: “${prText(e.quote, 300)}”`),
+    '',
+    '## The change',
+    prText(fix.summary, 1500),
+    '',
+    `Test: ${prText(fix.test, 600)}`,
+    '',
+    `Files: ${files.map((f) => code(f)).join(', ')}`,
+    ...(fix.notes.length ? ['', "## The model's notes", ...fix.notes.map((n) => `- ${prText(n, 400)}`)] : []),
+    '',
+    '---',
+    `Asked for with the Draft a fix button on ${issue.id}'s Slack message. ${o.agent.spec.name}@${o.agent.version} run ${code(run.runId)}, $${run.cost.toFixed(2)}: \`get_run\` and \`get_evidence\` on the agent-engine MCP server show it.`,
+    '',
+    'Generated by agent-engine; review before marking ready.',
+  ].join('\n');
 }
