@@ -185,14 +185,16 @@ test('past its monthly share the monitor patrols without the AI, exactly as at a
   assert.equal(share.r.investigation?.status, 'skipped');
   assert.equal(share.r.skippedLlm, 'investigator skipped: agent monthly cap $10 reached');
   assert.equal(share.session.requests.length, 0, 'no model call');
-  assert.equal(share.r.cards.length, 1);
+  assert.equal(share.r.cards.length, 2);
   assert.ok(share.r.cards[0]!.endsWith('-rows.md'));
+  assert.ok(share.r.cards[1]!.endsWith('-paused.md'), 'then the channel is told the AI is paused');
   assert.deepEqual(share.r.slack, share.r.cards, 'the urgent rows card went to Slack');
-  assert.equal(share.sent.length, 1);
+  assert.equal(share.sent.length, 2);
 
   const month = await patrol({ monthlyCapUsd: 10 }); // what any cap did before the share existed
   assert.equal(month.r.skippedLlm, 'investigator skipped: monthly cap $10 reached');
-  assert.deepEqual(share.sent, month.sent, 'the same card, the same posts');
+  assert.deepEqual(share.sent[0], month.sent[0], 'the same card');
+  assert.deepEqual([share.sent[1], month.sent[1]], ["⏸️ AI paused: the monitor's monthly AI budget ($10) is used up", '⏸️ AI paused: the monthly AI budget across all agents ($10) is used up'], 'each pause says which cap');
   assert.deepEqual(
     [share.r.filed, share.r.resolved, share.r.cards.map((f) => basename(f)), share.r.investigation?.outputs],
     [month.r.filed, month.r.resolved, month.r.cards.map((f) => basename(f)), month.r.investigation?.outputs],
@@ -596,7 +598,7 @@ const LOGIN = 'http|backend-production|/v1/auth/login|400';
 // 20 400s a window on each route from its start time: worth a look, not urgent.
 const firing = (since: Record<string, string>) =>
   new FakeTelemetry((q, at) => {
-    if (q.startsWith('count(kube_pod_container_status_restarts_total')) return [{ labels: {}, value: 120 }];
+    if (/^count\(kube_(pod_container_status_restarts_total|deployment_spec_replicas)\b/.test(q)) return [{ labels: {}, value: 120 }];
     if (!q.includes('backend_be_production_http_requests_total')) return [];
     return Object.entries(since).flatMap(([route, from]) => [
       { labels: { route, status_code: '200' }, value: 1000 },
@@ -769,7 +771,7 @@ test('work still owed when a row recovers ends there: back within 6 h, it waits 
   const m = monitor(c, fakeSession(investigator(asked, () => []), investigator(asked, () => [])));
   // 400s from 12:00, none from 12:20 to 12:40, then back.
   const tel = new FakeTelemetry((q, at) => {
-    if (q.startsWith('count(kube_pod_container_status_restarts_total')) return [{ labels: {}, value: 120 }];
+    if (/^count\(kube_(pod_container_status_restarts_total|deployment_spec_replicas)\b/.test(q)) return [{ labels: {}, value: 120 }];
     if (!q.includes('backend_be_production_http_requests_total')) return [];
     const t = at.getTime();
     const on = t >= Date.parse('2026-09-29T12:00:00Z') && !(t >= Date.parse('2026-09-29T12:20:00Z') && t < Date.parse('2026-09-29T12:40:00Z'));

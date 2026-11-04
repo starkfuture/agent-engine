@@ -38,7 +38,7 @@ const doubles = (from: number, worse: number, to = 40) => (t: number) => (t >= T
 
 function schedule(s: Schedule) {
   return new FakeTelemetry((query: string, when: Date): Sample[] => {
-    if (query.startsWith('count(kube_pod_container_status_restarts_total')) return [{ labels: {}, value: 120 }];
+    if (/^count\(kube_(pod_container_status_restarts_total|deployment_spec_replicas)\b/.test(query)) return [{ labels: {}, value: 120 }];
     if (!query.includes('backend_be_production_http_requests_total')) return [];
     return Object.entries(s).flatMap(([route, f]) => [
       { labels: { route, status_code: '200' }, value: 1000 },

@@ -3,6 +3,7 @@ import { createServer, type Server } from 'node:http';
 import { freeBytes } from './engine/retention.js';
 import type { Engine } from './engine/run.js';
 import type { SyncState } from './mcp/reposync.js';
+import { prometheusBlind } from './output/notices.js';
 import type { PatrolResult } from './runner.js';
 
 // Prometheus metrics for the heartbeat alert: is the engine up, is the patrol
@@ -20,11 +21,13 @@ export class Metrics {
     this.repos = state;
   }
 
+  // A patrol that read nothing from Prometheus (every source but logs and
+  // traces failed) ran, but saw next to nothing: not a success.
   patrol(at: Date, r?: PatrolResult): void {
     this.lastRun = at;
     if (!r) return;
-    this.lastOk = at;
     this.sources = r.summary.sources.map((s) => ({ source: s.source, ok: s.ok }));
+    if (!prometheusBlind(r.summary.sources)) this.lastOk = at;
   }
 
   render(engine: Engine, now = new Date()): string {
@@ -51,11 +54,24 @@ export class Metrics {
       gauge('engine_repo_sync_ok', '0 when the last sync of this repo failed.', rows.map(([repo, s]) => [{ repo }, s.lastError ? 0 : 1]));
     }
     gauge('engine_runs_today', 'Runs started today (UTC), by agent and status.', engine.store.counts(day).map((c) => [{ agent: c.agent, status: c.status }, c.n]));
+    // Per agent too (agent label), after the totals, which stay as they were:
+    // every agent that ran this month, and every agent with a monthly share.
+    const month = day.slice(0, 7);
+    const shares = Object.entries(engine.agentMonthlyCapUsd ?? {});
+    const agents = [...new Set([...engine.store.agents(month), ...shares.map(([a]) => a)])].sort();
     gauge('engine_spend_usd', 'Spend booked so far (running runs count their reservation).', [
       [{ period: 'day' }, engine.store.spent(day)],
-      [{ period: 'month' }, engine.store.spent(day.slice(0, 7))],
+      [{ period: 'month' }, engine.store.spent(month)],
+      ...agents.flatMap((agent): Array<[Record<string, string>, number]> => [
+        [{ period: 'day', agent }, engine.store.spent(day, agent)],
+        [{ period: 'month', agent }, engine.store.spent(month, agent)],
+      ]),
     ]);
-    gauge('engine_spend_cap_usd', 'Spend caps across all agents.', [[{ period: 'day' }, engine.dailyCapUsd], ...(engine.monthlyCapUsd !== undefined ? [[{ period: 'month' }, engine.monthlyCapUsd] as [Record<string, string>, number]] : [])]);
+    gauge('engine_spend_cap_usd', "Spend caps across all agents; with agent, that agent's share of the monthly cap.", [
+      [{ period: 'day' }, engine.dailyCapUsd],
+      ...(engine.monthlyCapUsd !== undefined ? [[{ period: 'month' }, engine.monthlyCapUsd] as [Record<string, string>, number]] : []),
+      ...shares.map(([agent, cap]): [Record<string, string>, number] => [{ period: 'month', agent }, cap]),
+    ]);
     return out.join('\n') + '\n';
   }
 }

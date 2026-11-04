@@ -165,6 +165,11 @@ export class Store {
     return this.spentIn(day, agent, user);
   }
 
+  // The agents with a run in a UTC day or month (metrics).
+  agents(day: string): string[] {
+    return (this.db.prepare(`SELECT DISTINCT agent FROM runs WHERE ${day.length === 7 ? 'substr(day, 1, 7)' : 'day'} = ? ORDER BY agent`).all(day) as Array<{ agent: string }>).map((r) => r.agent);
+  }
+
   // visibleTo: only runs that person asked for, or runs of the given agents.
   recent(limit = 30, agentOrFilter?: string | { agent?: string; user?: string; visibleTo?: { user: string; agents: string[] } }): RunRow[] {
     const f = typeof agentOrFilter === 'string' ? { agent: agentOrFilter } : (agentOrFilter ?? {});

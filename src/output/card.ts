@@ -316,3 +316,97 @@ export function worseCard(rows: Array<{ key: string; now: number; was?: number |
   const blocks = [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(`${esc(redact(`${head}\n${lines.map((l) => `• ${l}`).join('\n')}`))}${who}`, 2900) }] }];
   return { text: `${esc(redact(text))}${who}`, blocks, markdown: `**${head}** (On it: ${by}, no AI run)\n${lines.map((l) => `- ${l}`).join('\n')}` };
 }
+
+// ---- notices: the AI paused, sources the patrol can't read ------------------------
+// Code's own top-level messages, each said once when it starts and once when it
+// ends (output/notices.ts). Without them a quiet channel looks the same as a
+// watch that stopped.
+
+// A hold that pauses the AI, as the channel reads it: a spend cap or the kill
+// switch. Others are not announced (undefined): another run still going or a
+// shutdown pass by themselves, and a nearly full volume has its own alert (its
+// note changes every patrol, so each would read as a new hold).
+export function pauseText(reason: string): string | undefined {
+  const cap = (what: string) => new RegExp(`^${what} cap \\$(\\S+) reached`).exec(reason)?.[1];
+  let usd: string | undefined;
+  if ((usd = cap('agent monthly'))) return `the monitor's monthly AI budget ($${usd}) is used up`;
+  if ((usd = cap('agent daily'))) return `the monitor's daily AI budget ($${usd}) is used up until 00:00 UTC`;
+  if ((usd = cap('global daily'))) return `the daily AI budget across all agents ($${usd}) is used up until 00:00 UTC`;
+  if ((usd = cap('monthly'))) return `the monthly AI budget across all agents ($${usd}) is used up`;
+  if (/^kill switch is on/.test(reason)) return `the ${reason}`; // who set it and why, as stop_all wrote it
+  return undefined;
+}
+
+// How long, in the largest unit that reads well.
+function span(ms: number): string {
+  const min = Math.max(0, Math.round(ms / 60_000));
+  if (min < 60) return `${min} min`;
+  if (min < 48 * 60) return `${Math.floor(min / 60)} h${min % 60 ? ` ${min % 60} min` : ''}`;
+  return `${Math.round(min / 1440)} d`;
+}
+
+// A bold first line and a few plain ones. Everything is code's text or
+// production's (a source's error, who set the kill switch): escaped.
+function notice(head: string, lines: string[]): Card {
+  const slack = (s: string) => esc(redact(s));
+  return {
+    text: slack(head),
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: clip(`*${slack(head)}*\n${slack(lines.join('\n'))}`) } }],
+    markdown: `**${redact(head)}**\n${lines.map(redact).join('\n')}`,
+  };
+}
+
+export function pausedCard(why: string, since: string, at: string): Card {
+  return notice(`⏸️ AI paused: ${why}`, [`Since ${when(since, at)}. Urgent rows are still posted; other rows wait until it lifts.`]);
+}
+
+export function resumedCard(why: string, since: string, at: string): Card {
+  return notice('▶️ AI investigations resumed', [`Paused since ${when(since, at)} (${span(Date.parse(at) - Date.parse(since))}): ${why}.`]);
+}
+
+// The kind of failure, in a few words. The patrol file has the whole error.
+export function errorClass(error: string): string {
+  const m = /^(prometheus|loki|tempo): ([\s\S]*)$/.exec(error);
+  const rest = (m?.[2] ?? error).replace(/\s+/g, ' ').trim();
+  const http = /^HTTP (\d{3})\b/.exec(rest);
+  const kind = http
+    ? `HTTP ${http[1]}`
+    : /timeout|timed out|aborted/i.test(rest)
+      ? 'timeout'
+      : /^no .*\bseries\b/.test(rest)
+        ? 'no series (missing data)'
+        : /fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|socket hang up/i.test(rest)
+          ? 'unreachable'
+          : /^non-JSON/.test(rest)
+            ? 'not JSON'
+            : rest.length > 60
+              ? `${rest.slice(0, 59)}…`
+              : rest || 'unknown error';
+  return redact(m ? `${m[1]} ${kind}` : kind);
+}
+
+// Sources the patrol couldn't read this patrol, by kind of failure. `also`:
+// others were already blind, and the channel was told.
+export function blindCard(down: Array<{ source: string; error: string }>, at: string, also = false): Card {
+  const by = new Map<string, string[]>();
+  for (const d of down) by.set(errorClass(d.error), [...(by.get(errorClass(d.error)) ?? []), d.source]);
+  const what = down.length === 1 ? down[0]!.source : `${down.length} sources`;
+  return notice(`⚠️ ${also ? 'Also blind' : 'Blind'} at ${minute(at).slice(11)}: the patrol could not read ${what}`, [
+    ...[...by].map(([kind, sources]) => `• ${sources.join(', ')}: ${kind}`),
+    'Problems there go unseen, and their issues stay open, until they read again.',
+  ]);
+}
+
+// Every source the channel was told is blind reads again: each with how long
+// it was blind (since the first patrol that couldn't read it).
+export function sightCard(back: Array<{ source: string; since: string }>, at: string): Card {
+  const by = new Map<string, string[]>();
+  for (const b of back) {
+    const d = span(Date.parse(at) - Date.parse(b.since));
+    by.set(d, [...(by.get(d) ?? []), b.source]);
+  }
+  const what = back.length === 1 ? back[0]!.source : `${back.length} sources`;
+  const one = by.size === 1 ? [...by.keys()][0] : undefined;
+  const lines = one ? [`• ${back.map((b) => b.source).join(', ')}`] : [...by].map(([d, sources]) => `• ${sources.join(', ')}: blind for ${d}`);
+  return notice(`✅ The patrol reads ${what} again at ${minute(at).slice(11)}${one ? `, after ${one} blind` : ''}`, lines);
+}
