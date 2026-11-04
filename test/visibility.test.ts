@@ -99,6 +99,62 @@ test("the monitor's share used up: one 'AI paused' in the channel, nothing more 
   assert.deepEqual(texts().slice(2), ['⏸️ AI paused: the kill switch is on (set test); an admin clears it with resume']);
 });
 
+// A major report on the rows it is asked about, and a challenger that agrees.
+const major: Script = async function* (sim) {
+  const out = await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+  const id = /evidence_id: (E-[0-9a-f]{4}-\d+)/.exec(out.text)![1]!;
+  const quote = /^\S+ 400 \| [1-9]\d*/m.exec(out.text)![0];
+  const r = await sim.mcp('submit_report', {
+    title: 'Sign-in returns 400',
+    severity: 'major',
+    status: 'active',
+    started_at: '2026-09-29T12:00:00Z',
+    what_broke: 'POST /v1/auth/login returns 400',
+    impact: '2% of sign-ins',
+    cause: { hypothesis: 'a validation change', confidence: 'medium' },
+    evidence: [{ id, quote, claim: 'the route returns 400' }],
+    suggested_fix: 'roll it back',
+    not_checked: [],
+    rows: ['http|backend-production|/v1/auth/login|400'],
+    issue: 'new',
+  });
+  assert.equal(r.isError, false, r.text);
+  yield ok(0.1);
+};
+const agrees: Script = async function* (sim) {
+  await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 });
+  await sim.mcp('submit_challenge', { objections: [], overall: 'Holds up.' });
+  yield ok(0.1, 1);
+};
+
+test('a patrol that dies during the first admitted run after a pause says "resumed" once, after the restart', async () => {
+  const c = cfg();
+  const { box, texts } = webhook();
+  let clock = new Date('2026-09-29T12:15:30Z');
+  const m = monitor(c, fakeSession(major, agrees, major, agrees), { dailyCapUsd: 0, now: () => clock });
+  let state = State.load(c.stateFile);
+  const tel = firing({ '/v1/auth/login': '2026-09-29T12:00:00Z' });
+  const pass = (time: string) => {
+    clock = new Date(Date.parse(time) + 30_000);
+    return patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir, box), new Date(time), { llm: true, post: true }, m);
+  };
+  await pass('2026-09-29T12:15:00Z');
+  assert.equal(texts().length, 1, 'paused');
+  m.engine.dailyCapUsd = 20;
+  // The run is admitted, then the patrol dies before it ends (here: its report can't be queued).
+  const { enqueue } = box;
+  box.enqueue = (p) => {
+    if (p.kind === 'report') throw new Error('database is locked');
+    return enqueue.call(box, p);
+  };
+  await assert.rejects(pass('2026-09-29T12:30:00Z'), /database is locked/);
+  box.enqueue = enqueue;
+  state = State.load(c.stateFile); // the restart
+  const again = await pass('2026-09-29T12:45:00Z');
+  assert.equal(again.investigation?.status, 'ok');
+  assert.equal(texts().filter((t) => t.startsWith('▶️')).length, 1);
+});
+
 test('during a hold the urgent rows card says the AI is paused, not that an investigation started', async () => {
   const c = cfg();
   const { box, texts } = webhook();

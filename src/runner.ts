@@ -246,7 +246,10 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   // rows take the separate fast path below, before the model starts.
   const finish = async () => {
     announceBlind(state.data, summary.sources, summary.at, say);
-    if (monitor) announcePause(state.data, heldNow(state.data.held, now, monitor.engine.stopFile), summary.at, say);
+    if (monitor) {
+      announceResume(state.data, summary.at, say);
+      announcePause(state.data, heldNow(state.data.held, now, monitor.engine.stopFile), summary.at, say);
+    }
     state.save();
     // An issue is resolved once every row of it is back to normal (which needs
     // healthy observers and recoverAfterMinutes without firing), with one
@@ -400,7 +403,6 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
         heldBy,
         onAdmitted: () => {
           admitted = true;
-          announceResume(state.data, summary.at, say); // after a pause the channel heard about, before the reports
         },
       });
     } catch (e) {

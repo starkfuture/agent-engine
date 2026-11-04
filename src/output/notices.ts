@@ -42,11 +42,13 @@ export function announcePause(s: StateData, heldBy: string | undefined, at: stri
   (s.notices ??= {}).paused = { reason: h.reason, since: h.since };
 }
 
-// A run was admitted after a pause the channel was told about: one message
-// that the AI is back, before its reports.
+// After a patrol: a run was admitted since the pause the channel was told about
+// (the runner clears the hold once one is): one message that the AI is back.
+// Here, not at admission, so it is saved with the state in the same breath:
+// a restart during the run doesn't say it twice.
 export function announceResume(s: StateData, at: string, say: Say): void {
   const p = s.notices?.paused;
-  if (!p) return;
+  if (!p || s.held) return;
   say(resumedCard(pauseText(p.reason) ?? p.reason, p.since, at), 'resumed');
   delete s.notices!.paused;
 }
