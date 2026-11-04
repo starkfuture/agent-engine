@@ -217,6 +217,28 @@ test('posting off (replay, a dry patrol): the notices are written to disk and no
   assert.match(readFileSync(blind!, 'utf8'), /http:legacy-v1, workloads, rollouts: prometheus HTTP 503/);
 });
 
+test('a dry patrol on the live state file never keeps the channel from hearing', async () => {
+  const c = cfg();
+  const { box, texts } = webhook();
+  const m = monitor(c, fakeSession(), { dailyCapUsd: 0, now: () => new Date('2026-09-29T12:15:30Z') });
+  let down = true;
+  const tel = new FakeTelemetry((q, at) => {
+    if (down && q.includes('kube_')) throw new SourceError('prometheus', 'HTTP 503: upstream unavailable');
+    return world(q, at);
+  });
+  const pass = (time: string, post: boolean) => patrolOnce(tel, c, new Noise({}), State.load(c.stateFile), new CardSink(c.outDir, box), new Date(time), { llm: true, post }, m);
+  const dry = await pass('2026-09-29T12:15:00Z', false); // someone runs `patrol` by hand, without --post
+  assert.ok(['-blind.md', '-paused.md'].every((n) => dry.cards.some((f) => f.endsWith(n))), 'written to disk');
+  const again = await pass('2026-09-29T12:30:00Z', false);
+  assert.deepEqual(again.cards, [], 'and not again on disk');
+  assert.deepEqual(texts(), []);
+  await pass('2026-09-29T12:45:00Z', true); // the live patrol
+  assert.deepEqual(texts(), ['⚠️ Blind at 12:45Z: the patrol could not read 2 sources', '⏸️ AI paused: the daily AI budget across all agents ($0) is used up until 00:00 UTC']);
+  down = false;
+  await pass('2026-09-29T13:00:00Z', true);
+  assert.deepEqual(texts().slice(2), ['✅ The patrol reads 2 sources again at 13:00Z, after 15 min blind']);
+});
+
 // ---- blind sources ----------------------------------------------------------------
 
 test('sources the patrol cannot read are said once, and once when every one is back, with how long; a restart does not repeat it', async () => {

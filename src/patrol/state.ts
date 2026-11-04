@@ -34,7 +34,7 @@ export interface StateData {
   // The investigator's last run was refused (a cap, the kill switch): the
   // skipped run that recorded it. Ends with the next run that is admitted.
   held?: { reason: string; since: string; runId: string };
-  notices?: Notices; // what the channel was told about pauses and blind sources
+  notices?: Notices; // what was said about pauses and blind sources (output/notices.ts)
 }
 
 const H = 3600_000;

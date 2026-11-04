@@ -245,10 +245,12 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   // Finish by saving the state and delivering any reports/recoveries. Urgent
   // rows take the separate fast path below, before the model starts.
   const finish = async () => {
-    announceBlind(state.data, summary.sources, summary.at, say);
+    // Kept apart: what the channel was told, and what a patrol that doesn't post wrote to disk.
+    const where = o.post && sink.outbox ? 'channel' : 'disk';
+    announceBlind(state.data, where, summary.sources, summary.at, say);
     if (monitor) {
-      announceResume(state.data, summary.at, say);
-      announcePause(state.data, heldNow(state.data.held, now, monitor.engine.stopFile), summary.at, say);
+      announceResume(state.data, where, summary.at, say);
+      announcePause(state.data, where, heldNow(state.data.held, now, monitor.engine.stopFile), summary.at, say);
     }
     state.save();
     // An issue is resolved once every row of it is back to normal (which needs

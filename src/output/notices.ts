@@ -5,17 +5,25 @@ import { blindCard, pausedCard, pauseText, resumedCard, sightCard, type Card } f
 
 // Two states look exactly like a quiet channel: the AI paused (a cap, the kill
 // switch) and sources the patrol can't read. Code says each in the channel once
-// when it starts and once when it ends. What the channel was told is kept in
-// the state file, so a restart doesn't say it again.
-export interface Notices {
-  paused?: { reason: string; since: string }; // the hold the channel was told about
+// when it starts and once when it ends. What was said is kept in the state
+// file, so a restart doesn't say it again: what the channel was told, and apart
+// from it what patrols that don't post (a replay, a dry patrol on the same
+// state file) wrote to disk, so a dry run never keeps the channel from hearing.
+export interface Told {
+  paused?: { reason: string; since: string }; // the hold it was told about
   blind?: Record<string, string>; // the sources it was told are blind, and since which patrol
 }
+export interface Notices {
+  channel?: Told;
+  disk?: Told;
+}
+export type Where = keyof Notices;
 
 // Queues a notice for the channel (or only for disk, with posting off).
 export type Say = (card: Card, name: string) => void;
 
 type Held = NonNullable<StateData['held']>;
+const told = (s: StateData, where: Where): Told => ((s.notices ??= {})[where] ??= {});
 
 // Whether the hold the last refused run recorded still holds. A daily cap ends
 // with its UTC day, a monthly one with its UTC month, the kill switch once its
@@ -31,26 +39,27 @@ export function heldNow(held: Held | undefined, now: Date, stopFile: string): st
   return r;
 }
 
-// After a patrol: a hold that pauses the AI (see pauseText) and that the channel
-// hasn't heard about gets one message. The same hold, next patrols: nothing. A
-// daily cap still refusing the next day is a new hold.
-export function announcePause(s: StateData, heldBy: string | undefined, at: string, say: Say): void {
+// After a patrol: a hold that pauses the AI (see pauseText) and that hasn't
+// been said gets one message. The same hold, next patrols: nothing. A daily cap
+// still refusing the next day is a new hold.
+export function announcePause(s: StateData, where: Where, heldBy: string | undefined, at: string, say: Say): void {
   const h = s.held;
   const why = h && heldBy === h.reason ? pauseText(h.reason) : undefined;
-  if (!h || !why || (s.notices?.paused?.reason === h.reason && s.notices.paused.since === h.since)) return;
+  const p = s.notices?.[where]?.paused;
+  if (!h || !why || (p?.reason === h.reason && p.since === h.since)) return;
   say(pausedCard(why, h.since, at), 'paused');
-  (s.notices ??= {}).paused = { reason: h.reason, since: h.since };
+  told(s, where).paused = { reason: h.reason, since: h.since };
 }
 
-// After a patrol: a run was admitted since the pause the channel was told about
-// (the runner clears the hold once one is): one message that the AI is back.
-// Here, not at admission, so it is saved with the state in the same breath:
-// a restart during the run doesn't say it twice.
-export function announceResume(s: StateData, at: string, say: Say): void {
-  const p = s.notices?.paused;
+// After a patrol: a run was admitted since the pause that was said (the runner
+// clears the hold once one is): one message that the AI is back. Here, not at
+// admission, so it is saved with the state in the same breath: a restart
+// during the run doesn't say it twice.
+export function announceResume(s: StateData, where: Where, at: string, say: Say): void {
+  const p = s.notices?.[where]?.paused;
   if (!p || s.held) return;
   say(resumedCard(pauseText(p.reason) ?? p.reason, p.since, at), 'resumed');
-  delete s.notices!.paused;
+  delete told(s, where).paused;
 }
 
 // Everything but logs (Loki) and traces (Tempo) reads Prometheus.
@@ -65,23 +74,23 @@ export function prometheusBlind(sources: SourceHealth[]): boolean {
   return prom.length > 0 && prom.every((s) => !s.ok);
 }
 
-// After a patrol: sources that failed and the channel hasn't heard about get
-// one message ("also blind" while others still are). One outage, however it
-// spreads: it is over when every source the channel was told about reads again
-// in one patrol, with one message, and how long each was blind. A source no
-// longer patrolled (taken out of the config) leaves it quietly.
-export function announceBlind(s: StateData, sources: SourceHealth[], at: string, say: Say): void {
-  const told = s.notices?.blind ?? {};
+// After a patrol: sources that failed and haven't been said get one message
+// ("also blind" while others still are). One outage, however it spreads: it is
+// over when every source that was said reads again in one patrol, with one
+// message, and how long each was blind. A source no longer patrolled (taken
+// out of the config) leaves it quietly.
+export function announceBlind(s: StateData, where: Where, sources: SourceHealth[], at: string, say: Say): void {
+  const said = s.notices?.[where]?.blind ?? {};
   const failed = sources.filter((x) => !x.ok && !notConfigured(x));
-  const fresh = failed.filter((x) => !Object.hasOwn(told, x.source));
+  const fresh = failed.filter((x) => !Object.hasOwn(said, x.source));
   if (fresh.length) {
-    say(blindCard(fresh.map((x) => ({ source: x.source, error: x.error ?? 'unknown error' })), at, Object.keys(told).length > 0), 'blind');
-    (s.notices ??= {}).blind = { ...told, ...Object.fromEntries(fresh.map((x) => [x.source, at])) };
+    say(blindCard(fresh.map((x) => ({ source: x.source, error: x.error ?? 'unknown error' })), at, Object.keys(said).length > 0), 'blind');
+    told(s, where).blind = { ...said, ...Object.fromEntries(fresh.map((x) => [x.source, at])) };
     return;
   }
-  if (failed.length || !Object.keys(told).length) return;
+  if (failed.length || !Object.keys(said).length) return;
   const ok = new Set(sources.filter((x) => x.ok).map((x) => x.source));
-  const back = Object.entries(told).filter(([k]) => ok.has(k)).map(([source, since]) => ({ source, since }));
+  const back = Object.entries(said).filter(([k]) => ok.has(k)).map(([source, since]) => ({ source, since }));
   if (back.length) say(sightCard(back, at), 'sources-back');
-  delete s.notices!.blind;
+  delete told(s, where).blind;
 }
