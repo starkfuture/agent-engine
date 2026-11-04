@@ -13,7 +13,11 @@ const SECRET_KEY = String.raw`[A-Za-z0-9_]*?(?:password|passwd|passphrase|pwd|se
 const NAME_KEY = String.raw`(?:first|last|full|given|family|middle|sur)[_-]?name`;
 const ADDRESS_KEY = String.raw`(?:(?:billing|shipping|delivery|home|mailing)[_-]?)?(?:address(?:[_-]?line)?[_-]?[0-9]?|street(?:[_-]?address)?[_-]?[0-9]?|city|zip(?:[_-]?code)?|postcode|postal[_-]?code|house[_-]?number)`;
 const PERSONAL_KEY = `(?:${NAME_KEY}|${ADDRESS_KEY})`;
-const REDACTIONS: Array<[RegExp, string]> = [
+// A quoted value, escaped (\"x\") or plain ("x", which may hold \" inside), and
+// the same value with the same quotes around a placeholder, so JSON stays JSON.
+const QUOTED = String.raw`\\"(?:[^"\\]|\\[^"])*\\"|"(?:[^"\\]|\\.)*"|'[^']*'`;
+const keepQuotes = (v: string, ph: string): string => (v.startsWith('\\"') ? `\\"${ph}\\"` : `${v[0]}${ph}${v[0]}`);
+const REDACTIONS: Array<[RegExp, string | ((...a: any[]) => string)]> = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '<private-key>'],
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '<jwt>'],
   [/https:\/\/hooks\.slack\.com\/[A-Za-z0-9/_-]+/g, '<slack-webhook>'],
@@ -29,10 +33,10 @@ const REDACTIONS: Array<[RegExp, string]> = [
   // Names and street addresses by key: quoted values (also escaped JSON), then
   // bare key=value. `name: x` style is only taken for name keys, because
   // "address: ECONNREFUSED" is an error message, not a street.
-  [new RegExp(String.raw`\b(${NAME_KEY})(\\?["']?\s*[:=]\s*)(\\?"(?:[^"\\]|\\[^"])*\\?"|'[^']*')`, 'gi'), '$1$2<name>'],
-  [new RegExp(String.raw`\b(${ADDRESS_KEY})(\\?["']?\s*[:=]\s*)(\\?"(?:[^"\\]|\\[^"])*\\?"|'[^']*')`, 'gi'), '$1$2<address>'],
-  [new RegExp(String.raw`\b(${NAME_KEY})(=|\s*:\s*)(?!<name>)([^\s"',}&\\]+(?: (?![\w-]+[=:])[A-Z][^\s"',}&\\]*){0,2})`, 'gi'), '$1$2<name>'],
-  [new RegExp(String.raw`\b(${ADDRESS_KEY})=(?!<address>)([^\s"',}&\\]+(?: (?![\w-]+[=:])[^\s"',}&\\]+){0,3})`, 'gi'), '$1=<address>'],
+  [new RegExp(String.raw`\b(${NAME_KEY})(\\?["']?\s*[:=]\s*)(${QUOTED})`, 'gi'), (_m, k: string, sep: string, v: string) => `${k}${sep}${keepQuotes(v, '<name>')}`],
+  [new RegExp(String.raw`\b(${ADDRESS_KEY})(\\?["']?\s*[:=]\s*)(${QUOTED})`, 'gi'), (_m, k: string, sep: string, v: string) => `${k}${sep}${keepQuotes(v, '<address>')}`],
+  [new RegExp(String.raw`\b(${NAME_KEY})(=|\s*:\s*)(?!<name>)([^\s"',}&\\]+(?: (?![\w-]+[=:])[A-Z][^\s"',}&\\]*){0,4})`, 'gi'), '$1$2<name>'],
+  [new RegExp(String.raw`\b(${ADDRESS_KEY})=(?!<address>)([^\s"',}&\\]+(?: (?![\w-]+[=:])[^\s"',}&\\]+){0,6})`, 'gi'), '$1=<address>'],
   // Bounded quantifiers keep this linear on long lines.
   [/[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}/g, '<email>'],
   [/\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}\b/g, '<iban>'],
@@ -43,7 +47,7 @@ const REDACTIONS: Array<[RegExp, string]> = [
 
 export function redact(s: string): string {
   let out = s;
-  for (const [re, rep] of REDACTIONS) out = out.replace(re, rep);
+  for (const [re, rep] of REDACTIONS) out = typeof rep === 'string' ? out.replace(re, rep) : out.replace(re, rep);
   return out;
 }
 

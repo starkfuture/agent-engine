@@ -74,8 +74,9 @@ const referral = (n: number, first: string, last: string, street: string) =>
 test('person names and street addresses in JSON log text are masked', () => {
   const s = redact(referral(1, 'Jane', 'Smithers', '12 Quill Lane, Springfield'));
   for (const leak of ['Jane', 'Smithers', 'Quill', 'Springfield']) assert.ok(!s.includes(leak), s);
-  assert.match(s, /"firstName":<name>/);
-  assert.match(s, /"address":<address>/);
+  assert.match(s, /"firstName":"<name>"/);
+  assert.match(s, /"address":"<address>"/);
+  JSON.parse(s.slice(s.indexOf('{')));
   assert.ok(s.includes('"marketingConsent":"true"'), 'other fields stay as evidence');
 });
 
@@ -88,6 +89,12 @@ test('a bare name or address stops at the next field, so codes and routes stay v
   const s = redact('error firstName=Jane Smithers code=PAYMENT_DECLINED street=12 Quill Lane city=Springfield route=/pay');
   for (const leak of ['Jane', 'Smithers', 'Quill', 'Springfield']) assert.ok(!s.includes(leak), s);
   assert.ok(s.includes('code=PAYMENT_DECLINED') && s.includes('route=/pay'), s);
+});
+
+test('an escaped quote inside a name does not end the value early', () => {
+  const s = redact('{"fullName":"Jane \\"JJ\\" Smithers","code":"E1"}');
+  for (const leak of ['Jane', 'JJ', 'Smithers']) assert.ok(!s.includes(leak), s);
+  assert.deepEqual(JSON.parse(s), { fullName: '<name>', code: 'E1' });
 });
 
 test('keys that only look similar are left alone', () => {
