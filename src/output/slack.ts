@@ -305,12 +305,14 @@ export class SlackOutbox {
 
   // Of these rows, the ones with an open thread, grouped by thread: recoveries
   // only make sense as a reply where the problem was posted. One post, one
-  // recovery note at most: a row already noted back isn't again until posted again.
+  // recovery note at most: a row already noted back isn't again until posted
+  // again. A post still queued for it counts: the note goes out after it.
   groupByThread(keys: string[]): string[][] {
     if (!this.transport.threads || !keys.length) return [];
     const since = new Date(this.o.now().getTime() - this.o.threadHours * H).toISOString();
+    const queued = `EXISTS (SELECT 1 FROM slack_outbox o, json_each(o.keys) j WHERE o.status = 'pending' AND o.kind IN ('rows', 'report') AND j.value = slack_threads.key)`;
     const rows = this.db
-      .prepare(`SELECT key, ts FROM slack_threads WHERE key IN (${keys.map(() => '?').join(',')}) AND last_at >= ? AND (recovered_at IS NULL OR recovered_at < last_at)`)
+      .prepare(`SELECT key, ts FROM slack_threads WHERE key IN (${keys.map(() => '?').join(',')}) AND last_at >= ? AND (recovered_at IS NULL OR recovered_at < last_at OR ${queued})`)
       .all(...keys, since) as Array<{ key: string; ts: string }>;
     const by = new Map<string, string[]>();
     for (const r of rows) by.set(r.ts, [...(by.get(r.ts) ?? []), r.key]);
