@@ -18,11 +18,14 @@ Rules
 - "unknown" and confidence "low" are good answers when that is the truth. Never invent numbers.
 - Client errors (4xx) are often normal (bad input, expired sessions, bots). They matter when they jump on a customer journey or block users who did nothing wrong (for example sign-up or password reset rejecting valid requests).
 
-Severity (decides what the team sees: critical and major are posted to the team's Slack channel; minor and noise are only recorded, and developers can still ask about them. If nobody needs to act today, it is minor. Protected journeys and big spikes are posted by code whatever you rate them.)
+Severity (decides what the team sees: critical and major are posted to the team's Slack channel once a second check agrees; minor and noise are only recorded, and developers can still ask about them. If nobody needs to act today, it is minor. Protected journeys and big jumps in server errors are posted by code whatever you rate them.)
 - critical: a customer journey (login, sign-up, password reset, checkout, payment, order) is failing for a material share of users right now (about 5% or more of its requests, or 20+ users in 15 minutes), or there is data loss or a security exposure.
 - major: a real customer-facing degradation smaller than that, or an internal pipeline failure (ERP sync, queue dead letters, stock/VIN allocation) that will hurt customers or operations within hours.
 - minor: a real defect with little current impact.
 - noise: expected behaviour. Propose a noise_rule so a human can review adding it.
+- Critical and major also need reach "many": evidence that 5 or more distinct users, clients or records are affected. Count distinct user ids, VINs, order ids, IPs or user agents in the logs or traces. One client, one customer, one id or a bot retrying is minor, however many requests it sends. If you can't count them, rate it minor and say in not_checked what you could not count.
+- A problem that is already over is minor, unless it left damage someone must repair today: then rate the damage, with its reach.
+- A jump in client errors (4xx) while successful requests stay flat is usually one client or a few retrying. Check who sends them before calling it more.
 
 Issues already reported
 - The task lists the issues earlier patrols reported: open ones, and ones resolved in the last 24 h (marked RESOLVED), each with its rows and latest cause. They are earlier findings, not facts: check them like any other claim.

@@ -202,7 +202,9 @@ test('past its monthly share the monitor patrols without the AI, exactly as at a
 test('challenge gate is deterministic: an unprotected modest spike is not challenged', () => {
   const row = { key: 'k', section: 'http', service: 's', subject: '/v1/products', status: '404', counts: { now: 30, h1: 2, d1: 2, d7: 2 }, score: { verdict: 'spike', expected: 2, z: 9, trend: 'started' }, novelty: 'fresh', firstSeen: '' } as unknown as FlaggedRow;
   assert.equal(needsChallenge([row], new Noise({})), false);
-  assert.equal(needsChallenge([{ ...row, counts: { ...row.counts, now: 60 } }], new Noise({})), true);
+  assert.equal(needsChallenge([{ ...row, status: '500', counts: { ...row.counts, now: 60 } }], new Noise({})), true, 'a big jump in server errors');
+  assert.equal(needsChallenge([{ ...row, counts: { ...row.counts, now: 60 } }], new Noise({})), false, 'a big jump in client errors is not urgent by itself');
+  assert.equal(needsChallenge([{ ...row, counts: { ...row.counts, now: 60 } }], new Noise({}), true), true, 'unless PATROL_URGENT_CLIENT_ERRORS says so');
   assert.equal(needsChallenge([row], new Noise({ never_suppress: [{ section: 'http', route: '/v1/products' }] })), true);
 });
 
@@ -213,6 +215,7 @@ const report = (over: Partial<Report> = {}): Report => ({
   started_at: '2026-09-29T12:00:00Z',
   what_broke: 'POST /v1/auth/password/reset returns 400',
   impact: '~75% of reset requests in 15 min',
+  reach: 'many',
   cause: { hypothesis: 'validation change', confidence: 'medium' },
   evidence: [{ id: 'E-abcd-1', quote: 'reset 400 | 75', claim: '75 of 95 requests were 400' }],
   suggested_fix: 'roll back the validation change',
@@ -428,7 +431,7 @@ test('the AI decides the rest: critical and major are posted with their owners, 
   assert.match(readFileSync(r.slack[0]!, 'utf8'), /\*\*Severity:\*\* major · \*\*Confidence:\*\* medium · cc <@U0BACKEND1>/);
 });
 
-test('a challenge that runs out of budget verifies nothing: its objection stays, every card says not verified', async () => {
+test('a challenge that runs out of budget verifies nothing: nothing is posted, and every card says not verified', async () => {
   const c = cfg();
   const sent: Array<{ text: string; blocks: unknown[] }> = [];
   const box = new SlackOutbox(':memory:', { threads: true, post: async (m) => (sent.push(m), `ts${sent.length}`) }, { sleep: async () => {}, gapMs: 0 });
@@ -455,13 +458,8 @@ test('a challenge that runs out of budget verifies nothing: its objection stays,
   );
   const r = await patrolOnce(new FakeTelemetry(smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir, box), new Date('2026-09-29T12:15:00Z'), { llm: true, post: true }, monitor(c, session));
   assert.deepEqual([r.investigation?.challenge?.verdict, r.investigation?.challenge?.note], ['escalate', 'error_max_budget_usd']);
-  assert.equal(sent.length, 2, 'both posted: a challenge that broke off hides nothing');
-  const [reset, signup] = sent.map((m) => JSON.stringify(m.blocks));
-  assert.match(reset!, /A second AI check disputes this, a human decides:\* The \/v1\/auth\/password\/reset 400s are one client retrying/, 'its objection stays');
-  for (const b of [reset!, signup!]) {
-    assert.match(b, /not verified by a second check/);
-    assert.doesNotMatch(b, /second check agrees/);
-  }
+  assert.equal(sent.length, 0, 'a check that broke off verifies nothing: not even its "yes" posts a report');
+  assert.match(readFileSync(r.cards[1]!, 'utf8'), /The \/v1\/auth\/password\/reset 400s are one client retrying/, 'its objection stays on the card');
   for (const f of r.cards.slice(1)) {
     const md = readFileSync(f, 'utf8');
     assert.match(md, /Not verified: the challenge did not complete \(error_max_budget_usd\)\./);

@@ -281,6 +281,11 @@ test('rows first flagged after their service deployed say so, and posted cards c
     const r = await sim.mcp('submit_report', report({ evidence: [{ id, quote: '2.2644.9 → 2.2645.0', claim: 'backend-production was deployed at 11:58Z' }], rows }));
     assert.equal(r.isError, false, r.text);
     yield ok(0.3, 4);
+  }, async function* (sim) {
+    // The second check agrees: only then is a major report posted.
+    await sim.mcp('recent_changes', { hours: 2 });
+    await sim.mcp('submit_challenge', { objections: [], overall: 'Holds up.' });
+    yield ok(0.1, 1);
   });
   const r = await patrolOnce(cluster([BACKEND], smaller), c, new Noise({}), State.memory(), new CardSink(c.outDir, box), new Date('2026-09-29T12:15:00Z'), { llm: true, post: true }, monitor(c, session));
   const after = 'first flagged 17 min after deploy backend-production 2.2645.0 (11:58Z)';
@@ -408,6 +413,7 @@ function report(over: Partial<Report> = {}): Report {
     started_at: '2026-09-29T12:00:00Z',
     what_broke: 'POST /v1/auth/password/reset returns 400',
     impact: '~20% of reset requests in 15 min',
+    reach: 'many',
     cause: { hypothesis: 'the 11:58Z deploy changed validation', confidence: 'medium' },
     evidence: [{ id: 'E-abcd-1', quote: 'reset 400 | 19', claim: '19 requests were 400' }],
     suggested_fix: 'check the 2.2645.0 validation change',

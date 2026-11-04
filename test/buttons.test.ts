@@ -63,6 +63,7 @@ const report = (over: Partial<Report>): Report => ({
   started_at: '2026-11-02T08:00:00Z',
   what_broke: 'POST /v1/auth/login returns 400 for valid accounts',
   impact: '30 failed sign-ins in 15 min',
+  reach: 'many',
   cause: { hypothesis: 'email validation rejects a trailing space', confidence: 'medium' },
   evidence: [],
   suggested_fix: 'trim the email before validating it',
@@ -77,6 +78,7 @@ function model(decide: Decide): Session & { seen: string[][] } {
   const session = (req: Parameters<Session>[0]) =>
     fakeSession(async function* (sim) {
       if (sim.req.tools.some((t) => t.name === 'submit_challenge')) {
+        await sim.mcp('service_overview', { service: 'backend-production', minutes: 60 }); // a challenger that checked nothing verifies nothing
         await sim.mcp('submit_challenge', { objections: [], overall: 'Holds up: the counts match the evidence.' });
         yield ok(0.05, 1);
         return;

@@ -59,6 +59,7 @@ const report = (over: Partial<Report> = {}): Report => ({
   started_at: '2026-11-02T08:00:00Z',
   what_broke: 'POST /v1/auth/login returns 400 for valid accounts',
   impact: '30 failed sign-ins in 15 min',
+  reach: 'many',
   cause: { hypothesis: 'email validation rejects a trailing space', confidence: 'medium' },
   evidence: [{ id: 'E-abcd-1', quote: 'x', claim: 'the route returns 400' }],
   suggested_fix: 'trim the email before validating it',
@@ -144,8 +145,8 @@ function webhook(): Transport & { sent: Sent[] } {
 }
 
 // A patrol world with one engine.db for the issues and the outbox, as in production.
-function setup(transport: Transport, decide: Decide, o: { issues?: boolean; oncall?: string | undefined; judge?: Judge; buttons?: boolean; recoverAfterMinutes?: number } = {}) {
-  const c: Config = { ...testConfig(), slackOncall: o.oncall, ...(o.recoverAfterMinutes ? { recoverAfterMinutes: o.recoverAfterMinutes } : {}) };
+function setup(transport: Transport, decide: Decide, o: { issues?: boolean; oncall?: string | undefined; judge?: Judge; buttons?: boolean; recoverAfterMinutes?: number; cfg?: Partial<Config> } = {}) {
+  const c: Config = { ...testConfig(), slackOncall: o.oncall, ...(o.recoverAfterMinutes ? { recoverAfterMinutes: o.recoverAfterMinutes } : {}), ...o.cfg };
   const db = join(c.runsDir, 'engine.db');
   const clock = { now: new Date(T0) };
   const box = new SlackOutbox(db, transport, { now: () => clock.now, sleep: async () => {}, gapMs: 0 });
@@ -343,6 +344,67 @@ test('a row of a resolved issue that comes back unposted goes back quietly: no n
   assert.equal(w.session.seen.length, 1, 'the returns are known rows: no run, no post');
   assert.equal(w.issues!.get(id)!.status, 'resolved');
   assert.deepEqual(t.sent.map((s) => s.text), ['🟠 Major: Sign-in rejects emails with a trailing space', `✅ Back to normal at 08:15Z · quiet for 15 min · ${id} resolved: backend-production · /v1/auth/login 400`]);
+});
+
+// ---- only real findings reach the channel (11-04) ------------------------------
+const strict: Partial<Config> = { confirmPatrols: 2, urgentClientErrors: false };
+
+test('a one-patrol burst of client errors is not news: no rows card, no AI run, no post', async () => {
+  // 15 times its usual count for one patrol: urgent before, when 4xx jumps were.
+  const tel = schedule({ '/v1/auth/sign-up': (t) => (t >= T0 && t < T0 + 0.25 * H ? 300 : 0) });
+  const t = bot();
+  const w = setup(t, linker(), { cfg: strict });
+  const burst = await w.patrol(tel, 0);
+  assert.deepEqual([burst.summary.send, burst.summary.waiting.map((r) => r.key)], [[], [key('/v1/auth/sign-up')]]);
+  await w.patrol(tel, 0.25);
+  assert.deepEqual([t.sent, w.session.seen.length], [[], 0]);
+  assert.ok(w.logs.some((l) => l.startsWith('patrol 2026-11-02T08:00:00.000Z: 0 to send, 1 waiting')));
+});
+
+test('news that holds a second patrol is investigated then, and posted once the second check agrees', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const t = bot();
+  const w = setup(t, linker(), { cfg: strict });
+  await w.patrol(tel, 0);
+  assert.equal(w.session.seen.length, 0, 'once is not enough');
+  const second = await w.patrol(tel, 0.25);
+  assert.deepEqual(w.session.seen.map((s) => s.rows), [[key('/v1/auth/login')]]);
+  assert.equal(second.filed[0]?.action, 'opened');
+  assert.deepEqual(t.sent.map((m) => m.text), ['🟠 Major: Sign-in rejects emails with a trailing space']);
+  assert.equal(w.session.challenges.length, 1, 'checked before it was posted');
+});
+
+test('a gap starts the count over: news in patrols that are not in a row waits again', async () => {
+  const tel = schedule({ '/v1/auth/login': (t) => between(0, 0.25)(t) || between(0.5, 40)(t) });
+  const w = setup(bot(), linker(), { cfg: strict });
+  for (const h of [0, 0.25, 0.5]) await w.patrol(tel, h);
+  assert.equal(w.session.seen.length, 0);
+  await w.patrol(tel, 0.75);
+  assert.equal(w.session.seen.length, 1);
+});
+
+test('a worse row that does not hold owes the investigator nothing', async () => {
+  const login = (t: number) => (t >= T0 && t < T0 + 40 * H ? (t >= T0 + 3 * H && t < T0 + 3.25 * H ? 60 : 20) : 0);
+  const tel = schedule({ '/v1/auth/login': login });
+  const w = setup(bot(), linker(), { cfg: strict });
+  for (const h of [0, 0.25]) await w.patrol(tel, h);
+  assert.equal(w.session.seen.length, 1);
+  const worse = await w.patrol(tel, 3);
+  assert.deepEqual(worse.summary.waiting.map((r) => [r.key, r.novelty]), [[key('/v1/auth/login'), 'worse']]);
+  const back = await w.patrol(tel, 3.25);
+  assert.deepEqual(back.summary.known.map((r) => r.key), [key('/v1/auth/login')]);
+  assert.equal(w.session.seen.length, 1, 'no run for the worse patrol, before or after');
+});
+
+test('critical and major need reach "many": one client, a few, or uncounted is minor', () => {
+  const rows = new Set(['k']);
+  const r = (over: Partial<Report>) => checkReport(report({ rows: ['k'], ...over }), rows);
+  assert.deepEqual(r({ reach: 'many' }), []);
+  for (const reach of ['one', 'few', 'unknown', undefined] as const) {
+    assert.match(r({ reach }).join(), /major needs reach "many"/, String(reach));
+    assert.match(r({ reach, severity: 'critical', impact: '40 failed checkouts' }).join(), /critical needs reach "many"/);
+    assert.deepEqual(r({ reach, severity: 'minor' }), []);
+  }
 });
 
 test('a row hidden by a noise rule still fires: its issue stays open until it stops', async () => {
@@ -780,27 +842,27 @@ test('a report that does not hold up still covers its rows: they are not owed an
   assert.equal(w.session.seen.length, 1, 'no second AI run on it');
 });
 
-test('"partly holds": posted, with the objections on the card', async () => {
+test('"partly holds": not posted, kept as minor with the objections in its run', async () => {
   const tel = schedule({ '/v1/auth/login': between(0, 40) });
   const t = recorder(true);
   const objection = (theirs: string) => ({ claim: 'Half of the 400s come from one test account.', failure_scenario: 'the team chases a bug few users hit', settling_check: 'group the 400s by account', evidence: [theirs], blocking: true });
   const w = setup(t, linker(), { judge: ({ theirs }) => ({ items: [{ item: 1, holds: 'partly', reason: 'Real, but smaller than it says.' }], objections: [objection(theirs)] }) });
   const r = await w.patrol(tel, 0);
-  assert.equal(r.filed[0]?.action, 'opened');
-  assert.equal(t.sent.length, 1);
-  assert.match(t.sent[0]!.text, /^🟠 Major: Sign-in rejects emails/);
-  assert.match(parsed(t.sent[0]!), /⚠️ \*A second AI check disputes this, a human decides:\* Half of the 400s come from one test account\./);
+  assert.equal(r.filed[0]?.action, 'none', 'a minor report opens no issue');
+  assert.equal(t.sent.length, 0, 'only a finding the second check agrees with is news');
+  assert.ok(w.logs.includes('report 1 minor: not posted; was major, the second check did not agree (partly)'));
+  assert.match(readFileSync(r.cards.at(-1)!, 'utf8'), /Half of the 400s come from one test account\./);
 });
 
-test('a challenger that fails, or that the caps cannot pay for: posted as before, marked not verified', async () => {
+test('a challenger that fails, or that the caps cannot pay for: not posted, kept as minor', async () => {
   const tel = schedule({ '/v1/auth/login': between(0, 40) });
   const t = recorder(true);
   const w = setup(t, linker(), { judge: () => 'fail' });
   const r = await w.patrol(tel, 0);
   assert.equal(r.investigation?.challenge?.verdict, 'error');
-  assert.equal(r.filed[0]?.action, 'opened');
-  assert.equal(t.sent.length, 1, 'posted');
-  assert.match(JSON.stringify(t.sent[0]!.blocks), /not verified by a second check/);
+  assert.equal(r.filed[0]?.action, 'none');
+  assert.equal(t.sent.length, 0, 'not verified, not posted');
+  assert.ok(w.logs.includes('report 1 minor: not posted; was major, the second check did not finish'));
   assert.match(readFileSync(r.cards.at(-1)!, 'utf8'), /Not verified: the challenge did not complete \(error_max_budget_usd\)/);
 
   // The day's cap holds the investigator ($2.5) but not the challenger as well ($1).
@@ -811,8 +873,7 @@ test('a challenger that fails, or that the caps cannot pay for: posted as before
   assert.equal(capped.investigation?.status, 'ok', 'the investigator still ran');
   assert.equal(v.session.challenges.length, 0, 'no challenger session');
   assert.equal(capped.investigation?.challenge?.note, 'not run: global daily cap $3 reached');
-  assert.equal(u.sent.length, 1, 'posted');
-  assert.match(JSON.stringify(u.sent[0]!.blocks), /not verified by a second check/);
+  assert.equal(u.sent.length, 0, 'not posted');
   const row = v.monitor.engine.store.get(capped.investigation!.runId)!;
   assert.deepEqual([row.challenge, row.reserve], ['error', 2.5]);
 });
