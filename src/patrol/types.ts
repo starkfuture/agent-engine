@@ -13,13 +13,16 @@ export interface Row {
   score: Score;
   detail?: string; // redacted sample line, termination reason, …
   query?: string; // to reproduce in Grafana
-  truncated?: boolean; // counts are lower bounds (log line limit hit)
+  truncated?: boolean; // counts are lower bounds (the log line or trace search limit was hit)
 }
 
 export interface SourceHealth {
   source: string;
   ok: boolean;
   error?: string;
+  // Read, but not all of it: capped results, some scrape targets down, a
+  // presence check not run. Shown under the blind spots; never fails the source.
+  note?: string;
 }
 
 export const rowKey = (r: Pick<Row, 'section' | 'service' | 'subject' | 'status'>) =>

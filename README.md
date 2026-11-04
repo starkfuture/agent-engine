@@ -71,9 +71,9 @@ Read-only everywhere: it recommends and never acts. Paging stays with determinis
    - **HTTP:** every route × status that isn't 2xx/3xx, across the V3 services, legacy `/v1`, Keycloak and the mesh, plus traffic drops.
    - **Workloads:** restarts, stuck containers, unavailable replicas.
    - **Rollouts:** a stalled rollout (replicas not on the new version for 10 min, or the controller's `ProgressDeadlineExceeded`), an Argo CD app Degraded or Missing for 5 min, and a failed Argo CD sync. A rollout row is a state: it is flagged for as long as it holds. A stall recovers only when its rollout completes: every replica updated and available, and the old ones retired. A Deployment with no series is unknown, not complete. Each deploy's stall is its own row (it carries the namespace and the ReplicaSet's hash), and so is each failed sync (it carries the failure count), so the next one is posted again.
-   - **Error counters:** SQS consumer errors, from every service. A counter has no series until its first error, so an `up` check says whether the services are being scraped. If they are not, the source is blind.
-   - **Logs:** error lines grouped into stable templates.
-   - **Traces:** error traces by root operation.
+   - **Error counters:** SQS consumer errors, from every service. A counter has no series until its first error, so an `up` check says whether the services are being scraped. If they are not, the source is blind. If only some are (`43 of 46 targets up`), the summary says so under its blind spots, and the source still counts as read.
+   - **Logs:** error lines grouped into stable templates. A one-minute count of any line at all says whether logs arrive: none is a blind spot, not a quiet system.
+   - **Traces:** error traces by root operation. A search for any trace (`{}`, limit 1) says whether traces arrive. A window at the search limit (`traces.limit`) is a sample: its rows say "counts are lower bounds", and so does the source.
 2. **Filter.** Steady rows, known noise (`config/noise.yaml`) and already-reported rows are dropped. A quiet patrol ends here and costs $0.
 3. **Card first.** The rows card goes to `out/cards/` before any AI runs. If the investigator crashes, the rows are still marked reported.
 4. **Investigate.** Only if a row the investigator still owes an answer is big enough to read (a "to look at" row, below), the engine runs the `monitor` agent. Small rows on their own don't spend a run. It has read-only telemetry tools and no shell, files or web, and must submit schema-checked reports that cite evidence ids.
@@ -230,6 +230,8 @@ npm run dev -- replay --from 2026-09-29T00:00:00Z --to 2026-10-01T00:00:00Z --re
 ```
 
 **Pass condition:** the sign-up and password-reset 400s on the legacy `/v1` series show up as fresh rows at the start of the incident, and the known noise stays quiet.
+
+A recording answers only the queries it recorded, by exact text and time. A query added since is a miss (in the "not in the recording" count): the logs and traces presence checks and an error counter's scrape-target total then read "not checked" on their source, which stays as read. A miss never makes a source blind that the older queries could read. Record again to check them.
 
 ### Tests
 

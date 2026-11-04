@@ -30,6 +30,9 @@ export interface Telemetry {
   promInstant(query: string, at: Date): Promise<Sample[]>;
   promRange(query: string, start: Date, end: Date, stepSec: number): Promise<Series[]>;
   lokiRange(query: string, start: Date, end: Date, limit: number): Promise<LogLine[]>;
+  // A LogQL metric query (sum(count_over_time(…))) evaluated every stepSec from
+  // start to end: counts, not lines, so no line limit cuts it.
+  lokiMetric(query: string, start: Date, end: Date, stepSec: number): Promise<Series[]>;
   tempoSearch(traceql: string, start: Date, end: Date, limit: number): Promise<TraceHit[]>;
   readonly has: { loki: boolean; tempo: boolean };
 }
@@ -144,6 +147,16 @@ class HttpTelemetry implements Telemetry {
     return out;
   }
 
+  async lokiMetric(query: string, start: Date, end: Date, stepSec: number): Promise<Series[]> {
+    const j = await this.get('loki', '/loki/api/v1/query_range', { query, start: `${sec(start)}000000000`, end: `${sec(end)}000000000`, step: String(stepSec) });
+    if (j.status !== 'success') throw new SourceError('loki', j.error ?? 'query failed');
+    if (j.data.resultType !== 'matrix') throw new SourceError('loki', `not a metric query (result ${j.data.resultType})`);
+    return (j.data.result as any[]).map((r) => ({
+      labels: r.metric ?? {},
+      points: (r.values as [number, string][]).map(([t, v]) => [Number(t), Number(v)] as [number, number]),
+    }));
+  }
+
   async tempoSearch(traceql: string, start: Date, end: Date, limit: number): Promise<TraceHit[]> {
     const bad = traceqlProblem(traceql);
     if (bad) throw new SourceError('tempo', bad);
@@ -214,6 +227,11 @@ export class GrafanaTelemetry extends HttpTelemetry {
 // `export` runs the patrol against prod in recording mode; every response lands in
 // a JSONL file keyed by (method, args). Replay serves those responses offline, so
 // the 29 Sep incident stays testable after Prometheus retention drops it.
+// A query is matched by its exact text and times, so one added to the patrol
+// after a recording was made is a miss in that recording (counted in `misses`).
+// The checks added later (logs and traces presence, the scrape-target total of
+// an error counter) read a miss as "not checked": a note on the source, which
+// stays as read. A miss never fails a source that the old queries could read.
 
 type Call = { m: keyof Omit<Telemetry, 'has'>; a: unknown[] };
 const keyOf = (c: Call) =>
@@ -256,6 +274,9 @@ export class RecordingTelemetry implements Telemetry {
       (await this.inner.lokiRange(q, s, e, l)).map((x) => ({ ...x, line: redact(x.line) })),
     );
   }
+  lokiMetric(q: string, s: Date, e: Date, st: number) {
+    return this.rec({ m: 'lokiMetric', a: [q, s, e, st] }, () => this.inner.lokiMetric(q, s, e, st));
+  }
   tempoSearch(q: string, s: Date, e: Date, l: number) {
     return this.rec({ m: 'tempoSearch', a: [q, s, e, l] }, () => this.inner.tempoSearch(q, s, e, l));
   }
@@ -293,6 +314,9 @@ export class ReplayTelemetry implements Telemetry {
   }
   lokiRange(q: string, s: Date, e: Date, l: number) {
     return this.play<LogLine[]>({ m: 'lokiRange', a: [q, s, e, l] });
+  }
+  lokiMetric(q: string, s: Date, e: Date, st: number) {
+    return this.play<Series[]>({ m: 'lokiMetric', a: [q, s, e, st] });
   }
   tempoSearch(q: string, s: Date, e: Date, l: number) {
     return this.play<TraceHit[]>({ m: 'tempoSearch', a: [q, s, e, l] });
