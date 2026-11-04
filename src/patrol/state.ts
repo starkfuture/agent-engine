@@ -91,8 +91,8 @@ export class State {
 
   // Records a sighting. With `confirm`, news (fresh or worse) must hold for
   // confirm.patrols patrols in a row: until then it is held (returns true),
-  // and owes the investigator nothing yet. A patrol it wasn't flagged in, or
-  // was flagged in but wasn't news, starts the count over.
+  // and owes the investigator nothing yet. A patrol in which it wasn't news
+  // starts the count over.
   seen(r: Row, at: Date, sources: string[], confirm?: Confirm): boolean {
     const iso = at.toISOString();
     const novelty = this.novelty(r, at);
@@ -109,7 +109,10 @@ export class State {
       if (!s || !confirm || at.getTime() - Date.parse(s.last) > 1.5 * confirm.windowMin * 60_000) current.streak = { since: iso, last: iso };
       else s.last = iso;
       held = !!confirm && at.getTime() - Date.parse(current.streak!.since) < (confirm.patrols - 1) * confirm.windowMin * 60_000;
-    } else delete current.streak;
+    }
+    // A patrol that isn't news doesn't touch the count: the next news after it
+    // finds a gap and starts over. So a sighting of the same key that isn't
+    // news (a same-named workload in another namespace) can't reset it.
     if (held) return true;
     // New work: a worse row, or one back after a confirmed recovery since it was
     // last reported (a new episode). The new episode waits for its reminder, as

@@ -392,6 +392,20 @@ test('the recovery hold applies to Argo CD rows; only a stalled rollout is back 
   assert.deepEqual(state.recovered(new Set(), new Date('2026-09-29T13:00:00Z'), 15, 60, observe), [degraded]);
 });
 
+test('a sighting of the same key that is not news does not reset the count (same-named workloads in two namespaces)', () => {
+  const state = State.memory();
+  const confirm = { windowMin: 15, patrols: 2 };
+  const t = (min: number) => new Date(Date.parse('2026-11-04T10:00:00Z') + min * 60_000);
+  const row = (now: number) => ({ key: 'workload|api|unavailable replicas|', section: 'workload', service: 'api', subject: 'unavailable replicas', counts: { now, h1: 2, d1: 2, d7: 2 }, score: { verdict: 'spike', expected: 2, z: 5, trend: 'started' } }) as unknown as Parameters<State['seen']>[0];
+  state.seen(row(2), t(0), ['workloads'], confirm);
+  state.reported(row(2), t(0));
+  // One namespace worse (6), the other steady (2), seen in either order.
+  assert.equal(state.seen(row(6), t(15), ['workloads'], confirm), true, 'worse once: held');
+  state.seen(row(2), t(15), ['workloads'], confirm);
+  state.seen(row(2), t(30), ['workloads'], confirm);
+  assert.equal(state.seen(row(6), t(30), ['workloads'], confirm), false, 'worse twice in a row: news');
+});
+
 test('a 6-hour reminder of an urgent row is not posted again', async () => {
   const c = cfg();
   const state = State.memory();

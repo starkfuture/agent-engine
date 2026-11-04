@@ -78,6 +78,10 @@ test('who a line is about: identity fields, key=value in the text and VINs; not 
   // Keycloak's plain-text events: the IP counts, a null user doesn't.
   assert.deepEqual(identitiesOf('type="LOGIN_ERROR", realmId="stark", clientId="storefront", userId="null", ipAddress="203.0.113.7", error="invalid_user_credentials"').sort(), ['clientid=storefront', 'ip=203.0.113.7']);
   assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'rejected', remote_addr: '203.0.113.8' })), ['ip=203.0.113.8']);
+  // Request and trace ids are not vehicles, nor is a 17-digit number.
+  assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'retry', userId: 'u-1', requestId: 'ABCDEFGH123456789', meta: { traceId: 'ZYXWVUTS987654321' } })), ['userid=u-1']);
+  assert.deepEqual(identitiesOf('retry requestId=ABCDEFGH123456789 for user'), []);
+  assert.deepEqual(identitiesOf('order 12345678901234567 failed'), []);
 });
 
 test('log_search counts the distinct users a template mentions, past its two samples, and shows only the counts', async () => {

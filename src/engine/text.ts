@@ -132,6 +132,9 @@ const IDENTITY_KEY = /^(user_?id|customer_?id|account_?id|order_?id|vin|client_?
 const IDENTITY_TEXT = /\b(user_?id|customer_?id|account_?id|order_?id|client_?id|client_?ip|ip_?address|remote_?addr|vin)["']?\s*[=:]\s*["']?([\w.@+:-]{4,128})/gi;
 const VIN = /\b[A-HJ-NPR-Z0-9]{17}\b/g;
 const NO_ID = /^(null|undefined|none|unknown|-)$/i;
+// Ids of the request, not of who it is about: never scanned for VINs.
+const REQUEST_KEY = /^(request|trace|span|correlation|req|message|event|x_?request)_?id$/i;
+const REQUEST_TEXT = /\b(?:request|trace|span|correlation|req|message|event)_?id["']?\s*[=:]\s*["']?[\w-]+/gi;
 export function identitiesOf(line: string): string[] {
   const out = new Set<string>();
   const kind = (k: string) => {
@@ -143,9 +146,10 @@ export function identitiesOf(line: string): string[] {
   };
   // Free text: key=value pairs and VINs. In a structured line only the values
   // that aren't identity fields themselves, so a field isn't counted twice.
+  // A VIN has letters and digits: a 17-digit number is something else.
   const scan = (text: string) => {
     for (const m of text.matchAll(IDENTITY_TEXT)) add(m[1]!, m[2]!);
-    for (const m of text.matchAll(VIN)) add('vin', m[0]);
+    for (const m of text.replace(REQUEST_TEXT, '').matchAll(VIN)) if (/[A-Z]/.test(m[0]) && /\d/.test(m[0])) add('vin', m[0]);
   };
   const walk = (v: unknown, depth: number): void => {
     if (typeof v === 'string') return scan(v);
@@ -153,7 +157,7 @@ export function identitiesOf(line: string): string[] {
     for (const [k, x] of Object.entries(v)) {
       if (IDENTITY_KEY.test(k) && (typeof x === 'string' || typeof x === 'number')) {
         if (String(x).length <= 128) add(k, String(x));
-      } else walk(x, depth + 1);
+      } else if (!REQUEST_KEY.test(k)) walk(x, depth + 1);
     }
   };
   const t = line.trim();
