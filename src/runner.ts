@@ -238,16 +238,19 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     state.save();
     // An issue is resolved once every row of it is back to normal (which needs
     // healthy observers and recoverAfterMinutes without firing), with one
-    // recovery note in its thread. Its rows never get a note of their own:
-    // not while some of them still fire, and not after it resolved, when they
-    // come and go on their own. A row of no issue gets one only if a post
-    // about it is still unanswered (groupByThread).
+    // recovery note in its thread. Its rows get no note of their own while it
+    // is open, nor after it resolved, unless a post about them came after
+    // that (an urgent rows card, say): its note answered everything before.
+    // Otherwise a row gets one only if a post about it is still unanswered
+    // (groupByThread).
     let loose = summary.recovered;
     const issues = o.issues;
     if (issues) {
       const open = record('listing open issues', () => issues.openIssues(), []);
-      const held = new Set([...open.flatMap((i) => i.rows), ...record('finding the issues of recovered rows', () => issues.withIssue(summary.recovered), new Set<string>())]);
-      loose = summary.recovered.filter((k) => !held.has(k));
+      const held = new Set(open.flatMap((i) => i.rows));
+      const resolved = record('finding the resolved issues of recovered rows', () => issues.resolvedAt(summary.recovered), new Map<string, string>());
+      const posted = resolved.size ? record('reading when rows were posted', () => sink.outbox?.lastPosted([...resolved.keys()]) ?? new Map<string, string>(), new Map<string, string>()) : new Map<string, string>();
+      loose = summary.recovered.filter((k) => !held.has(k) && !(resolved.has(k) && (posted.get(k) ?? '') <= resolved.get(k)!));
       for (const i of open) {
         const back = i.rows.filter((k) => state.recoveredAt(k) !== undefined).length;
         if (back < i.rows.length) {

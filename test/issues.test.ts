@@ -363,6 +363,22 @@ test('a row of a resolved issue never gets a note of its own, also one posted be
   assert.equal(t.sent.length, 2, 'the issue and its one resolved note: nothing per row');
 });
 
+test('a row of a resolved issue posted again after it resolved gets its note: the issue did not answer that post', async () => {
+  const login = (t: number) => between(0, 0.25)(t) || between(1, 1.25, 300)(t); // back at 10x: urgent
+  const tel = schedule({ '/v1/auth/login': login });
+  const t = bot();
+  // The second run calls it minor: the issue stays resolved.
+  const w = setup(t, (s) => (s.issues[0] ? { issue: s.issues[0].id, severity: 'minor' } : { issue: 'new' }));
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  assert.deepEqual((await w.patrol(tel, 0.25)).resolved, [id]);
+  await w.patrol(tel, 1);
+  assert.match(t.sent[2]!.text, /^Patrol 2026-11-02 09:00Z/, 'the urgent rows card');
+  assert.equal(w.issues!.get(id)!.status, 'resolved');
+  await w.patrol(tel, 1.25);
+  assert.deepEqual(t.sent.slice(3).map((m) => m.text), ['✅ Back to normal at 09:15Z · quiet for 15 min: backend-production · /v1/auth/login 400']);
+});
+
 test('a row hidden by a noise rule still fires: its issue stays open until it stops', async () => {
   const login = (t: number) => (between(0, 0.25)(t) || between(0.5, 2)(t));
   const tel = schedule({ '/v1/auth/login': login, '/v1/ownership/transfer': between(0, 1) });

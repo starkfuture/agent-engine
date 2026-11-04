@@ -319,6 +319,13 @@ export class SlackOutbox {
     return [...by.values()];
   }
 
+  // When each of these rows was last posted about (not counting recovery notes).
+  lastPosted(keys: string[]): Map<string, string> {
+    if (!keys.length) return new Map();
+    const rows = this.db.prepare(`SELECT key, last_at FROM slack_threads WHERE key IN (${keys.map(() => '?').join(',')})`).all(...keys) as Array<{ key: string; last_at: string }>;
+    return new Map(rows.map((r) => [r.key, r.last_at]));
+  }
+
   // Send what is pending, oldest first. Never throws: Slack being down must not
   // stop a patrol or re-run the model.
   async flush(log: (s: string) => void = () => {}): Promise<FlushResult> {
