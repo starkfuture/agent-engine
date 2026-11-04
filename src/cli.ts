@@ -282,8 +282,10 @@ async function main() {
   const noise = Noise.load(cfg.noiseFile);
   const owners = Owners.load(cfg.ownersFile);
   // The bot when configured (threads, one message per issue), else the webhook.
-  const bot = cfg.slackBotToken ? botTransport(cfg.slackBotToken, cfg.slackChannel!) : undefined;
-  const transport = bot ?? (cfg.slackWebhookUrl ? webhookTransport(cfg.slackWebhookUrl) : undefined);
+  // A replay never posts and writes only under SRE_OUT_DIR, so it ignores Slack settings.
+  const slackOn = cmd !== 'replay';
+  const bot = slackOn && cfg.slackBotToken ? botTransport(cfg.slackBotToken, cfg.slackChannel!) : undefined;
+  const transport = bot ?? (slackOn && cfg.slackWebhookUrl ? webhookTransport(cfg.slackWebhookUrl) : undefined);
   // The buttons (On it, Not an issue): Socket Mode (SLACK_APP_TOKEN) and the
   // bot, in the process that keeps posting the patrol. Their clicks shape what
   // any patrol posts; only this process shows them and takes clicks.

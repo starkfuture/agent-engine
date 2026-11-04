@@ -842,3 +842,13 @@ test("the shipped SQS counter reads every service's consumer errors, and checks 
   assert.deepEqual(sqs.group_by, ['app', 'queue', 'error_type']);
   assert.match(sqs.presence ?? '', /^up\{.+\} == 1$/);
 });
+
+test('the shipped never_suppress list protects auth-service 5xx on refresh and grants, not their 4xx', () => {
+  const noise = Noise.load(join(import.meta.dirname, '..', 'config', 'noise.yaml'));
+  const row = (service: string, subject: string, status: string) => ({ key: `http|${service}|${subject}|${status}`, section: 'http', service, subject, status }) as unknown as FlaggedRow;
+  for (const route of ['/v3/auth/refresh', '/v3/auth/internal/user-grants/:id']) {
+    assert.equal(noise.protected(row('auth-service', route, '503')), true, route);
+    assert.equal(noise.protected(row('auth-service', route, '401')), false, route);
+    assert.equal(noise.protected(row('auth-service', route, '404')), false, route);
+  }
+});
