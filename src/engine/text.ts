@@ -152,6 +152,56 @@ export function messageOf(line: string): { level?: string; msg: string; context?
   return { msg: t };
 }
 
+// Who a line is about, for counting a problem's reach: identity fields of a
+// structured line (user, customer, account, order, vehicle, client, IP), the
+// same names written as key=value in the text, and VINs anywhere. Callers
+// count them; the values never leave the tool.
+const IDENTITY_KEY = /^(user_?id|customer_?id|account_?id|order_?id|vin|client_?id|client_?ip|ip|ip_?address|remote_?addr|sub)$/i;
+const IDENTITY_TEXT = /\b(user_?id|customer_?id|account_?id|order_?id|client_?id|client_?ip|ip|ip_?address|remote_?addr|sub|vin)["']?\s*[=:]\s*["']?([\w.@+:-]{1,128})/gi;
+const VIN = /\b[A-HJ-NPR-Z0-9]{17}\b/g;
+// No identity, or a redacted one (recordings and replays hold "<ip>"): unknown, not one.
+const NO_ID = /^(null|undefined|none|unknown|-|<[a-z_]+>)$/i;
+// Ids of the request, not of who it is about: never scanned for VINs.
+const REQUEST_KEY = /^(request|trace|span|correlation|req|message|event|x_?request)_?id$/i;
+const REQUEST_TEXT = /\b(?:request|trace|span|correlation|req|message|event)_?id["']?\s*[=:]\s*["']?[\w-]+/gi;
+export function identitiesOf(line: string): string[] {
+  const out = new Set<string>();
+  const kind = (k: string) => {
+    const c = k.toLowerCase().replace(/_/g, '');
+    return c === 'ipaddress' || c === 'clientip' || c === 'remoteaddr' ? 'ip' : c;
+  };
+  const add = (k: string, v: string) => {
+    if (!NO_ID.test(v)) out.add(`${kind(k)}=${v}`);
+  };
+  // Free text: key=value pairs and VINs. In a structured line only the values
+  // that aren't identity fields themselves, so a field isn't counted twice.
+  // A VIN has letters and digits: a 17-digit number is something else.
+  const scan = (text: string) => {
+    for (const m of text.matchAll(IDENTITY_TEXT)) add(m[1]!, m[2]!);
+    for (const m of text.replace(REQUEST_TEXT, '').matchAll(VIN)) if (/[A-Z]/.test(m[0]) && /\d/.test(m[0])) add('vin', m[0]);
+  };
+  const walk = (v: unknown, depth: number): void => {
+    if (typeof v === 'string') return scan(v);
+    if (depth > 3 || !v || typeof v !== 'object') return;
+    for (const [k, x] of Object.entries(v)) {
+      if (IDENTITY_KEY.test(k) && (typeof x === 'string' || typeof x === 'number')) {
+        if (String(x).length <= 128) add(k, String(x));
+      } else if (!REQUEST_KEY.test(k)) walk(x, depth + 1);
+    }
+  };
+  const t = line.trim();
+  let structured = false;
+  if (t.startsWith('{'))
+    try {
+      walk(JSON.parse(t), 0);
+      structured = true;
+    } catch {
+      /* not JSON */
+    }
+  if (!structured) scan(line);
+  return [...out];
+}
+
 export function templateOf(line: string): string {
   const { msg, context } = messageOf(line);
   let t = redact(msg);
