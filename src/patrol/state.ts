@@ -6,6 +6,7 @@ import type { Row } from './types.js';
 export interface RowMemory {
   firstSeen: string;
   lastSeen: string;
+  lastFiredAt?: string; // also while a noise rule hides it: the recovery hold counts from here
   lastReportedAt?: string;
   lastReportedNow?: number;
   sources?: string[]; // collectors that observed the row; absent in older state files
@@ -35,6 +36,7 @@ export interface StateData {
 }
 
 const H = 3600_000;
+const STALLED = /^rollout\|[^|]+\|stalled\|/;
 
 export interface NoveltyPolicy {
   renotifyAfterHours: number; // a still-firing row comes back to the LLM after this
@@ -93,6 +95,7 @@ export class State {
     const recurred = !!current.lastRecoveredAt && current.lastRecoveredAt > (current.lastReportedAt ?? '');
     if (novelty === 'worse' || (novelty === 'reminder' && (recurred || !current.investigation)) || (!current.investigation && !current.lastReportedAt)) current.investigation = { status: 'pending', attempts: 0 };
     current.sources = sources;
+    current.lastFiredAt = iso;
     delete current.recoveredAt;
   }
 
@@ -135,9 +138,11 @@ export class State {
 
   // A row a noise rule hides still fires: it is not back to normal. Only its
   // recovery marker changes; novelty and the Slack window stay as they were.
-  firing(key: string): void {
+  firing(key: string, at: Date): void {
     const m = this.data.rows[key];
-    if (m) delete m.recoveredAt;
+    if (!m) return;
+    delete m.recoveredAt;
+    m.lastFiredAt = at.toISOString();
   }
 
   // Set once a reported row is seen healthy again; cleared when it fires again.
@@ -161,7 +166,7 @@ export class State {
       // even when its observers are down, so it can resolve after they return.
       m.sources = observation.sources;
       if (!observation.ok) continue;
-      if (at.getTime() - Date.parse(m.lastSeen) < holdMin * 60_000 && !key.startsWith('rollout|')) continue;
+      if (at.getTime() - Date.parse(m.lastFiredAt ?? m.lastSeen) < holdMin * 60_000 && !STALLED.test(key)) continue;
       m.recoveredAt = m.lastRecoveredAt = at.toISOString();
       // Work still owed ends with its episode. If the row fires again, that is a
       // new one (see seen()): owed at its reminder or when worse, with fresh attempts.

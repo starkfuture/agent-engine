@@ -363,6 +363,32 @@ test('suppressing a still-firing signal never announces recovery', async () => {
   assert.deepEqual(next.recovered, []);
 });
 
+test('the recovery hold counts from the last firing, also one a noise rule hid', async () => {
+  const c = { ...cfg(), recoverAfterMinutes: 60 };
+  const state = State.memory();
+  const start = new Date('2026-09-29T12:15:00Z');
+  const first = await buildSummary(new FakeTelemetry(world), c, new Noise({}), state, start);
+  for (const row of first.send) state.reported(row, start);
+  const noise = new Noise({ noise: [{ id: 'auth', section: 'http', route: '.*auth.*', reason: 'known issue', expires: '2027-01-01' }] });
+  assert.equal((await buildSummary(new FakeTelemetry(world), c, noise, state, new Date('2026-09-29T13:00:00Z'))).suppressed.length, 2);
+  const healthy = new FakeTelemetry((q, at) => world(q, at).map((s) => (s.labels.status_code === '400' ? { ...s, value: 0 } : s)));
+  const quiet = (t: string) => buildSummary(healthy, c, noise, state, new Date(t)).then((s) => s.recovered.length);
+  assert.equal(await quiet('2026-09-29T13:15:00Z'), 0, 'hidden at 13:00: not an hour yet');
+  assert.equal(await quiet('2026-09-29T13:45:00Z'), 0);
+  assert.equal(await quiet('2026-09-29T14:00:00Z'), 2, 'an hour after the last firing');
+});
+
+test('the recovery hold applies to Argo CD rows; only a stalled rollout is back when it completes', () => {
+  const t0 = '2026-09-29T12:00:00.000Z';
+  const degraded = 'rollout|ecom-service-production|argocd app|Degraded';
+  const stalled = 'rollout|ecom-service-production|stalled|microservices/abc123';
+  const row = { firstSeen: t0, lastSeen: t0, lastReportedAt: t0, sources: ['argocd', 'rollouts'] };
+  const state = new State({ rows: { [degraded]: { ...row }, [stalled]: { ...row } } });
+  const observe = (_k: string, sources: string[] | undefined) => ({ sources: sources ?? [], ok: true });
+  assert.deepEqual(state.recovered(new Set(), new Date('2026-09-29T12:15:00Z'), 15, 60, observe), [stalled]);
+  assert.deepEqual(state.recovered(new Set(), new Date('2026-09-29T13:00:00Z'), 15, 60, observe), [degraded]);
+});
+
 test('a 6-hour reminder of an urgent row is not posted again', async () => {
   const c = cfg();
   const state = State.memory();
