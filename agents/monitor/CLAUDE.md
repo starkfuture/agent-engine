@@ -23,7 +23,7 @@ Severity (decides what the team sees: critical and major are posted to the team'
 - major: a real customer-facing degradation smaller than that, or an internal pipeline failure (ERP sync, queue dead letters, stock/VIN allocation) that will hurt customers or operations within hours.
 - minor: a real defect with little current impact.
 - noise: expected behaviour. Propose a noise_rule so a human can review adding it.
-- Critical and major also need reach "many": evidence that 5 or more distinct users, clients or records are affected. Count distinct user ids, VINs, order ids, IPs or user agents in the logs or traces. One client, one customer, one id or a bot retrying is minor, however many requests it sends. If you can't count them, rate it minor and say in not_checked what you could not count.
+- Critical and major also need reach "many": evidence that 5 or more distinct users, clients or records are affected. log_search prints, per template, how many distinct users, customers, orders, VINs, clients or IPs its lines mention ("distinct: 6 userid, 3 vin"): use it, with contains to narrow to the failing route or error. One client, one customer, one id or a bot retrying is minor, however many requests it sends. If you can't count them, rate it minor and say in not_checked what you could not count.
 - A problem that is already over is minor, unless it left damage someone must repair today: then rate the damage, with its reach.
 - A jump in client errors (4xx) while successful requests stay flat is usually one client or a few retrying. Check who sends them before calling it more.
 

@@ -124,6 +124,35 @@ export function messageOf(line: string): { level?: string; msg: string; context?
   return { msg: t };
 }
 
+// Who a line is about, for counting a problem's reach: identity fields of a
+// structured line (user, customer, account, order, vehicle, client, IP), the
+// same names written as key=value in the text, and VINs anywhere. Callers
+// count them; the values never leave the tool.
+const IDENTITY_KEY = /^(user_?id|customer_?id|account_?id|order_?id|vin|client_?id|client_?ip|ip|remote_?addr|sub)$/i;
+const IDENTITY_TEXT = /\b(user_?id|customer_?id|account_?id|order_?id|client_?id|vin)["']?\s*[=:]\s*["']?([\w.:-]{4,64})/gi;
+const VIN = /\b[A-HJ-NPR-Z0-9]{17}\b/g;
+export function identitiesOf(line: string): string[] {
+  const out = new Set<string>();
+  const kind = (k: string) => k.toLowerCase().replace(/_/g, '');
+  const walk = (v: unknown, depth: number): void => {
+    if (depth > 3 || !v || typeof v !== 'object') return;
+    for (const [k, x] of Object.entries(v)) {
+      if (IDENTITY_KEY.test(k) && (typeof x === 'string' || typeof x === 'number') && String(x).length <= 100) out.add(`${kind(k)}=${x}`);
+      else walk(x, depth + 1);
+    }
+  };
+  const t = line.trim();
+  if (t.startsWith('{'))
+    try {
+      walk(JSON.parse(t), 0);
+    } catch {
+      /* not JSON */
+    }
+  for (const m of line.matchAll(IDENTITY_TEXT)) out.add(`${kind(m[1]!)}=${m[2]}`);
+  for (const m of line.matchAll(VIN)) out.add(`vin=${m[0]}`);
+  return [...out];
+}
+
 export function templateOf(line: string): string {
   const { msg, context } = messageOf(line);
   let t = redact(msg);
