@@ -142,6 +142,19 @@ test('no log line at all while Loki answers is missing data, not a quiet system;
   assert.deepEqual(sourceOf(await buildSummary(new Observed(), c, new Noise({}), State.memory(), AT), 'logs'), { source: 'logs', ok: true });
 });
 
+test('errors read in the window are kept when the last minute is empty: lines may have stopped since, and the source says so', async () => {
+  // 20 errors five minutes before the patrol, then nothing arrives.
+  const burst: LogLine[] = Array.from({ length: 20 }, (_, i) => ({ labels: { app: 'checkout' }, tsNs: `${AT.getTime() - 5 * MIN - i * 1000}000000`, line: `ERROR payment failed ${i}` }));
+  const tel = new Observed({ logs: (_q, _s, end) => (end.getTime() === AT.getTime() ? burst : []), logCounts: () => [] });
+  const s = await buildSummary(tel, cfg(), new Noise({}), State.memory(), AT);
+  assert.ok(s.send.some((r) => r.section === 'logs' && r.service === 'checkout'), 'the burst is still a row');
+  assert.deepEqual(sourceOf(s, 'logs'), {
+    source: 'logs',
+    ok: true,
+    note: 'no log lines at all for {namespace="microservices"} in the last minute, though the window\'s search read 20: newer lines may be missing',
+  });
+});
+
 test('no trace at all while Tempo answers is missing data too; the check is `{}` with limit 1 in the window', async () => {
   const c = cfg();
   const none = new Observed({ traces: () => [] });

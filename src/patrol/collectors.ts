@@ -60,18 +60,19 @@ export const noteOf = (rows: Row[]): { note?: string } => {
 
 // Logs and traces have no `up`: an empty error search is also what a broken
 // pipeline looks like. One cheap read for anything at all, at the patrol time
-// only: nothing there fails the source, like requireSeries. A presence query
-// that errors (or that a recording made before it existed doesn't have)
-// proves nothing either way: the source stays as read, with a note.
-async function present(what: string, none: string, read: () => Promise<number>): Promise<string | undefined> {
-  let n: number;
-  try {
-    n = await read();
-  } catch (e) {
-    return `${what} presence not checked (${(e as Error).message})`;
-  }
-  if (!(n > 0)) throw new Error(`${none} (missing data, not a quiet system)`);
-  return undefined;
+// only (`probe` never rejects: a count, or why it couldn't be read).
+// - Nothing there and nothing in the "now" search either: missing data, and
+//   the source fails, like requireSeries.
+// - Nothing there, but the search did read errors in the window: they are
+//   kept, with a note (lines may have stopped arriving since).
+// - A probe that errors (or that a recording made before it existed doesn't
+//   have) proves nothing either way: the source stays as read, with a note.
+const probe = (read: () => Promise<number>): Promise<number | Error> => read().catch((e: Error) => e);
+function presence(what: string, none: string, n: number | Error, found: number): string | undefined {
+  if (n instanceof Error) return `${what} presence not checked (${n.message})`;
+  if (n > 0) return undefined;
+  if (!found) throw new Error(`${none} (missing data, not a quiet system)`);
+  return `${none}, though the window's search read ${found}: newer ${what === 'log' ? 'lines' : 'traces'} may be missing`;
 }
 
 const SLOT_NAMES: Record<Slot, string> = { now: 'now', h1: '1 h ago', d1: '1 d ago', d7: '7 d ago' };
@@ -279,17 +280,16 @@ export const logPresenceQuery = (src: Sources['logs']) => `sum(count_over_time($
 export async function collectLogs(tel: Telemetry, src: Sources['logs'], at: Date, windowMin: number, t: Thresholds = DEFAULT_THRESHOLDS): Promise<Row[]> {
   const query = logQuery(src);
   const w = windowMin * 60_000;
-  const [results, presence] = await Promise.all([
+  const [results, seen] = await Promise.all([
     Promise.all(
       SLOTS.map((s) => {
         const end = shift(at, s);
         return tel.lokiRange(query, new Date(end.getTime() - w), end, src.max_lines);
       }),
     ),
-    present('log', `no log lines at all for ${src.selector} in the last minute`, async () =>
-      (await tel.lokiMetric(logPresenceQuery(src), at, at, 60)).reduce((n, s) => n + s.points.reduce((m, [, v]) => m + (Number.isFinite(v) ? v : 0), 0), 0),
-    ),
+    probe(async () => (await tel.lokiMetric(logPresenceQuery(src), at, at, 60)).reduce((n, s) => n + s.points.reduce((m, [, v]) => m + (Number.isFinite(v) ? v : 0), 0), 0)),
   ]);
+  const present = presence('log', `no log lines at all for ${src.selector} in the last minute`, seen, results[SLOTS.indexOf('now')]?.length ?? 0);
   const cells = new Map<string, { counts: Counts; sample: string }>();
   const truncatedSlots = new Set<Slot>();
   SLOTS.forEach((slot, i) => {
@@ -322,7 +322,7 @@ export async function collectLogs(tel: Telemetry, src: Sources['logs'], at: Date
       ...(truncatedSlots.size ? { truncated: true } : {}),
     });
   }
-  return withNotes(rows, presence, cappedNote(`line limit (${src.max_lines})`, SLOTS.filter((s) => truncatedSlots.has(s)), 'error log'));
+  return withNotes(rows, present, cappedNote(`line limit (${src.max_lines})`, SLOTS.filter((s) => truncatedSlots.has(s)), 'error log'));
 }
 
 // ---- Traces: error traces grouped by root service + operation ---------------
@@ -331,7 +331,7 @@ export async function collectLogs(tel: Telemetry, src: Sources['logs'], at: Date
 // lower bounds, and the source says so even when no row is flagged.
 export async function collectTraces(tel: Telemetry, src: Sources['traces'], at: Date, windowMin: number, t: Thresholds = DEFAULT_THRESHOLDS): Promise<Row[]> {
   const w = windowMin * 60_000;
-  const [results, presence] = await Promise.all([
+  const [results, seen] = await Promise.all([
     Promise.all(
       SLOTS.map((s) => {
         const end = shift(at, s);
@@ -339,8 +339,9 @@ export async function collectTraces(tel: Telemetry, src: Sources['traces'], at: 
       }),
     ),
     // Presence: any trace at all in the "now" window; one is enough.
-    present('trace', `no traces at all ({}) in the last ${windowMin} min`, async () => (await tel.tempoSearch('{}', new Date(at.getTime() - w), at, 1)).length),
+    probe(async () => (await tel.tempoSearch('{}', new Date(at.getTime() - w), at, 1)).length),
   ]);
+  const present = presence('trace', `no traces at all ({}) in the last ${windowMin} min`, seen, results[SLOTS.indexOf('now')]?.length ?? 0);
   const capped = SLOTS.filter((_, i) => (results[i]?.length ?? 0) >= src.limit);
   const cells = new Map<string, { counts: Counts; example: string }>();
   SLOTS.forEach((slot, i) => {
@@ -359,5 +360,5 @@ export async function collectTraces(tel: Telemetry, src: Sources['traces'], at: 
     const [service, subject] = k.split('\u0000') as [string, string];
     rows.push({ key: rowKey({ section: 'traces', service, subject }), section: 'traces', service, subject, counts, score, detail: example, query: src.traceql, ...(capped.length ? { truncated: true } : {}) });
   }
-  return withNotes(rows, presence, cappedNote(`search limit (${src.limit})`, capped, 'trace'));
+  return withNotes(rows, present, cappedNote(`search limit (${src.limit})`, capped, 'trace'));
 }
