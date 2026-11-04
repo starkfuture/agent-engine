@@ -238,14 +238,15 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     state.save();
     // An issue is resolved once every row of it is back to normal (which needs
     // healthy observers and recoverAfterMinutes without firing), with one
-    // recovery note in its thread. Its rows get no recovery note of their own,
-    // also while some of them still fire. A row of no open issue gets one only
-    // if a post about it is still unanswered (groupByThread).
+    // recovery note in its thread. Its rows never get a note of their own:
+    // not while some of them still fire, and not after it resolved, when they
+    // come and go on their own. A row of no issue gets one only if a post
+    // about it is still unanswered (groupByThread).
     let loose = summary.recovered;
     const issues = o.issues;
     if (issues) {
       const open = record('listing open issues', () => issues.openIssues(), []);
-      const held = new Set(open.flatMap((i) => i.rows));
+      const held = new Set([...open.flatMap((i) => i.rows), ...record('finding the issues of recovered rows', () => issues.withIssue(summary.recovered), new Set<string>())]);
       loose = summary.recovered.filter((k) => !held.has(k));
       for (const i of open) {
         const back = i.rows.filter((k) => state.recoveredAt(k) !== undefined).length;

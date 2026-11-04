@@ -345,6 +345,24 @@ test('a row of a resolved issue that comes back unposted goes back quietly: no n
   assert.deepEqual(t.sent.map((s) => s.text), ['🟠 Major: Sign-in rejects emails with a trailing space', `✅ Back to normal at 08:15Z · quiet for 15 min · ${id} resolved: backend-production · /v1/auth/login 400`]);
 });
 
+test('a row of a resolved issue never gets a note of its own, also one posted before notes were recorded', async () => {
+  const login = (t: number) => between(0, 0.25)(t) || between(1, 1.25)(t);
+  const tel = schedule({ '/v1/auth/login': login });
+  const t = bot();
+  const w = setup(t, linker());
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  assert.deepEqual((await w.patrol(tel, 0.25)).resolved, [id]);
+  // As on 11-04: rows posted before slack_threads recorded their notes look unanswered.
+  const db = new DatabaseSync(w.db);
+  db.exec(`UPDATE slack_threads SET recovered_at = NULL`);
+  db.close();
+  await w.patrol(tel, 1);
+  const back = await w.patrol(tel, 1.25);
+  assert.deepEqual(back.summary.recovered, [key('/v1/auth/login')]);
+  assert.equal(t.sent.length, 2, 'the issue and its one resolved note: nothing per row');
+});
+
 test('a row hidden by a noise rule still fires: its issue stays open until it stops', async () => {
   const login = (t: number) => (between(0, 0.25)(t) || between(0.5, 2)(t));
   const tel = schedule({ '/v1/auth/login': login, '/v1/ownership/transfer': between(0, 1) });
