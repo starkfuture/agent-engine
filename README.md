@@ -109,7 +109,7 @@ Every post goes through an outbox in the engine's SQLite file (`slack_outbox`):
 - **Posting off means no delivery**, including messages left queued by an earlier patrol.
 - **Recovery requires healthy observers.** A missing or failed source leaves its issues unresolved; recovery is recorded once when the source returns, including after a restart. Suppressing a signal does not resolve it.
 - **Back to normal means an hour without firing** (`PATROL_RECOVER_AFTER_MINUTES`, default 60). A row that flickers (on for a patrol, off for one or two) stays one problem, and its issue stays open. A stalled rollout is back when it completes.
-- **One post, one recovery note.** A row gets a "✅ Back to normal" only when a post about it is still unanswered. A row that comes back without a post (a known row, a minor report) goes back quietly.
+- **One post, one recovery note.** A row gets a "✅ Back to normal" only when a post about it is still unanswered. A row that comes back without a post (a known row, a minor report) goes back quietly. A note that lists a row answers every post about it before the note: the issue's one "resolved" note covers its rows, so they get no note of their own afterwards, unless posted again since (an urgent rows card, say).
 
 Delivery is at least once: if Slack accepts a message but its response is lost, a retry may duplicate it. The outbox prevents overlapping senders from duplicating a post; it cannot make the remote send and the local receipt one transaction.
 
