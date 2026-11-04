@@ -147,6 +147,24 @@ test('a post still queued for a row is owed its note: Slack down when the row co
   assert.deepEqual(bot.sent.map((s) => s.text), ['urgent', 'back', 'urgent again', 'back again'], 'in order: the note after its post');
 });
 
+test('when a row was last posted: sent, or still queued (Slack down) from when it was queued', async () => {
+  let down = false;
+  const bot = fakeBot(() => (down ? new SlackError('down') : undefined));
+  const { box, c } = outbox(bot);
+  box.enqueue({ kind: 'rows', keys: ['k'], broadcast: true, message: msg('urgent') });
+  await box.flush();
+  assert.deepEqual([...box.lastPosted(['k', 'other'])], [['k', '2026-10-31T10:00:00.000Z']]);
+  c.advance(60);
+  box.enqueue({ kind: 'recovered', keys: ['k'], broadcast: false, message: msg('back') });
+  await box.flush();
+  assert.deepEqual([...box.lastPosted(['k'])], [['k', '2026-10-31T10:00:00.000Z']], 'a recovery note is not a post about it');
+  c.advance(60);
+  down = true;
+  box.enqueue({ kind: 'rows', keys: ['k'], broadcast: true, message: msg('urgent again') });
+  await box.flush();
+  assert.deepEqual([...box.lastPosted(['k'])], [['k', '2026-10-31T12:00:00.000Z']], 'queued, not sent: counts from when it was queued');
+});
+
 test('the webhook cannot thread: every post is top-level, as before', async () => {
   const sent: string[] = [];
   const box = new SlackOutbox(':memory:', { threads: false, post: async (m) => void sent.push(m.text) }, { sleep: async () => {}, gapMs: 0 });

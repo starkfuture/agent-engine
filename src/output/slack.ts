@@ -319,11 +319,18 @@ export class SlackOutbox {
     return [...by.values()];
   }
 
-  // When each of these rows was last posted about (not counting recovery notes).
+  // When each of these rows was last posted about (not counting recovery
+  // notes). A post still queued for it counts from when it was queued.
   lastPosted(keys: string[]): Map<string, string> {
     if (!keys.length) return new Map();
-    const rows = this.db.prepare(`SELECT key, last_at FROM slack_threads WHERE key IN (${keys.map(() => '?').join(',')})`).all(...keys) as Array<{ key: string; last_at: string }>;
-    return new Map(rows.map((r) => [r.key, r.last_at]));
+    const marks = keys.map(() => '?').join(',');
+    const sent = this.db.prepare(`SELECT key, last_at AS at FROM slack_threads WHERE key IN (${marks})`).all(...keys) as Array<{ key: string; at: string }>;
+    const queued = this.db
+      .prepare(`SELECT j.value AS key, MAX(o.created_at) AS at FROM slack_outbox o, json_each(o.keys) j WHERE o.status = 'pending' AND o.kind IN ('rows', 'report') AND j.value IN (${marks}) GROUP BY j.value`)
+      .all(...keys) as Array<{ key: string; at: string }>;
+    const out = new Map<string, string>();
+    for (const r of [...sent, ...queued]) if (r.at > (out.get(r.key) ?? '')) out.set(r.key, r.at);
+    return out;
   }
 
   // Send what is pending, oldest first. Never throws: Slack being down must not

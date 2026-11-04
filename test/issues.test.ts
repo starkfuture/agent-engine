@@ -379,6 +379,24 @@ test('a row of a resolved issue posted again after it resolved gets its note: th
   assert.deepEqual(t.sent.slice(3).map((m) => m.text), ['✅ Back to normal at 09:15Z · quiet for 15 min: backend-production · /v1/auth/login 400']);
 });
 
+test('a row of a resolved issue whose new post is still queued (Slack down) gets its note after it', async () => {
+  const login = (t: number) => between(0, 0.25)(t) || between(1, 1.25, 300)(t);
+  const tel = schedule({ '/v1/auth/login': login });
+  let down = false;
+  const sent: Sent[] = [];
+  const t: Transport = { threads: true, async post(m) { if (down) throw new SlackError('down'); sent.push({ text: m.text }); return `1700000000.${String(sent.length).padStart(6, '0')}`; } };
+  const w = setup(t, (s) => (s.issues[0] ? { issue: s.issues[0].id, severity: 'minor' } : { issue: 'new' }));
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  assert.deepEqual((await w.patrol(tel, 0.25)).resolved, [id]);
+  down = true;
+  await w.patrol(tel, 1); // the urgent rows card waits in the outbox
+  await w.patrol(tel, 1.25); // back to normal while it still waits
+  down = false;
+  await w.patrol(tel, 1.5);
+  assert.deepEqual(sent.slice(2).map((m) => m.text.split('\n')[0]), ['Patrol 2026-11-02 09:00Z: 1 to look at', '✅ Back to normal at 09:15Z · quiet for 15 min: backend-production · /v1/auth/login 400']);
+});
+
 test('a row hidden by a noise rule still fires: its issue stays open until it stops', async () => {
   const login = (t: number) => (between(0, 0.25)(t) || between(0.5, 2)(t));
   const tel = schedule({ '/v1/auth/login': login, '/v1/ownership/transfer': between(0, 1) });
