@@ -9,10 +9,11 @@ import { join } from 'node:path';
 
 const RUN_ID = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-/;
 
-export function sweep(o: { runsDir: string; outDir?: string; days: number; now?: Date }): { runs: number; cards: number } {
+export function sweep(o: { runsDir: string; outDir?: string; days: number; now?: Date }): { runs: number; cards: number; patrols: number } {
   const cutoff = (o.now ?? new Date()).getTime() - o.days * 86_400_000;
   let runs = 0;
   let cards = 0;
+  let patrols = 0;
   if (existsSync(o.runsDir))
     for (const agent of readdirSync(o.runsDir, { withFileTypes: true })) {
       if (!agent.isDirectory()) continue;
@@ -33,7 +34,16 @@ export function sweep(o: { runsDir: string; outDir?: string; days: number; now?:
       rmSync(p, { force: true });
       cards++;
     }
-  return { runs, cards };
+  // Patrol summaries (out/patrols) hold row text from production; they age out too.
+  const patrolsDir = o.outDir ? join(o.outDir, 'patrols') : undefined;
+  if (patrolsDir && existsSync(patrolsDir))
+    for (const f of readdirSync(patrolsDir)) {
+      const p = join(patrolsDir, f);
+      if (statSync(p).mtimeMs >= cutoff) continue;
+      rmSync(p, { recursive: true, force: true });
+      patrols++;
+    }
+  return { runs, cards, patrols };
 }
 
 export function freeBytes(dir: string): number | undefined {

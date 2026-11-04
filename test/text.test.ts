@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fence, identitiesOf, redact, templateOf } from '../src/engine/text.js';
-import type { LogLine } from '../src/clients/telemetry.js';
+import { fence, identitiesOf, redact, redactDeep, templateOf } from '../src/engine/text.js';
+import type { LogLine, Telemetry } from '../src/clients/telemetry.js';
 import { Evidence } from '../src/engine/evidence.js';
 import { monitorTools } from '../src/investigate/tools.js';
 import { FakeTelemetry, testConfig } from './fake.js';
-import { workloadOf } from '../src/patrol/collectors.js';
+import { collectLogs, workloadOf } from '../src/patrol/collectors.js';
 import { withMatcher } from '../src/investigate/tools.js';
+
+const AT = new Date('2026-10-01T12:00:00Z');
 
 test('engine and GitHub App tokens are redacted', () => {
   const t = 'debug this eng_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 and ghs_AbCdEfGhIjKlMnOpQrStUvWx01';
@@ -103,4 +105,62 @@ test('log_search counts the distinct users a template mentions, past its two sam
   assert.match(text, /11× ecom-service-production JWT Strategy validation error/);
   assert.match(text, /distinct: 6 userid, 2 vin/);
   assert.doesNotMatch(text, /u-5|u-6/, 'only the two samples show any value');
+});
+
+// Fabricated values; the shape is a referral payload seen in legacy backend error logs.
+const referral = (n: number, first: string, last: string, street: string) =>
+  `Referral failed: {"_id":"64b1f0c2a1b2c3d4e5f6a7b${n}","firstName":"${first}","lastName":"${last}","email":"${first.toLowerCase()}@example.com","phone":"+44 20 7946 0958","vin":"YV1ABCDEFGH123456","address":"${street}","marketingConsent":"true"}`;
+
+test('person names and street addresses in JSON log text are masked', () => {
+  const s = redact(referral(1, 'Jane', 'Smithers', '12 Quill Lane, Springfield'));
+  for (const leak of ['Jane', 'Smithers', 'Quill', 'Springfield']) assert.ok(!s.includes(leak), s);
+  assert.match(s, /"firstName":"<name>"/);
+  assert.match(s, /"address":"<address>"/);
+  JSON.parse(s.slice(s.indexOf('{')));
+  assert.ok(s.includes('"marketingConsent":"true"'), 'other fields stay as evidence');
+});
+
+test('names and addresses are masked in escaped JSON, key=value and snake_case forms', () => {
+  const s = redact('body={\\"last_name\\":\\"Smithers\\",\\"postalCode\\":\\"AB1 2CD\\"} first-name=Jane city=Springfield zip_code=12345 house_number=7 street=Quill Lane,');
+  for (const leak of ['Smithers', 'AB1 2CD', 'Jane', 'Springfield', '12345', 'Quill']) assert.ok(!s.includes(leak), s);
+});
+
+test('a bare name or address stops at the next field, so codes and routes stay visible', () => {
+  const s = redact('error firstName=Jane Smithers code=PAYMENT_DECLINED street=12 Quill Lane city=Springfield route=/pay');
+  for (const leak of ['Jane', 'Smithers', 'Quill', 'Springfield']) assert.ok(!s.includes(leak), s);
+  assert.ok(s.includes('code=PAYMENT_DECLINED') && s.includes('route=/pay'), s);
+});
+
+test('an escaped quote inside a name does not end the value early', () => {
+  const s = redact('{"fullName":"Jane \\"JJ\\" Smithers","code":"E1"}');
+  for (const leak of ['Jane', 'JJ', 'Smithers']) assert.ok(!s.includes(leak), s);
+  assert.deepEqual(JSON.parse(s), { fullName: '<name>', code: 'E1' });
+});
+
+test('keys that only look similar are left alone', () => {
+  const s = redact('{"name":"auth-service","ipAddress":"x","emailAddress":"y","route":"/v3/auth/refresh"}');
+  assert.ok(s.includes('auth-service') && s.includes('"ipAddress":"x"') && s.includes('/v3/auth/refresh'), s);
+});
+
+test('different people with the same failure share one template and none of it names anyone', () => {
+  const a = templateOf(referral(1, 'Jane', 'Smithers', '12 Quill Lane'));
+  const b = templateOf(JSON.stringify({ level: 'error', context: 'ReferralService', msg: referral(2, 'Omar', 'Okafor', '9 Elm Road') }));
+  for (const leak of ['Jane', 'Smithers', 'Quill', 'Omar', 'Okafor', 'Elm']) assert.ok(!a.includes(leak) && !b.includes(leak), `${a} | ${b}`);
+  assert.equal(templateOf(referral(1, 'Jane', 'Smithers', '12 Quill Lane')), templateOf(referral(3, 'Omar', 'Okafor', '9 Elm Road')));
+});
+
+test('redactDeep masks person and address keys, including whole address objects', () => {
+  const o = redactDeep({ firstName: 'Jane', customer: { fullName: 'Jane Smithers', address: { line1: '12 Quill Lane', city: 'Springfield' } }, name: 'route-a' }) as Record<string, any>;
+  const j = JSON.stringify(o);
+  for (const leak of ['Jane', 'Smithers', 'Quill', 'Springfield']) assert.ok(!j.includes(leak), j);
+  assert.equal(o.name, 'route-a');
+  assert.equal(JSON.stringify(redactDeep(JSON.stringify({ lastName: 'Okafor' }))).includes('Okafor'), false);
+});
+
+test('a log-row sample, key and subject carry no names or addresses', async () => {
+  const lines = Array.from({ length: 20 }, (_, i) => ({ ts: new Date(), line: referral(i, `Jane${i}x`, `Smithers${i}x`, `${i} Quill Lane`), labels: { app: 'backend-production' } }));
+  const tel = { lokiRange: async (_q: string, _s: Date, end: Date) => (end.getTime() === AT.getTime() ? lines : []) } as unknown as Telemetry;
+  const rows = await collectLogs(tel, { selector: '{a="b"}', error_filter: '', service_label: 'app', max_lines: 100 }, AT, 15);
+  assert.ok(rows.length > 0);
+  assert.ok(!JSON.stringify(rows).match(/Jane\d|Smithers|Quill/), JSON.stringify(rows));
 });

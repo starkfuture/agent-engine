@@ -451,7 +451,7 @@ async function main() {
       const clean = () => {
         try {
           const r = sweep({ runsDir: cfg.runsDir, outDir: cfg.outDir, days: cfg.retentionDays });
-          if (r.runs || r.cards) log(`retention: deleted ${r.runs} run folder(s) and ${r.cards} card(s) older than ${cfg.retentionDays} days`);
+          if (r.runs || r.cards || r.patrols) log(`retention: deleted ${r.runs} run folder(s), ${r.cards} card(s) and ${r.patrols} patrol file(s) older than ${cfg.retentionDays} days`);
         } catch (e) {
           log(`retention failed: ${(e as Error).message}`);
         }

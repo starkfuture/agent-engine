@@ -5,7 +5,19 @@ import { createHash } from 'node:crypto';
 // a backstop: the real boundary is what an agent can reach (snapshots, in-process
 // credentials), not this list.
 const SECRET_KEY = String.raw`[A-Za-z0-9_]*?(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|encryption[_-]?key|signing[_-]?key|authorization|credential|hmac|cookie|_pass|_key)[A-Za-z0-9_]*`;
-const REDACTIONS: Array<[RegExp, string]> = [
+// Keys that name a person or a postal address. Customer records show up in
+// error logs (a failed referral prints the whole payload), and the names and
+// street addresses in them are personal data. A bare `name` key is NOT here: it
+// is a service, route or class name everywhere, so a customer name under plain
+// `name` is a known gap. `ipAddress`, `emailAddress` and the like stay readable.
+const NAME_KEY = String.raw`(?:first|last|full|given|family|middle|sur)[_-]?name`;
+const ADDRESS_KEY = String.raw`(?:(?:billing|shipping|delivery|home|mailing)[_-]?)?(?:address(?:[_-]?line)?[_-]?[0-9]?|street(?:[_-]?address)?[_-]?[0-9]?|city|zip(?:[_-]?code)?|postcode|postal[_-]?code|house[_-]?number)`;
+const PERSONAL_KEY = `(?:${NAME_KEY}|${ADDRESS_KEY})`;
+// A quoted value, escaped (\"x\") or plain ("x", which may hold \" inside), and
+// the same value with the same quotes around a placeholder, so JSON stays JSON.
+const QUOTED = String.raw`\\"(?:[^"\\]|\\[^"])*\\"|"(?:[^"\\]|\\.)*"|'[^']*'`;
+const keepQuotes = (v: string, ph: string): string => (v.startsWith('\\"') ? `\\"${ph}\\"` : `${v[0]}${ph}${v[0]}`);
+const REDACTIONS: Array<[RegExp, string | ((...a: any[]) => string)]> = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '<private-key>'],
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '<jwt>'],
   [/https:\/\/hooks\.slack\.com\/[A-Za-z0-9/_-]+/g, '<slack-webhook>'],
@@ -18,6 +30,13 @@ const REDACTIONS: Array<[RegExp, string]> = [
   [new RegExp(String.raw`\b(${SECRET_KEY})(\\?["']?\s*[:=]\s*)(\\?"(?:[^"\\]|\\[^"])*\\?"|'[^']*')`, 'gi'), '$1$2<secret>'],
   // …and bare values in env/query/YAML style (KEY=v, key: v), but not code (`token = getToken()`).
   [new RegExp(String.raw`\b(${SECRET_KEY})(=|\s*:\s*)(?!<secret>)([^\s"',}&]+)`, 'gi'), '$1$2<secret>'],
+  // Names and street addresses by key: quoted values (also escaped JSON), then
+  // bare key=value. `name: x` style is only taken for name keys, because
+  // "address: ECONNREFUSED" is an error message, not a street.
+  [new RegExp(String.raw`\b(${NAME_KEY})(\\?["']?\s*[:=]\s*)(${QUOTED})`, 'gi'), (_m, k: string, sep: string, v: string) => `${k}${sep}${keepQuotes(v, '<name>')}`],
+  [new RegExp(String.raw`\b(${ADDRESS_KEY})(\\?["']?\s*[:=]\s*)(${QUOTED})`, 'gi'), (_m, k: string, sep: string, v: string) => `${k}${sep}${keepQuotes(v, '<address>')}`],
+  [new RegExp(String.raw`\b(${NAME_KEY})(=|\s*:\s*)(?!<name>)([^\s"',}&\\]+(?: (?![\w-]+[=:])[A-Z][^\s"',}&\\]*){0,4})`, 'gi'), '$1$2<name>'],
+  [new RegExp(String.raw`\b(${ADDRESS_KEY})=(?!<address>)([^\s"',}&\\]+(?: (?![\w-]+[=:])[^\s"',}&\\]+){0,6})`, 'gi'), '$1=<address>'],
   // Bounded quantifiers keep this linear on long lines.
   [/[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}/g, '<email>'],
   [/\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}\b/g, '<iban>'],
@@ -28,7 +47,7 @@ const REDACTIONS: Array<[RegExp, string]> = [
 
 export function redact(s: string): string {
   let out = s;
-  for (const [re, rep] of REDACTIONS) out = out.replace(re, rep);
+  for (const [re, rep] of REDACTIONS) out = typeof rep === 'string' ? out.replace(re, rep) : out.replace(re, rep);
   return out;
 }
 
@@ -39,6 +58,15 @@ export function secretValue(k: string, x: unknown): boolean {
   if (!SECRET_KEY_EXACT.test(k)) return false;
   if (typeof x === 'string') return true;
   return typeof x === 'number' && !/tokens$/i.test(k);
+}
+
+const PERSONAL_KEY_EXACT = new RegExp(`^${PERSONAL_KEY}$`, 'i');
+// Whether a key's value is a person's name or address to mask. Objects count
+// (an `address` holding line1/city/…), so the whole value goes.
+export function personalValue(k: string, x: unknown): string | undefined {
+  if (!PERSONAL_KEY_EXACT.test(k) || x === null || x === undefined || x === '') return undefined;
+  if (typeof x !== 'string' && typeof x !== 'number' && typeof x !== 'object') return undefined;
+  return new RegExp(`^${NAME_KEY}$`, 'i').test(k) ? '<name>' : '<address>';
 }
 
 // Redact a structured value before it is serialised. Serialising first hides
@@ -60,7 +88,7 @@ export function redactDeep(v: unknown, depth = 0): unknown {
   if (Array.isArray(v)) return v.map((x) => redactDeep(x, depth));
   if (v && typeof v === 'object') {
     const out: Record<string, unknown> = {};
-    for (const [k, x] of Object.entries(v)) out[k] = secretValue(k, x) ? '<secret>' : redactDeep(x, depth);
+    for (const [k, x] of Object.entries(v)) out[k] = secretValue(k, x) ? '<secret>' : (personalValue(k, x) ?? redactDeep(x, depth));
     return out;
   }
   return v;
