@@ -133,9 +133,10 @@ test('no log line at all while Loki answers is missing data, not a quiet system;
   assert.equal(logs.error, 'no log lines at all for {namespace="microservices"} in the last minute (missing data, not a quiet system)');
   // Cost: one 1-minute count of the plain selector at the patrol time, never the window.
   const presence = quiet.calls.filter((x) => x.m === 'lokiMetric');
+  // A 1 s step: a backend that aligns points to the step can't move it off the patrol time.
   assert.deepEqual(
-    presence.map((x) => [x.q, x.start?.toISOString(), x.end.toISOString()]),
-    [['sum(count_over_time({namespace="microservices"}[1m]))', AT.toISOString(), AT.toISOString()]],
+    presence.map((x) => [x.q, x.start?.toISOString(), x.end.toISOString(), x.n]),
+    [['sum(count_over_time({namespace="microservices"}[1m]))', AT.toISOString(), AT.toISOString(), 1]],
   );
 
   // Lines arrive, none of them errors: a quiet system, and the source is fine.

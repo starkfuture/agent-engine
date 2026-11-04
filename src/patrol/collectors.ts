@@ -274,7 +274,9 @@ export function logQuery(src: Sources['logs']): string {
 }
 
 // Presence: any line at all for the plain selector, one minute at the patrol
-// time. No line filter and never the whole window, so it stays cheap.
+// time. No line filter and never the whole window, so it stays cheap. One
+// point with a 1 s step: a backend that aligns points to the step can't move
+// it off the patrol time.
 export const logPresenceQuery = (src: Sources['logs']) => `sum(count_over_time(${src.selector}[1m]))`;
 
 export async function collectLogs(tel: Telemetry, src: Sources['logs'], at: Date, windowMin: number, t: Thresholds = DEFAULT_THRESHOLDS): Promise<Row[]> {
@@ -287,7 +289,7 @@ export async function collectLogs(tel: Telemetry, src: Sources['logs'], at: Date
         return tel.lokiRange(query, new Date(end.getTime() - w), end, src.max_lines);
       }),
     ),
-    probe(async () => (await tel.lokiMetric(logPresenceQuery(src), at, at, 60)).reduce((n, s) => n + s.points.reduce((m, [, v]) => m + (Number.isFinite(v) ? v : 0), 0), 0)),
+    probe(async () => (await tel.lokiMetric(logPresenceQuery(src), at, at, 1)).reduce((n, s) => n + s.points.reduce((m, [, v]) => m + (Number.isFinite(v) ? v : 0), 0), 0)),
   ]);
   const present = presence('log', `no log lines at all for ${src.selector} in the last minute`, seen, results[SLOTS.indexOf('now')]?.length ?? 0);
   const cells = new Map<string, { counts: Counts; sample: string }>();
