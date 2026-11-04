@@ -249,9 +249,9 @@ test('Not an issue: linked reports are not posted, its rows get no AI run, and a
   const w = setup({ decide: (rows, issues) => ({ issue: issues[0] ?? 'new', severity: rows.includes(key('/v1/auth/signup')) ? 'critical' : 'major' }) });
   const id = opened(await w.patrol(tel, 0));
   const r = await w.click('dismissed', id, { user: 'U0BOB' }, 0.25);
-  assert.match(r.reply!, new RegExp(`^Not an issue: ${id} is muted until it resolves, at most until 11-09 08:15Z`));
+  assert.match(r.reply!, new RegExp(`^Not an issue: ${id} is muted for 7 days, until 11-09 08:15Z, also if it resolves and comes back\\.`));
   assert.deepEqual(buttons(w.t.updates[0]!.blocks), [ACTION.undo]);
-  assert.match(note(w.t.updates[0]!.blocks), /Not an issue: <@U0BOB> at 11-02 08:15Z\. Muted until it resolves, at most until 11-09 08:15Z/);
+  assert.match(note(w.t.updates[0]!.blocks), /Not an issue: <@U0BOB> at 11-02 08:15Z\. Muted for 7 days, until 11-09 08:15Z, also if it resolves and comes back\./);
 
   // A sibling row the AI links to it: investigated (it wasn't the issue's yet), not posted.
   const sibling = await w.patrol(tel, 2);
