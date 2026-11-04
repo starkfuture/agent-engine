@@ -19,7 +19,7 @@ const button = (click: Click, issue: string, text: string, extra: Record<string,
 
 const NOT_AN_ISSUE_CONFIRM = {
   title: plain('Not an issue?'),
-  text: plain(`Its reports won't be posted and its rows get no AI run until it resolves, at most ${MUTE_DAYS} days. A protected journey or a rise to critical still posts. Undo is on the message.`),
+  text: plain(`Its reports won't be posted and its rows get no AI run for ${MUTE_DAYS} days, also if it resolves and comes back. A protected journey or a rise to critical still posts. Undo is on the message.`),
   confirm: plain('Not an issue'),
   deny: plain('Cancel'),
   style: 'danger',
@@ -31,7 +31,7 @@ export function issueControls(issue: Issue, d: Disposition | undefined, before: 
   if (issue.status === 'resolved') return [context(`✅ ${issue.id} resolved at ${when(issue.resolved_at ?? '')}`)];
   const lines: string[] = [];
   if (d?.kind === 'acknowledged') lines.push(`👀 On it: <@${d.by}> since ${when(d.at)}. Reports stay in the thread; no daily reminder.`);
-  if (d?.kind === 'dismissed') lines.push(`🔕 Not an issue: <@${d.by}> at ${when(d.at)}. Muted until it resolves, at most until ${when(d.until ?? '')}.`);
+  if (d?.kind === 'dismissed') lines.push(`🔕 Not an issue: <@${d.by}> at ${when(d.at)}. Muted for ${MUTE_DAYS} days, until ${when(d.until ?? '')}, also if it resolves and comes back.`);
   if (!d && before.length) lines.push(`Marked Not an issue before by <@${before.at(-1)!.by}> on ${day(before.at(-1)!.at)}${before.length > 1 ? ` (${before.length} times)` : ''}.`);
   const notAnIssue = button('dismissed', issue.id, 'Not an issue', { confirm: NOT_AN_ISSUE_CONFIRM });
   const buttons = !d ? [button('acknowledged', issue.id, 'On it', { style: 'primary' }), notAnIssue] : d.kind === 'acknowledged' ? [notAnIssue, button('undo', issue.id, 'Undo')] : [button('undo', issue.id, 'Undo')];
@@ -104,7 +104,7 @@ export function onClick(body: unknown, o: { issues: Issues; outbox: SlackOutbox;
     click === 'acknowledged'
       ? `On it: ${id} is yours. Its reports stay in the thread with no daily reminder, and a row that gets worse gets one line there instead of an AI run.`
       : click === 'dismissed'
-        ? `Not an issue: ${id} is muted until it resolves, at most until ${when(r.now?.until ?? '')}. Its reports aren't posted and its rows get no AI run. A protected journey or a rise to critical still posts. Admins see it as a noise-rule candidate.`
+        ? `Not an issue: ${id} is muted for ${MUTE_DAYS} days, until ${when(r.now?.until ?? '')}, also if it resolves and comes back. Its reports aren't posted and its rows get no AI run. A protected journey or a rise to critical still posts. Admins see it as a noise-rule candidate.`
         : `Undone: nobody is on ${id} and it isn't muted.`;
   return { reply, updated: id, ...(respondTo ? { respondTo } : {}) };
 }

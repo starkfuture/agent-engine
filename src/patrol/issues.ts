@@ -66,7 +66,8 @@ export interface Linked {
 
 // What a person said with the buttons on the issue's Slack message, for this
 // episode: "On it" (acknowledged) or "Not an issue" (dismissed: a mute, which
-// ends at `until` at the latest). One at a time; resolving the issue ends it.
+// ends at `until` at the latest). One at a time; resolving the issue ends On
+// it, and Not an issue only once its mute is over (see resolve).
 export interface Disposition {
   kind: 'acknowledged' | 'dismissed';
   by: string; // Slack user id
@@ -194,7 +195,9 @@ export class Issues {
 
   // A report with the same cause. Its rows join the issue. A resolved issue is
   // reopened only when `reopen` (the caller posts recurrences, not quiet ones).
-  link(id: string, r: Filed, at: Date, o: { reopen: boolean }): Linked {
+  // A Not an issue kept from before it resolved stays on it when `muted` (the
+  // caller found the return quiet enough, see keptMute), and ends otherwise.
+  link(id: string, r: Filed, at: Date, o: { reopen: boolean; muted?: boolean }): Linked {
     const out = this.tx(() => {
       const before = this.row(id);
       if (!before) throw new Error(`no issue ${id}`);
@@ -205,7 +208,14 @@ export class Issues {
       if (before.status === 'resolved' && o.reopen) {
         // A new episode: its severity starts from this report.
         this.db.prepare(`UPDATE issues SET status = 'open', resolved_at = NULL, severity = ? WHERE id = ?`).run(r.severity, id);
-        this.event(id, 'reopened', at, { ...(r.run ? { run: r.run } : {}), severity: r.severity, resolved_at: before.resolved_at });
+        // Not an issue kept from before it resolved (see resolve), while its mute lasts.
+        const kept = this.lasting(id, at);
+        const muted = !!o.muted && kept?.kind === 'dismissed';
+        this.event(id, 'reopened', at, { ...(r.run ? { run: r.run } : {}), severity: r.severity, resolved_at: before.resolved_at, ...(muted ? { muted: true } : {}) });
+        if (!muted && this.current(id)) {
+          this.clear(id);
+          if (kept) this.event(id, 'mute_lifted', at, { reason: r.severity === 'critical' ? 'critical' : 'came back', ...(r.run ? { run: r.run } : {}) });
+        }
         res.reopenedFrom = before.resolved_at ?? iso;
       }
       this.addRows(id, r.rows);
@@ -222,9 +232,12 @@ export class Issues {
   }
 
   // When the channel last heard about the issue: opened, raised, reopened,
-  // reminded, or an urgent rows card in its thread.
+  // reminded, or an urgent rows card in its thread. A return Not an issue kept
+  // quiet is not news.
   lastNewsAt(id: string): string | undefined {
-    const news = this.db.prepare(`SELECT MAX(at) AS at FROM issue_events WHERE issue_id = ? AND type IN ('opened', 'severity_raised', 'reopened', 'reminded', 'rows_posted')`).get(id) as { at: string | null };
+    const news = this.db
+      .prepare(`SELECT MAX(at) AS at FROM issue_events WHERE issue_id = ? AND type IN ('opened', 'severity_raised', 'reopened', 'reminded', 'rows_posted') AND json_extract(data, '$.muted') IS NULL`)
+      .get(id) as { at: string | null };
     return news.at ?? undefined;
   }
 
@@ -241,14 +254,18 @@ export class Issues {
     this.event(id, 'rows_posted', at, { rows });
   }
 
-  // Resolving ends the episode, and with it On it or Not an issue.
+  // Resolving ends the episode, and with it On it. Not an issue outlasts it
+  // while its mute lasts (MUTE_DAYS from the click): a person's judgement
+  // shouldn't end when the rows go quiet for an hour. The event keeps the rows
+  // it covered then (see keptMute).
   resolve(id: string, at: Date): void {
     this.tx(() => {
       const changed = this.db.prepare(`UPDATE issues SET status = 'resolved', resolved_at = ? WHERE id = ? AND status = 'open'`).run(at.toISOString(), id).changes;
       if (!changed) return;
       const d = this.current(id);
-      this.clear(id);
-      this.event(id, 'resolved', at, { rows: this.rowsOf(id), ...(d ? { ended: d.kind } : {}) });
+      const kept = this.lasting(id, at)?.kind === 'dismissed';
+      if (!kept) this.clear(id);
+      this.event(id, 'resolved', at, { rows: this.rowsOf(id), ...(d ? (kept ? { kept: d.kind, until: d.until } : { ended: d.kind }) : {}) });
     });
   }
 
@@ -302,9 +319,24 @@ export class Issues {
   }
 
   // On it or Not an issue, as it stands at `at`: a mute past its end is over.
+  // A resolved issue has none in force (one kept for its return: keptMute).
   disposition(id: string, at: Date): Disposition | undefined {
+    return this.row(id)?.status === 'open' ? this.lasting(id, at) : undefined;
+  }
+
+  private lasting(id: string, at: Date): Disposition | undefined {
     const d = this.current(id);
     return d && !(d.until && Date.parse(d.until) <= at.getTime()) ? d : undefined;
+  }
+
+  // Not an issue on a resolved issue, kept while its mute lasts (see resolve),
+  // with the rows the issue held when it resolved: the rows the mute covered.
+  keptMute(id: string, at: Date): (Disposition & { rows: string[] }) | undefined {
+    const d = this.row(id)?.status === 'resolved' ? this.lasting(id, at) : undefined;
+    if (d?.kind !== 'dismissed') return undefined;
+    const resolved = this.db.prepare(`SELECT data FROM issue_events WHERE issue_id = ? AND type = 'resolved' ORDER BY id DESC LIMIT 1`).get(id) as { data: string } | undefined;
+    const rows = resolved ? (JSON.parse(resolved.data) as { rows?: string[] }).rows : undefined;
+    return { ...d, rows: rows ?? [] };
   }
 
   // A rise to critical ends Not an issue: the channel hears about it again.
@@ -316,10 +348,11 @@ export class Issues {
     });
   }
 
-  // Mutes past their hard end (MUTE_DAYS), ended now. The issues they were on.
+  // Mutes of open issues past their hard end (MUTE_DAYS), ended now. The
+  // issues they were on. One kept on a resolved issue just runs out.
   endMutes(at: Date): string[] {
     return this.tx(() => {
-      const ids = (this.db.prepare(`SELECT id FROM issues WHERE disposition = 'dismissed' AND muted_until <= ? ORDER BY id`).all(at.toISOString()) as Array<{ id: string }>).map((r) => r.id);
+      const ids = (this.db.prepare(`SELECT id FROM issues WHERE status = 'open' AND disposition = 'dismissed' AND muted_until <= ? ORDER BY id`).all(at.toISOString()) as Array<{ id: string }>).map((r) => r.id);
       for (const id of ids) {
         this.clear(id);
         this.event(id, 'mute_lifted', at, { reason: `${MUTE_DAYS} days` });
@@ -415,10 +448,13 @@ export class Issues {
   }
 
   // What the investigator is shown: open issues and those resolved in the last
-  // `resolvedHours`, most recently reported first, at most `max`.
+  // `resolvedHours`, most recently reported first, at most `max`. Also a
+  // resolved one whose Not an issue still lasts, so a return can link to it.
   listed(at: Date, o: { max?: number; resolvedHours?: number } = {}): { issues: Issue[]; more: number } {
     const since = new Date(at.getTime() - (o.resolvedHours ?? 24) * H).toISOString();
-    const rows = this.db.prepare(`SELECT * FROM issues WHERE status = 'open' OR resolved_at >= ? ORDER BY last_at DESC`).all(since) as unknown as IssueRow[];
+    const rows = this.db
+      .prepare(`SELECT * FROM issues WHERE status = 'open' OR resolved_at >= ? OR (disposition = 'dismissed' AND muted_until > ?) ORDER BY last_at DESC`)
+      .all(since, at.toISOString()) as unknown as IssueRow[];
     const max = o.max ?? 20;
     return { issues: rows.slice(0, max).map((r) => this.full(r)), more: Math.max(0, rows.length - max) };
   }

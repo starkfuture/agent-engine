@@ -69,7 +69,7 @@ export type Filing =
   | { action: 'raised'; issue: Issue; from: Severity; unmuted?: boolean } // unmuted: it ended a Not an issue mute
   | { action: 'reopened'; issue: Issue } // it was resolved and came back
   | { action: 'reminded'; issue: Issue } // same cause, but the channel has heard nothing about it for REMIND_HOURS
-  | { action: 'muted'; issue: Issue }; // same cause, and someone said Not an issue: not posted
+  | { action: 'muted'; issue: Issue; reopened?: boolean }; // same cause, and someone said Not an issue: not posted (reopened: it came back while the mute lasts)
 
 // An open issue whose rows never all recover (a chronic one) would otherwise
 // hide every later report in its thread for good: at most once in this many
@@ -95,9 +95,11 @@ export interface FileOptions {
 export function fileReport(issues: Issues, r: Report, at: Date, run?: string, o: FileOptions = {}): Filing {
   const filed = { title: r.title, severity: r.severity, rows: r.rows, hypothesis: r.cause.hypothesis, run };
   if (r.issue === 'new') return POSTED.has(r.severity) ? { action: 'opened', issue: issues.open(filed, at) } : { action: 'none' };
-  // A recurrence reopens the issue only when it is worth posting.
-  const l = issues.link(r.issue, filed, at, { reopen: POSTED.has(r.severity) });
-  if (l.reopenedFrom) return { action: 'reopened', issue: l.issue };
+  // A recurrence reopens the issue only when it is worth posting; quietly
+  // while a Not an issue from before it resolved still covers it.
+  const quiet = mutedReturn(issues, r, at, o);
+  const l = issues.link(r.issue, filed, at, { reopen: POSTED.has(r.severity), muted: quiet });
+  if (l.reopenedFrom) return quiet ? { action: 'muted', issue: l.issue, reopened: true } : { action: 'reopened', issue: l.issue };
   // The buttons: On it and Not an issue last until the issue resolves.
   const d = o.clicks ? issues.disposition(l.issue.id, at) : undefined;
   if (l.raisedFrom) {
@@ -115,6 +117,20 @@ export function fileReport(issues: Issues, r: Report, at: Date, run?: string, o:
   return { action: 'linked', issue: l.issue };
 }
 
+// A report that brings back a resolved issue someone said is not an issue,
+// while that mute lasts, stays muted: only rows the mute covered, none it
+// can't silence (see breaksMute), and no rise in severity (a rise to critical
+// ends a mute). Anything else reopens the issue as news and ends the mute, so
+// does a row that joined it since (a minor report): reopened muted, the mute
+// would cover that row too.
+function mutedReturn(issues: Issues, r: Report, at: Date, o: FileOptions): boolean {
+  if (!o.clicks || r.issue === 'new') return false;
+  const i = issues.get(r.issue);
+  const m = i?.status === 'resolved' ? issues.keptMute(i.id, at) : undefined;
+  const covered = (k: string) => !!m?.rows.includes(k);
+  return !!m && RANK[r.severity] <= RANK[i!.severity] && r.rows.every(covered) && i!.rows.every(covered) && !r.rows.some((k) => o.breaksMute?.(k));
+}
+
 // Would this report be shown in the channel, as a new message or a broadcast
 // reply, rather than as a quiet reply in its issue's thread (or not at all)?
 // fileReport's rule with the same options, read before the record changes.
@@ -124,7 +140,8 @@ export function shownInChannel(issues: Issues | undefined, r: Report, at: Date, 
   if (!POSTED.has(r.severity)) return false;
   if (!issues || r.issue === 'new') return true;
   const i = issues.get(r.issue);
-  if (!i || i.status === 'resolved' || RANK[r.severity] > RANK[i.severity]) return true; // on its own, reopened, raised (a rise also ends a mute)
+  if (!i || RANK[r.severity] > RANK[i.severity]) return true; // on its own, or raised (a rise also ends a mute)
+  if (i.status === 'resolved') return !mutedReturn(issues, r, at, o); // reopened, unless a Not an issue from before still covers it
   const d = o.clicks ? issues.disposition(i.id, at) : undefined;
   if (d?.kind === 'dismissed') return r.rows.some((k) => o.breaksMute?.(k)); // muted, unless a row breaks the mute
   if (o.reached && !o.reached(i.id)) return true; // opened without posting, or its first post failed: this one is its first
@@ -170,7 +187,7 @@ function filingNote(f: Filing, r: Report): string {
     case 'reminded':
       return `linked to ${f.issue.id}: open with no news in the channel for ${REMIND_HOURS} h (broadcast)`;
     case 'muted':
-      return `linked to ${f.issue.id} (Not an issue: not posted)`;
+      return f.reopened ? `reopened ${f.issue.id}: it came back, still Not an issue (not posted)` : `linked to ${f.issue.id} (Not an issue: not posted)`;
   }
 }
 
@@ -441,8 +458,9 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       const unchecked = visible && !inv.challenge;
       const card = reportCard(r, summary.at, footer, unchecked ? notRun('it became news after the check was decided') : inv.challenge, cc, issueRef(f), recentDeploys(summary.deploys), item);
       emit(card, `${stamp(summary.at)}-${i + 1}`, post);
-      // Back from resolved, or Not an issue ended: its buttons are back.
-      if (o.post && (f.action === 'reopened' || (f.action === 'raised' && f.unmuted))) sink.outbox?.updateRoot(f.issue.id);
+      // Back from resolved, or Not an issue ended: its buttons are back. Back
+      // while Not an issue lasts: its message shows the mute again, with Undo.
+      if (o.post && (f.action === 'reopened' || (f.action === 'muted' && f.reopened) || (f.action === 'raised' && f.unmuted))) sink.outbox?.updateRoot(f.issue.id);
       if (post) toSlack++;
       if (post?.repeat) quiet++;
       const note = `${filingNote(f, r)}${!fails ? '' : kept ? `; ${why}, posted anyway: a protected journey` : `; was ${out.severity}, ${why}`}${unchecked ? '; not verified: no second check ran' : ''}`;
