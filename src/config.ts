@@ -62,6 +62,9 @@ export interface Config {
   lokiUid: string | undefined;
   tempoUid: string | undefined;
   windowMinutes: number;
+  // A reported row is back to normal only after this long without firing. A
+  // row that flickers stays one problem instead of a recovery every hour.
+  recoverAfterMinutes: number;
   attentionFloor: number; // fresh or worse event rows below this count are "quiet" on the card, not "to look at"
   sources: Sources;
   noiseFile: string;
@@ -219,6 +222,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     lokiUid: opt(env.LOKI_DATASOURCE_UID),
     tempoUid: opt(env.TEMPO_DATASOURCE_UID),
     windowMinutes: num(env.PATROL_WINDOW_MINUTES, 15, 'PATROL_WINDOW_MINUTES'),
+    recoverAfterMinutes: num(env.PATROL_RECOVER_AFTER_MINUTES, 60, 'PATROL_RECOVER_AFTER_MINUTES'),
     attentionFloor: num(env.PATROL_ATTENTION_FLOOR, DEFAULT_FLOOR, 'PATROL_ATTENTION_FLOOR'),
     sources: loadSources(r(env.SRE_SOURCES_FILE ?? 'config/sources.yaml')),
     noiseFile: r(env.SRE_NOISE_FILE ?? 'config/noise.yaml'),

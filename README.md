@@ -108,6 +108,8 @@ Every post goes through an outbox in the engine's SQLite file (`slack_outbox`):
 - **One sender per database, with a renewable lease.** Overlapping patrols cannot flush the same entries concurrently; an abandoned lease expires after a minute. The channel's rate limit is shared across flushes.
 - **Posting off means no delivery**, including messages left queued by an earlier patrol.
 - **Recovery requires healthy observers.** A missing or failed source leaves its issues unresolved; recovery is recorded once when the source returns, including after a restart. Suppressing a signal does not resolve it.
+- **Back to normal means an hour without firing** (`PATROL_RECOVER_AFTER_MINUTES`, default 60). A row that flickers (on for a patrol, off for one or two) stays one problem, and its issue stays open. A stalled rollout is back when it completes.
+- **One post, one recovery note.** A row gets a "✅ Back to normal" only when a post about it is still unanswered. A row that comes back without a post (a known row, a minor report) goes back quietly.
 
 Delivery is at least once: if Slack accepts a message but its response is lost, a retry may duplicate it. The outbox prevents overlapping senders from duplicating a post; it cannot make the remote send and the local receipt one transaction.
 
@@ -144,7 +146,7 @@ What a report posts:
 | critical or major, with no issue record (it is off, or failed) | a message | a message | yes |
 | minor or noise | not posted, as before; a linked one's rows still join the issue | nothing | no |
 
-The rows of a linked report join the issue. Urgent rows that all belong to one open issue are posted in its thread, still shown in the channel. When every row of an open issue is back to normal (healthy observers required, as for any recovery), the issue is resolved and its thread gets one "✅ Back to normal · I-7f3a resolved" note; its rows get no recovery note of their own, also while some of them still fire.
+The rows of a linked report join the issue. Urgent rows that all belong to one open issue are posted in its thread, still shown in the channel. When every row of an open issue is back to normal (healthy observers and an hour without firing, as for any recovery), the issue is resolved and its thread gets one "✅ Back to normal · I-7f3a resolved" note; its rows get no recovery note of their own, also while some of them still fire.
 
 Patrol logs say what each report did (`report 1 linked to I-7f3a (no broadcast)`, `I-7f3a resolved: all 3 row(s) back to normal`); `get_run` on a monitor run shows each report with its issue. Runs from before `answer.md` was written show their reports from `output.json`. Slack delivery shows as unknown: a run isn't linked to its posts yet. A linked repeat still costs an AI run: this changes what is posted, not what triggers a run. The buttons below do cut runs.
 

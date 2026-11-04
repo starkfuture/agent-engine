@@ -283,7 +283,8 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
 // ---- recovered ------------------------------------------------------------------
 // A short reply in the thread where the rows were posted. Row keys are
 // section|service|subject|status; the subject may itself contain '|'. With an
-// issue id: every row of that issue is back, and the issue is resolved.
+// issue id: every row of that issue is back, and the issue is resolved. quiet:
+// how long the rows went without firing before they counted as back.
 const rowName = (k: string) => {
   const parts = k.split('|');
   const [section, service] = parts;
@@ -292,10 +293,12 @@ const rowName = (k: string) => {
   return `${service} · ${shortSubject({ section: section as FlaggedRow['section'], subject })}${status ? ` ${status}` : ''}`;
 };
 
-export function recoveredCard(keys: string[], at: string, issue?: string): Card {
+export function recoveredCard(keys: string[], at: string, issue?: string, quiet?: number): Card {
   // A stalled rollout back to normal is a rollout that completed.
   const lines = keys.map((k) => (/^rollout\|[^|]+\|stalled\|/.test(k) ? `${k.split('|')[1]} · rollout complete` : rowName(k)));
-  const head = `✅ Back to normal at ${minute(at).slice(11)}${issue ? ` · ${issue} resolved` : ''}`;
+  const stallsOnly = keys.every((k) => /^rollout\|[^|]+\|stalled\|/.test(k));
+  const calm = quiet && !stallsOnly ? ` · quiet for ${quiet % 60 ? `${quiet} min` : `${quiet / 60} h`}` : '';
+  const head = `✅ Back to normal at ${minute(at).slice(11)}${calm}${issue ? ` · ${issue} resolved` : ''}`;
   const text = `${head}: ${lines.length === 1 ? lines[0] : `${lines.length} signals`}`;
   const blocks = [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(redact(`${head}\n${lines.map((l) => `• ${l}`).join('\n')}`)), 2900) }] }];
   return { text: esc(redact(text)), blocks, markdown: `**${head}**\n${lines.map((l) => `- ${l}`).join('\n')}` };

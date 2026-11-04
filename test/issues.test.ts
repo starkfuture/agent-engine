@@ -144,8 +144,8 @@ function webhook(): Transport & { sent: Sent[] } {
 }
 
 // A patrol world with one engine.db for the issues and the outbox, as in production.
-function setup(transport: Transport, decide: Decide, o: { issues?: boolean; oncall?: string | undefined; judge?: Judge; buttons?: boolean } = {}) {
-  const c: Config = { ...testConfig(), slackOncall: o.oncall };
+function setup(transport: Transport, decide: Decide, o: { issues?: boolean; oncall?: string | undefined; judge?: Judge; buttons?: boolean; recoverAfterMinutes?: number } = {}) {
+  const c: Config = { ...testConfig(), slackOncall: o.oncall, ...(o.recoverAfterMinutes ? { recoverAfterMinutes: o.recoverAfterMinutes } : {}) };
   const db = join(c.runsDir, 'engine.db');
   const clock = { now: new Date(T0) };
   const box = new SlackOutbox(db, transport, { now: () => clock.now, sleep: async () => {}, gapMs: 0 });
@@ -259,7 +259,7 @@ test('linking to a resolved issue reopens it and is broadcast', async () => {
   assert.deepEqual(w.issues!.events(id).map((e) => e.type), ['opened', 'resolved', 'reopened', 'report_linked']);
   assert.deepEqual(t.sent, [
     { text: '🟠 Major: Sign-in rejects emails with a trailing space' },
-    { text: `✅ Back to normal at 08:15Z · ${id} resolved: backend-production · /v1/auth/login 400`, thread_ts: '1700000000.000001', reply_broadcast: false },
+    { text: `✅ Back to normal at 08:15Z · quiet for 15 min · ${id} resolved: backend-production · /v1/auth/login 400`, thread_ts: '1700000000.000001', reply_broadcast: false },
     { text: `🟠 Update on ${id}: Sign-in rejects emails with a trailing space`, thread_ts: '1700000000.000001', reply_broadcast: true },
   ]);
   assert.ok(w.logs.includes(`report 1 reopened ${id}: it came back (broadcast)`));
@@ -306,10 +306,43 @@ test('an issue resolves when every row is back, with one recovery note in its th
   const all = await w.patrol(tel, 0.5);
   assert.deepEqual(all.resolved, [id]);
   assert.equal(t.sent.filter((s) => s.text.includes('Back to normal')).length, 1);
-  assert.deepEqual(t.sent[1], { text: `✅ Back to normal at 08:30Z · ${id} resolved: 2 signals`, thread_ts: '1700000000.000001', reply_broadcast: false });
+  assert.deepEqual(t.sent[1], { text: `✅ Back to normal at 08:30Z · quiet for 15 min · ${id} resolved: 2 signals`, thread_ts: '1700000000.000001', reply_broadcast: false });
   assert.equal(w.issues!.get(id)!.resolved_at, '2026-11-02T08:30:00.000Z');
   await w.patrol(tel, 0.75);
   assert.equal(t.sent.length, 2, 'resolved once');
+});
+
+test('a row that flickers keeps its issue open: back to normal after an hour without firing, in one note', async () => {
+  // On for a patrol, off for one or two, on again: the 401 bursts of 11-03.
+  const login = (t: number) => between(0, 0.25)(t) || between(0.5, 0.75)(t) || between(1.25, 1.5)(t);
+  const tel = schedule({ '/v1/auth/login': login });
+  const t = bot();
+  const w = setup(t, linker(), { recoverAfterMinutes: 60 });
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  const resolvedAt: number[] = [];
+  for (const h of [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75]) if ((await w.patrol(tel, h)).resolved.length) resolvedAt.push(h);
+  assert.deepEqual(resolvedAt, [2.25], 'resolved once, an hour after the last burst');
+  assert.equal(w.issues!.get(id)!.status, 'resolved');
+  assert.deepEqual(w.issues!.events(id).map((e) => e.type), ['opened', 'resolved']);
+  assert.deepEqual(t.sent, [
+    { text: '🟠 Major: Sign-in rejects emails with a trailing space' },
+    { text: `✅ Back to normal at 10:15Z · quiet for 1 h · ${id} resolved: backend-production · /v1/auth/login 400`, thread_ts: '1700000000.000001', reply_broadcast: false },
+  ]);
+});
+
+test('a row of a resolved issue that comes back unposted goes back quietly: no note for a return nobody was told about', async () => {
+  const login = (t: number) => between(0, 0.25)(t) || between(1, 1.25)(t) || between(2, 2.25)(t);
+  const tel = schedule({ '/v1/auth/login': login });
+  const t = bot();
+  const w = setup(t, linker());
+  const first = await w.patrol(tel, 0);
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  assert.deepEqual((await w.patrol(tel, 0.25)).resolved, [id]);
+  for (const h of [1, 1.25, 2, 2.25]) await w.patrol(tel, h);
+  assert.equal(w.session.seen.length, 1, 'the returns are known rows: no run, no post');
+  assert.equal(w.issues!.get(id)!.status, 'resolved');
+  assert.deepEqual(t.sent.map((s) => s.text), ['🟠 Major: Sign-in rejects emails with a trailing space', `✅ Back to normal at 08:15Z · quiet for 15 min · ${id} resolved: backend-production · /v1/auth/login 400`]);
 });
 
 test('a row hidden by a noise rule still fires: its issue stays open until it stops', async () => {
