@@ -111,6 +111,7 @@ const major: Script = async function* (sim) {
     started_at: '2026-09-29T12:00:00Z',
     what_broke: 'POST /v1/auth/login returns 400',
     impact: '2% of sign-ins',
+    reach: 'many',
     cause: { hypothesis: 'a validation change', confidence: 'medium' },
     evidence: [{ id, quote, claim: 'the route returns 400' }],
     suggested_fix: 'roll it back',
