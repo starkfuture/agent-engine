@@ -12,6 +12,10 @@ export const ReportShape = {
   started_at: z.string().describe('ISO time of the first bad event you found, or "unknown".'),
   what_broke: z.string().min(10).max(700).describe('Observable symptom: endpoint/flow, status codes, error text (redacted).'),
   impact: z.string().min(5).max(700).describe('Who is affected and how many, from evidence. Say "unknown" if you could not measure it.'),
+  reach: z
+    .enum(['many', 'few', 'one', 'unknown'])
+    .optional()
+    .describe('Distinct users, clients or records the evidence shows affected: many (5 or more), few (2-4), one (one client, customer, id or bot, however many requests), unknown. Count user ids, VINs, order ids, IPs or user agents in logs or traces. Critical and major need "many".'),
   cause: z.object({
     hypothesis: z.string().min(5).max(900),
     confidence: z.enum(['high', 'medium', 'low']),
@@ -50,5 +54,8 @@ export function checkReport(r: Report, knownRows: Set<string>, issues: ReadonlyS
   if (r.issue !== 'new' && !issues.has(r.issue)) problems.push(`issue ${r.issue} is not in the issue list; use an id from the list, or "new"`);
   if (r.noise_rule && r.severity !== 'noise') problems.push('noise_rule is only allowed with severity "noise"');
   if (r.severity === 'critical' && /^unknown$/i.test(r.impact.trim())) problems.push('critical needs measured impact; use major if impact is unknown');
+  // Only a problem that reaches many is news: one client retrying is not, however loud.
+  if ((r.severity === 'critical' || r.severity === 'major') && r.reach !== 'many')
+    problems.push(`${r.severity} needs reach "many": evidence of 5 or more distinct users, clients or records affected. Count them, or rate it minor (reach ${r.reach ?? 'not set'})`);
   return problems;
 }

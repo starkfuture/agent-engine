@@ -24,7 +24,7 @@ function row(section: Section, service: string, subject: string, now: number, o:
     ...rest,
   };
 }
-const summary = (send: FlaggedRow[], over: Partial<Summary> = {}): Summary => ({ at: AT, windowMinutes: 15, send, known: [], suppressed: [], recovered: [], deploys: { at: AT, hours: 6, deploys: [], statefulsets: [], notes: [] }, sources: [], ...over });
+const summary = (send: FlaggedRow[], over: Partial<Summary> = {}): Summary => ({ at: AT, windowMinutes: 15, send, known: [], waiting: [], suppressed: [], recovered: [], deploys: { at: AT, hours: 6, deploys: [], statefulsets: [], notes: [] }, sources: [], ...over });
 
 // What Slack parses: the notification text and every mrkdwn string.
 const slackText = (c: Card) => [c.text, ...(JSON.stringify(c.blocks).match(/"type":"mrkdwn","text":"(?:[^"\\]|\\.)*"/g) ?? [])].join('\n');

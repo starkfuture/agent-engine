@@ -5,7 +5,7 @@ import { TEMPO_MAX_MINUTES, type LogLine, type Telemetry } from '../clients/tele
 import type { Evidence } from '../engine/evidence.js';
 import type { ToolFactory } from '../engine/run.js';
 import { deployLines, deploysHeading, listDeploys } from '../patrol/deploys.js';
-import { fence, redact, templateOf, truncate } from '../engine/text.js';
+import { fence, identitiesOf, redact, templateOf, truncate } from '../engine/text.js';
 
 const H = 3600_000;
 
@@ -138,7 +138,7 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
     ),
     tool(
       'log_search',
-      'Search logs (Loki), grouped into templates with counts and two redacted samples each. Narrow with service and contains.',
+      'Search logs (Loki), grouped into templates with counts, how many distinct users, customers, orders, VINs, clients or IPs each template mentions (counts only), and two redacted samples each. Narrow with service and contains.',
       {
         service: z.string().optional(),
         contains: z.string().max(200).optional().describe('Literal substring filter'),
@@ -155,23 +155,33 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
         if (contains) sel += ` |= ${q(contains)}`;
         const end = new Date(at.getTime() - end_minutes_ago * 60_000);
         const lines = await tel.lokiRange(sel, new Date(end.getTime() - minutes * 60_000), end, limit);
-        const groups = new Map<string, { n: number; first: string; last: string; samples: string[] }>();
+        // Reach: the distinct identities each template mentions, counted before
+        // the samples are cut and redacted. Only the counts are shown.
+        const groups = new Map<string, { n: number; first: string; last: string; samples: string[]; ids: Map<string, Set<string>> }>();
         for (const l of lines) {
           const svc = l.labels[L.service_label] ?? '?';
           const k = `${svc} ${templateOf(l.line)}`;
           const ts = new Date(Number(BigInt(l.tsNs) / 1_000_000n)).toISOString();
-          const g = groups.get(k) ?? { n: 0, first: ts, last: ts, samples: [] };
+          const g = groups.get(k) ?? { n: 0, first: ts, last: ts, samples: [], ids: new Map<string, Set<string>>() };
           g.n++;
           if (ts < g.first) g.first = ts;
           if (ts > g.last) g.last = ts;
           if (g.samples.length < 2) g.samples.push(truncate(l.line, 500));
+          for (const id of identitiesOf(l.line)) {
+            const kind = id.slice(0, id.indexOf('='));
+            const seen = g.ids.get(kind) ?? new Set<string>();
+            if (seen.size < 1000) seen.add(id);
+            g.ids.set(kind, seen);
+          }
           groups.set(k, g);
         }
         const hit = lines.length >= limit;
         const out = [`query: ${sel}`, `window: ${minutes} min ending ${end.toISOString()}; ${lines.length} lines${hit ? ' (limit hit: counts are lower bounds)' : ''}`];
         if (hit) out.push(...(await limitCut(tel, sel, lines, end, minutes, !service && !contains && !errors_only)));
-        for (const [k, g] of [...groups.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 25))
-          out.push('', `${g.n}× ${k}`, `   first ${g.first} last ${g.last}`, ...g.samples.map((s) => `   sample: ${s}`));
+        for (const [k, g] of [...groups.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 25)) {
+          const ids = [...g.ids.entries()].sort((a, b) => b[1].size - a[1].size).map(([kind, v]) => `${v.size}${v.size >= 1000 ? '+' : ''} ${kind}`);
+          out.push('', `${g.n}× ${k}`, `   first ${g.first} last ${g.last}`, ...(ids.length ? [`   distinct: ${ids.join(', ')}`] : []), ...g.samples.map((s) => `   sample: ${s}`));
+        }
         return out.join('\n');
       }),
     ),

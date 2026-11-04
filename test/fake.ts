@@ -65,6 +65,8 @@ export const testConfig = (): Config => ({
   tempoUid: undefined,
   windowMinutes: 15,
   recoverAfterMinutes: 15, // one patrol, as before the hold; the hold has its own tests
+  confirmPatrols: 1, // news at once, as before; waiting for a second patrol has its own tests
+  urgentClientErrors: true, // the test worlds' jumps are 400s: urgent, as before; the 4xx rule has its own tests
   attentionFloor: 10,
   sources: {
     http_families: [
