@@ -61,6 +61,7 @@ export const testConfig = (): Config => ({
   lokiUid: undefined,
   tempoUid: undefined,
   windowMinutes: 15,
+  recoverAfterMinutes: 15, // one patrol, as before the hold; the hold has its own tests
   attentionFloor: 10,
   sources: {
     http_families: [

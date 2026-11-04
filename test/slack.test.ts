@@ -106,6 +106,23 @@ test('recoveries reply only where the problem was posted, grouped per thread', a
   assert.equal(bot.sent[1]!.reply_broadcast, false);
 });
 
+test('one post, one recovery note: a row noted back gets no other until it is posted again', async () => {
+  const bot = fakeBot();
+  const { box, c } = outbox(bot);
+  const k = 'http|backend-production|/v2/vehicles/:vin/rides|401';
+  box.enqueue({ kind: 'rows', keys: [k], broadcast: true, message: msg('urgent') });
+  await box.flush();
+  c.advance(60);
+  box.enqueue({ kind: 'recovered', keys: box.groupByThread([k])[0]!, broadcast: false, message: msg('back') });
+  await box.flush();
+  c.advance(60);
+  assert.deepEqual(box.groupByThread([k]), [], 'it fired again without a post: nothing to answer');
+  box.enqueue({ kind: 'rows', keys: [k], broadcast: true, message: msg('urgent again') });
+  await box.flush();
+  c.advance(60);
+  assert.deepEqual(box.groupByThread([k]), [[k]], 'posted again: one note owed');
+});
+
 test('the webhook cannot thread: every post is top-level, as before', async () => {
   const sent: string[] = [];
   const box = new SlackOutbox(':memory:', { threads: false, post: async (m) => void sent.push(m.text) }, { sleep: async () => {}, gapMs: 0 });

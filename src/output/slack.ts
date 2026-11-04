@@ -197,6 +197,10 @@ export class SlackOutbox {
     // When the issue's first message last showed its buttons.
     const threadCols = new Set((this.db.prepare(`PRAGMA table_info(slack_issue_threads)`).all() as Array<{ name: string }>).map((c) => c.name));
     if (!threadCols.has('controls_at')) this.db.exec(`ALTER TABLE slack_issue_threads ADD COLUMN controls_at TEXT`);
+    // When a row's recovery note was last posted. A row owes one only after a
+    // later post about it: a row that came back without a post goes back quietly too.
+    const rowCols = new Set((this.db.prepare(`PRAGMA table_info(slack_threads)`).all() as Array<{ name: string }>).map((c) => c.name));
+    if (!rowCols.has('recovered_at')) this.db.exec(`ALTER TABLE slack_threads ADD COLUMN recovered_at TEXT`);
     this.o = {
       threadHours: 24,
       freshMinutes: 30,
@@ -300,12 +304,13 @@ export class SlackOutbox {
   }
 
   // Of these rows, the ones with an open thread, grouped by thread: recoveries
-  // only make sense as a reply where the problem was posted.
+  // only make sense as a reply where the problem was posted. One post, one
+  // recovery note at most: a row already noted back isn't again until posted again.
   groupByThread(keys: string[]): string[][] {
     if (!this.transport.threads || !keys.length) return [];
     const since = new Date(this.o.now().getTime() - this.o.threadHours * H).toISOString();
     const rows = this.db
-      .prepare(`SELECT key, ts FROM slack_threads WHERE key IN (${keys.map(() => '?').join(',')}) AND last_at >= ?`)
+      .prepare(`SELECT key, ts FROM slack_threads WHERE key IN (${keys.map(() => '?').join(',')}) AND last_at >= ? AND (recovered_at IS NULL OR recovered_at < last_at)`)
       .all(...keys, since) as Array<{ key: string; ts: string }>;
     const by = new Map<string, string[]>();
     for (const r of rows) by.set(r.ts, [...(by.get(r.ts) ?? []), r.key]);
@@ -466,6 +471,10 @@ export class SlackOutbox {
       // Its first message was not this one (the rows card it started under,
       // or one posted before the buttons): show them there, once.
       else if (this.o.controls && this.issueThread(p.issue)?.controls_at === null && !this.db.prepare(`SELECT 1 FROM slack_outbox WHERE kind = 'root' AND issue = ?`).get(p.issue)) this.updateRoot(p.issue);
+    }
+    if (root && p.kind === 'recovered') {
+      const noted = this.db.prepare(`UPDATE slack_threads SET recovered_at = ? WHERE key = ?`);
+      for (const k of keys) noted.run(at, k);
     }
     if (root && p.kind !== 'recovered') {
       const up = this.db.prepare(

@@ -93,7 +93,7 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
   }
 
   const healthy = new Set(sources.filter(s => s.ok).map(s => s.source));
-  const recovered = state.recovered(flagged, at, w, (key, owners) => {
+  const recovered = state.recovered(flagged, at, w, cfg.recoverAfterMinutes, (key, owners) => {
     if (owners?.length) return { sources: owners, ok: owners.every(source => healthy.has(source)) };
     // Conservative migration for state saved before collector ownership was
     // recorded: all configured collectors for this section must be healthy.

@@ -237,8 +237,10 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   const finish = async () => {
     state.save();
     // An issue is resolved once every row of it is back to normal (which needs
-    // healthy observers), with one recovery note in its thread. Its rows get no
-    // recovery note of their own, also while some of them still fire.
+    // healthy observers and recoverAfterMinutes without firing), with one
+    // recovery note in its thread. Its rows get no recovery note of their own,
+    // also while some of them still fire. A row of no open issue gets one only
+    // if a post about it is still unanswered (groupByThread).
     let loose = summary.recovered;
     const issues = o.issues;
     if (issues) {
@@ -254,12 +256,12 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
         if (!record(`resolving ${i.id}`, () => (issues.resolve(i.id, at), true), false)) continue;
         result.resolved.push(i.id);
         log(`${i.id} resolved: all ${i.rows.length} row(s) back to normal`);
-        emit(recoveredCard(i.rows, summary.at, i.id), `${stamp(summary.at)}-resolved-${i.id}`, sink.outbox?.threads ? { kind: 'recovered', keys: i.rows, broadcast: false, issue: i.id } : undefined);
+        emit(recoveredCard(i.rows, summary.at, i.id, cfg.recoverAfterMinutes), `${stamp(summary.at)}-resolved-${i.id}`, sink.outbox?.threads ? { kind: 'recovered', keys: i.rows, broadcast: false, issue: i.id } : undefined);
         if (o.post) sink.outbox?.updateRoot(i.id); // its message says resolved, without buttons
       }
     }
     if (o.post && sink.outbox?.threads && loose.length)
-      for (const keys of sink.outbox.groupByThread(loose)) sink.emit(recoveredCard(keys, summary.at), `${stamp(summary.at)}-recovered-${keys.length}`, { kind: 'recovered', keys, broadcast: false });
+      for (const keys of sink.outbox.groupByThread(loose)) sink.emit(recoveredCard(keys, summary.at, undefined, cfg.recoverAfterMinutes), `${stamp(summary.at)}-recovered-${keys.length}`, { kind: 'recovered', keys, broadcast: false });
     await flush();
     return result;
   };

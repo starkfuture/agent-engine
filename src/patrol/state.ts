@@ -148,7 +148,9 @@ export class State {
   // Missing observations leave an issue open, even across several patrols or
   // a restart. Only a successful observation can resolve it, once. Older state
   // has no source/lifecycle markers: consider only the previous patrol's rows.
-  recovered(flaggedKeys: Set<string>, at: Date, windowMin: number, observe: (key: string, sources: string[] | undefined) => { sources: string[]; ok: boolean }): string[] {
+  // A row is back only once it has not fired for holdMin: one that flickers
+  // stays one problem. A stalled rollout is back when it completes: it doesn't flicker.
+  recovered(flaggedKeys: Set<string>, at: Date, windowMin: number, holdMin: number, observe: (key: string, sources: string[] | undefined) => { sources: string[]; ok: boolean }): string[] {
     const cutoff = at.getTime() - 1.5 * windowMin * 60_000;
     const recovered: string[] = [];
     for (const [key, m] of Object.entries(this.data.rows)) {
@@ -159,6 +161,7 @@ export class State {
       // even when its observers are down, so it can resolve after they return.
       m.sources = observation.sources;
       if (!observation.ok) continue;
+      if (at.getTime() - Date.parse(m.lastSeen) < holdMin * 60_000 && !key.startsWith('rollout|')) continue;
       m.recoveredAt = m.lastRecoveredAt = at.toISOString();
       // Work still owed ends with its episode. If the row fires again, that is a
       // new one (see seen()): owed at its reminder or when worse, with fresh attempts.
