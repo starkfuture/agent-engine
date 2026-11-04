@@ -25,6 +25,9 @@ export class FakeTelemetry implements Telemetry {
   async lokiRange(): Promise<LogLine[]> {
     return [];
   }
+  async lokiMetric(): Promise<Series[]> {
+    return [];
+  }
   async tempoSearch(): Promise<TraceHit[]> {
     return [];
   }

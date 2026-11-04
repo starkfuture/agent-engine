@@ -1,7 +1,7 @@
 import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Config, HttpFamily } from '../config.js';
-import { TEMPO_MAX_MINUTES, type Telemetry } from '../clients/telemetry.js';
+import { TEMPO_MAX_MINUTES, type LogLine, type Telemetry } from '../clients/telemetry.js';
 import type { Evidence } from '../engine/evidence.js';
 import type { ToolFactory } from '../engine/run.js';
 import { deployLines, deploysHeading, listDeploys } from '../patrol/deploys.js';
@@ -31,6 +31,41 @@ function familiesFor(cfg: Config, service: string): Array<{ f: HttpFamily; sel: 
 }
 
 const hhmm = (sec: number) => new Date(sec * 1000).toISOString().slice(5, 16).replace('T', ' ');
+
+// Loki returns the newest `limit` lines, so a search at its limit reaches back
+// only to its oldest line: where the limit cut the window, not when the problem
+// started (run 20261103T124535Z-monitor-dcb74b reported that cut as the start).
+// Per-10-minute counts of the same selector, which no line limit cuts, give
+// the real timeline. Loki (and Grafana) move a metric query's points onto
+// multiples of its step, so the buckets are asked for on those multiples: the
+// times shown are the times counted, and a bucket with no point is 0. An
+// unfiltered selector over a long window would count every line of the
+// namespace, so those counts are skipped.
+const UNFILTERED_MAX_MIN = 60;
+async function limitCut(tel: Telemetry, sel: string, lines: LogLine[], end: Date, minutes: number, unfiltered: boolean): Promise<string[]> {
+  const oldest = lines.reduce((m, l) => (BigInt(l.tsNs) < m ? BigInt(l.tsNs) : m), BigInt(lines[0]!.tsNs));
+  const out = [`limit hit: the limit cut the window at ${new Date(Number(oldest / 1_000_000n)).toISOString()}, the oldest line returned. That is where this search stopped reading, not when the problem started: older lines in the window were not read.`];
+  const step = minutes >= 10 ? 10 : 1;
+  if (unfiltered && minutes > UNFILTERED_MAX_MIN) {
+    out.push(`per-${step}-minute counts skipped: an unfiltered search over more than ${UNFILTERED_MAX_MIN} min would count every line; narrow it (service, contains, errors_only) or shorten the window.`);
+    return out;
+  }
+  const s = step * 60;
+  const endSec = Math.floor(end.getTime() / 1000);
+  const first = Math.floor((endSec - minutes * 60) / s) * s + s; // the first bucket end inside the window
+  const last = Math.floor(endSec / s) * s; // never past the window's end
+  try {
+    const series = await tel.lokiMetric(`sum(count_over_time(${sel.trim()} [${step}m]))`, new Date(first * 1000), new Date(last * 1000), s);
+    const byTime = new Map<number, number>();
+    for (let t = first; t <= last; t += s) byTime.set(t, 0);
+    for (const x of series) for (const [t, v] of x.points) byTime.set(Math.round(t), (byTime.get(Math.round(t)) ?? 0) + v);
+    const buckets = [...byTime].sort((a, b) => a[0] - b[0]);
+    out.push(`per ${step} min (matching lines in the ${step} min up to each time): ${buckets.map(([t, v]) => `${hhmm(t)}=${Math.round(v)}`).join(' ')}`);
+  } catch (e) {
+    out.push(`per-${step}-minute counts not available (${(e as Error).message})`);
+  }
+  return out;
+}
 
 // Read-only telemetry tools, anchored at `at` (the patrol time) so a replay of
 // 29 Sep investigates 29 Sep, not today. Every result is redacted, fenced and
@@ -140,7 +175,9 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
           }
           groups.set(k, g);
         }
-        const out = [`query: ${sel}`, `window: ${minutes} min ending ${end.toISOString()}; ${lines.length} lines${lines.length >= limit ? ' (limit hit: counts are lower bounds)' : ''}`];
+        const hit = lines.length >= limit;
+        const out = [`query: ${sel}`, `window: ${minutes} min ending ${end.toISOString()}; ${lines.length} lines${hit ? ' (limit hit: counts are lower bounds)' : ''}`];
+        if (hit) out.push(...(await limitCut(tel, sel, lines, end, minutes, !service && !contains && !errors_only)));
         for (const [k, g] of [...groups.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 25)) {
           const ids = [...g.ids.entries()].sort((a, b) => b[1].size - a[1].size).map(([kind, v]) => `${v.size}${v.size >= 1000 ? '+' : ''} ${kind}`);
           out.push('', `${g.n}× ${k}`, `   first ${g.first} last ${g.last}`, ...(ids.length ? [`   distinct: ${ids.join(', ')}`] : []), ...g.samples.map((s) => `   sample: ${s}`));
@@ -208,7 +245,8 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
       guard('trace_search', async ({ traceql, minutes, limit }) => {
         if (!tel.has.tempo) throw new Error('Tempo is not configured in this run');
         const hits = await tel.tempoSearch(traceql, new Date(at.getTime() - minutes * 60_000), at, limit);
-        return [`${hits.length} traces for ${traceql}`, ...hits.map((h) => `${new Date(h.startSec * 1000).toISOString()} ${h.rootService} ${h.rootName} ${h.durationMs}ms trace=${h.traceId}`)].join('\n');
+        const cut = hits.length >= limit ? [`limit hit: Tempo stopped at ${limit} traces and there are more in the window. This is a sample: counts are lower bounds, and the earliest trace listed is not when the problem started. Narrow the query or the window to see more.`] : [];
+        return [`${hits.length} traces for ${traceql}`, ...cut, ...hits.map((h) => `${new Date(h.startSec * 1000).toISOString()} ${h.rootService} ${h.rootName} ${h.durationMs}ms trace=${h.traceId}`)].join('\n');
       }),
     ),
   ];

@@ -1,6 +1,6 @@
 import type { Config } from '../config.js';
 import type { Telemetry } from '../clients/telemetry.js';
-import { collectCounter, collectHttp, collectLogs, collectTraces, collectWorkloads } from './collectors.js';
+import { collectCounter, collectHttp, collectLogs, collectTraces, collectWorkloads, noteOf } from './collectors.js';
 import { afterDeploy, collectArgocd, collectRollouts, deployLines, deploysHeading, listDeploys, notRead, type Deploys } from './deploys.js';
 import type { Noise, NoiseRule } from './noise.js';
 import type { Novelty, State } from './state.js';
@@ -76,7 +76,7 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
   settled.forEach((r, i) => {
     const source = jobs[i]!.source;
     if (r.status === 'fulfilled') {
-      sources.push({ source, ok: true });
+      sources.push({ source, ok: true, ...noteOf(r.value) });
       rows.push(...r.value);
       for (const row of r.value) rowSources.set(row.key, [...new Set([...(rowSources.get(row.key) ?? []), source])]);
     } else sources.push({ source, ok: false, error: String((r.reason as Error)?.message ?? r.reason).slice(0, 300) });
@@ -160,7 +160,8 @@ export function renderSummary(s: Summary, o: { forModel?: boolean } = {}): strin
   if (s.recovered.length) out.push('', `## Recovered since last patrol (${s.recovered.length})`, ...s.recovered.map((k) => `- ${k}`));
   out.push('', `## ${deploysHeading(s.deploys)}`, ...deployLines(s.deploys));
   const down = s.sources.filter((x) => !x.ok);
-  if (down.length) out.push('', '## Blind spots (sources that failed this patrol)', ...down.map((x) => `- ${x.source}: ${x.error}`));
+  const part = s.sources.filter((x) => x.ok && x.note);
+  if (down.length || part.length) out.push('', '## Blind spots (sources that failed this patrol, or were read only in part)', ...down.map((x) => `- ${x.source}: ${x.error}`), ...part.map((x) => `- ${x.source} (read, incomplete): ${x.note}`));
   if (s.suppressed.length) out.push('', `## Dropped as known noise (${s.suppressed.length})`, ...s.suppressed.map(({ row, rule }) => `- ${row.key} (rule ${rule.id})`));
   return out.join('\n');
 }
