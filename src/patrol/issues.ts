@@ -423,16 +423,6 @@ export class Issues {
     return { issues: rows.slice(0, max).map((r) => this.full(r)), more: Math.max(0, rows.length - max) };
   }
 
-  // Of these rows, the ones a resolved issue holds, with when the latest of
-  // them resolved.
-  resolvedAt(keys: string[]): Map<string, string> {
-    if (!keys.length) return new Map();
-    const rows = this.db
-      .prepare(`SELECT r.row_key AS key, MAX(i.resolved_at) AS at FROM issue_rows r JOIN issues i ON i.id = r.issue_id WHERE i.status = 'resolved' AND r.row_key IN (${keys.map(() => '?').join(',')}) GROUP BY r.row_key`)
-      .all(...keys) as Array<{ key: string; at: string }>;
-    return new Map(rows.map((r) => [r.key, r.at]));
-  }
-
   // The one open issue that already holds all these rows, if any.
   holding(keys: string[]): Issue | undefined {
     if (!keys.length) return undefined;

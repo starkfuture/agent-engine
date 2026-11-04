@@ -147,22 +147,21 @@ test('a post still queued for a row is owed its note: Slack down when the row co
   assert.deepEqual(bot.sent.map((s) => s.text), ['urgent', 'back', 'urgent again', 'back again'], 'in order: the note after its post');
 });
 
-test('when a row was last posted: sent, or still queued (Slack down) from when it was queued', async () => {
-  let down = false;
-  const bot = fakeBot(() => (down ? new SlackError('down') : undefined));
-  const { box, c } = outbox(bot);
-  box.enqueue({ kind: 'rows', keys: ['k'], broadcast: true, message: msg('urgent') });
+test('a note that lists a row answers its posts before it: no other note, until it is posted again', async () => {
+  const { box, c } = outbox(fakeBot());
+  box.enqueue({ kind: 'report', keys: ['a', 'b'], broadcast: true, message: msg('issue'), issue: 'I-0001' });
   await box.flush();
-  assert.deepEqual([...box.lastPosted(['k', 'other'])], [['k', '2026-10-31T10:00:00.000Z']]);
   c.advance(60);
-  box.enqueue({ kind: 'recovered', keys: ['k'], broadcast: false, message: msg('back') });
+  box.enqueue({ kind: 'recovered', keys: ['a'], broadcast: false, message: msg('I-0001 resolved'), issue: 'I-0001' });
   await box.flush();
-  assert.deepEqual([...box.lastPosted(['k'])], [['k', '2026-10-31T10:00:00.000Z']], 'a recovery note is not a post about it');
+  // As for posts from before recovered_at was kept: only the outbox knows.
+  (box as unknown as { db: { exec(sql: string): void } }).db.exec(`UPDATE slack_threads SET recovered_at = NULL`);
   c.advance(60);
-  down = true;
-  box.enqueue({ kind: 'rows', keys: ['k'], broadcast: true, message: msg('urgent again') });
+  assert.deepEqual(box.groupByThread(['a', 'b']), [['b']], 'a was answered by the note; b, linked later or never resolved, was not');
+  box.enqueue({ kind: 'rows', keys: ['a'], broadcast: true, message: msg('a again') });
   await box.flush();
-  assert.deepEqual([...box.lastPosted(['k'])], [['k', '2026-10-31T12:00:00.000Z']], 'queued, not sent: counts from when it was queued');
+  c.advance(60);
+  assert.deepEqual(box.groupByThread(['a']), [['a']], 'posted again since the note');
 });
 
 test('the webhook cannot thread: every post is top-level, as before', async () => {

@@ -306,31 +306,20 @@ export class SlackOutbox {
   // Of these rows, the ones with an open thread, grouped by thread: recoveries
   // only make sense as a reply where the problem was posted. One post, one
   // recovery note at most: a row already noted back isn't again until posted
-  // again. A post still queued for it counts: the note goes out after it.
+  // again. A note listing it answers it, also an issue's resolved note and
+  // one sent before recovered_at was kept. A post still queued for it counts:
+  // the note goes out after it.
   groupByThread(keys: string[]): string[][] {
     if (!this.transport.threads || !keys.length) return [];
     const since = new Date(this.o.now().getTime() - this.o.threadHours * H).toISOString();
     const queued = `EXISTS (SELECT 1 FROM slack_outbox o, json_each(o.keys) j WHERE o.status = 'pending' AND o.kind IN ('rows', 'report') AND j.value = slack_threads.key)`;
+    const noted = `EXISTS (SELECT 1 FROM slack_outbox o, json_each(o.keys) j WHERE o.kind = 'recovered' AND o.status IN ('sent', 'pending') AND j.value = slack_threads.key AND o.created_at >= slack_threads.last_at)`;
     const rows = this.db
-      .prepare(`SELECT key, ts FROM slack_threads WHERE key IN (${keys.map(() => '?').join(',')}) AND last_at >= ? AND (recovered_at IS NULL OR recovered_at < last_at OR ${queued})`)
+      .prepare(`SELECT key, ts FROM slack_threads WHERE key IN (${keys.map(() => '?').join(',')}) AND last_at >= ? AND (${queued} OR ((recovered_at IS NULL OR recovered_at < last_at) AND NOT ${noted}))`)
       .all(...keys, since) as Array<{ key: string; ts: string }>;
     const by = new Map<string, string[]>();
     for (const r of rows) by.set(r.ts, [...(by.get(r.ts) ?? []), r.key]);
     return [...by.values()];
-  }
-
-  // When each of these rows was last posted about (not counting recovery
-  // notes). A post still queued for it counts from when it was queued.
-  lastPosted(keys: string[]): Map<string, string> {
-    if (!keys.length) return new Map();
-    const marks = keys.map(() => '?').join(',');
-    const sent = this.db.prepare(`SELECT key, last_at AS at FROM slack_threads WHERE key IN (${marks})`).all(...keys) as Array<{ key: string; at: string }>;
-    const queued = this.db
-      .prepare(`SELECT j.value AS key, MAX(o.created_at) AS at FROM slack_outbox o, json_each(o.keys) j WHERE o.status = 'pending' AND o.kind IN ('rows', 'report') AND j.value IN (${marks}) GROUP BY j.value`)
-      .all(...keys) as Array<{ key: string; at: string }>;
-    const out = new Map<string, string>();
-    for (const r of [...sent, ...queued]) if (r.at > (out.get(r.key) ?? '')) out.set(r.key, r.at);
-    return out;
   }
 
   // Send what is pending, oldest first. Never throws: Slack being down must not

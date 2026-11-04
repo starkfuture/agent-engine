@@ -345,7 +345,7 @@ test('a row of a resolved issue that comes back unposted goes back quietly: no n
   assert.deepEqual(t.sent.map((s) => s.text), ['🟠 Major: Sign-in rejects emails with a trailing space', `✅ Back to normal at 08:15Z · quiet for 15 min · ${id} resolved: backend-production · /v1/auth/login 400`]);
 });
 
-test('a row of a resolved issue never gets a note of its own, also one posted before notes were recorded', async () => {
+test('a row of a resolved issue gets no note of its own: the issue\'s note answered it, also one sent before notes were recorded', async () => {
   const login = (t: number) => between(0, 0.25)(t) || between(1, 1.25)(t);
   const tel = schedule({ '/v1/auth/login': login });
   const t = bot();
