@@ -14,6 +14,15 @@ export interface RowMemory {
   recoveredAt?: string;
   lastRecoveredAt?: string; // the last confirmed recovery; kept when the row fires again
   investigation?: Investigation; // absent in state files from before it was kept
+  // News (fresh or worse) in patrols in a row, not sent yet: the first and the
+  // latest. A blip of one patrol gets no AI run (see seen()).
+  streak?: { since: string; last: string };
+}
+
+// How long news must hold before the investigator sees it.
+export interface Confirm {
+  windowMin: number;
+  patrols: number; // 1: at once, as before
 }
 
 // Whether the investigator still owes this row an answer. Pending until a
@@ -82,13 +91,31 @@ export class State {
     return 'known';
   }
 
-  seen(r: Row, at: Date, sources: string[]): void {
+  // Records a sighting. With `confirm`, news (fresh or worse) must hold for
+  // confirm.patrols patrols in a row: until then it is held (returns true),
+  // and owes the investigator nothing yet. A patrol in which it wasn't news
+  // starts the count over.
+  seen(r: Row, at: Date, sources: string[], confirm?: Confirm): boolean {
     const iso = at.toISOString();
     const novelty = this.novelty(r, at);
     const m = this.data.rows[r.key];
     if (!m || at.getTime() - Date.parse(m.lastSeen) > DEFAULT_NOVELTY.forgetAfterHours * H) this.data.rows[r.key] = { firstSeen: iso, lastSeen: iso, investigation: { status: 'pending', attempts: 0 } };
     else m.lastSeen = iso;
     const current = this.data.rows[r.key]!;
+    current.sources = sources;
+    current.lastFiredAt = iso;
+    delete current.recoveredAt;
+    let held = false;
+    if (novelty === 'fresh' || novelty === 'worse') {
+      const s = current.streak;
+      if (!s || !confirm || at.getTime() - Date.parse(s.last) > 1.5 * confirm.windowMin * 60_000) current.streak = { since: iso, last: iso };
+      else s.last = iso;
+      held = !!confirm && at.getTime() - Date.parse(current.streak!.since) < (confirm.patrols - 1) * confirm.windowMin * 60_000;
+    }
+    // A patrol that isn't news doesn't touch the count: the next news after it
+    // finds a gap and starts over. So a sighting of the same key that isn't
+    // news (a same-named workload in another namespace) can't reset it.
+    if (held) return true;
     // New work: a worse row, or one back after a confirmed recovery since it was
     // last reported (a new episode). The new episode waits for its reminder, as
     // before, so a flickering row isn't investigated every other patrol. A row
@@ -96,9 +123,7 @@ export class State {
     // it gets one investigation at its next reminder too.
     const recurred = !!current.lastRecoveredAt && current.lastRecoveredAt > (current.lastReportedAt ?? '');
     if (novelty === 'worse' || (novelty === 'reminder' && (recurred || !current.investigation)) || (!current.investigation && !current.lastReportedAt)) current.investigation = { status: 'pending', attempts: 0 };
-    current.sources = sources;
-    current.lastFiredAt = iso;
-    delete current.recoveredAt;
+    return false;
   }
 
   reported(r: Row, at: Date): void {
@@ -106,6 +131,7 @@ export class State {
     if (!m) return;
     m.lastReportedAt = at.toISOString();
     m.lastReportedNow = r.counts.now;
+    delete m.streak;
   }
 
   firstSeen(key: string): string | undefined {

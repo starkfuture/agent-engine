@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { Config } from './config.js';
 import type { Telemetry } from './clients/telemetry.js';
 import type { LoadedAgent } from './engine/agent.js';
-import { notRun, verdictOn } from './engine/challenge.js';
+import { finished, notRun, verdictOn } from './engine/challenge.js';
 import { runAgent, type Engine, type RunResult } from './engine/run.js';
 import { monitorTask } from './investigate/prompt.js';
 import { checkReport, Report, ReportShape } from './investigate/report.js';
@@ -17,7 +17,7 @@ import { MUTE_DAYS, RANK, type Disposition, type Issue, type Issues, type Severi
 import type { Noise } from './patrol/noise.js';
 import type { Owners } from './patrol/owners.js';
 import { ATTEMPTS, type State } from './patrol/state.js';
-import { buildSummary, renderSummary, type FlaggedRow, type Summary } from './patrol/summary.js';
+import { buildSummary, renderSummary, urgent, type FlaggedRow, type Summary } from './patrol/summary.js';
 import { redact, safeJson } from './engine/text.js';
 
 export interface PatrolOptions {
@@ -50,17 +50,12 @@ export interface MonitorAgent {
 
 const stamp = (iso: string) => iso.replace(/[:.]/g, '').slice(0, 15) + 'Z';
 
-// Rows the AI must never be able to hide: protected journeys (never_suppress),
-// big jumps and rollout rows (a stalled rollout, an Argo CD app degraded or a
-// failed sync). They are posted at once, with or without the AI.
-export function urgent(r: FlaggedRow, noise: Noise): boolean {
-  return r.section === 'rollout' || noise.protected(r) || (r.counts.now >= 50 && r.counts.now >= 5 * Math.max(1, r.score.expected));
-}
+export { urgent } from './patrol/summary.js';
 
 // Deterministic challenge gate, decided before the run: urgent rows always get
 // the AI's work challenged, whatever severity it gives them.
-export function needsChallenge(rows: FlaggedRow[], noise: Noise): boolean {
-  return rows.some((r) => urgent(r, noise));
+export function needsChallenge(rows: FlaggedRow[], noise: Noise, clientErrors = false): boolean {
+  return rows.some((r) => urgent(r, noise, clientErrors));
 }
 
 // Everything else reaches Slack only as an AI report rated one of these. Minor
@@ -136,7 +131,7 @@ export function shownInChannel(issues: Issues | undefined, r: Report, at: Date, 
   if (o.reached && !o.reached(i.id)) return true; // opened without posting, or its first post failed: this one is its first
   if (d?.kind === 'acknowledged' || o.newsPending?.(i.id)) return false; // On it, or news still queued: no reminder
   const news = o.newsAt?.(i.id) ?? issues.lastNewsAt(i.id);
-  return !!news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000; // the 24 h reminder
+  return o.remind !== false && !!news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000; // the 24 h reminder, when one may go out
 }
 
 // The posting rule. News (a new issue, a higher severity, a recurrence) is a
@@ -183,18 +178,18 @@ function filingNote(f: Filing, r: Report): string {
 // Rows Not an issue can't silence: protected journeys, and new or worse big
 // jumps (urgent). They take the usual path: the rows card in the issue's
 // thread, shown in the channel, and an AI run. The mute itself stays.
-export function breaksMute(r: FlaggedRow, noise: Noise): boolean {
-  return noise.protected(r) || (r.novelty !== 'reminder' && urgent(r, noise));
+export function breaksMute(r: FlaggedRow, noise: Noise, clientErrors = false): boolean {
+  return noise.protected(r) || (r.novelty !== 'reminder' && urgent(r, noise, clientErrors));
 }
 
 // Rows of an issue someone clicked On it or Not an issue on get no AI run.
 // On it: rows that got worse (or came back) get one line by code in its
 // thread, not shown in the channel. Not an issue: nothing, while the mute lasts.
 // Protected journeys are never claimed, nor big jumps under Not an issue.
-export function claimedRows(issues: Issues | undefined, rows: FlaggedRow[], noise: Noise, at: Date): Map<string, Disposition & { issue: string }> {
+export function claimedRows(issues: Issues | undefined, rows: FlaggedRow[], noise: Noise, at: Date, clientErrors = false): Map<string, Disposition & { issue: string }> {
   if (!issues) return new Map();
   const claims = issues.claims(rows.filter((r) => !noise.protected(r)).map((r) => r.key), at);
-  for (const r of rows) if (claims.get(r.key)?.kind === 'dismissed' && breaksMute(r, noise)) claims.delete(r.key);
+  for (const r of rows) if (claims.get(r.key)?.kind === 'dismissed' && breaksMute(r, noise, clientErrors)) claims.delete(r.key);
   return claims;
 }
 
@@ -205,7 +200,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, `${stamp(summary.at)}.md`), redact(renderSummary(summary)) + '\n');
   writeFileSync(join(dir, `${stamp(summary.at)}.json`), safeJson(summary, 1));
-  log(`patrol ${summary.at}: ${summary.send.length} to send, ${summary.known.length} known, ${summary.suppressed.length} noise, ${summary.recovered.length} recovered, sources down: ${summary.sources.filter((s) => !s.ok).map((s) => s.source).join(', ') || 'none'}`);
+  log(`patrol ${summary.at}: ${summary.send.length} to send, ${summary.waiting.length} waiting, ${summary.known.length} known, ${summary.suppressed.length} noise, ${summary.recovered.length} recovered, sources down: ${summary.sources.filter((s) => !s.ok).map((s) => s.source).join(', ') || 'none'}`);
 
   const result: PatrolResult = { summary, cards: [], slack: [], filed: [], resolved: [] };
   // The issue record must never stop a patrol: on a database error the reports
@@ -294,7 +289,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   const owedKnown = summary.known.filter((r) => state.needsInvestigation(r.key));
   // The buttons: rows of an issue someone is on, or said is not an issue, are
   // left out of the AI run and of the rows card (see claimedRows).
-  const claims = record('reading the buttons', () => claimedRows(o.buttons ? o.issues : undefined, [...summary.send, ...owedKnown], noise, at), new Map());
+  const claims = record('reading the buttons', () => claimedRows(o.buttons ? o.issues : undefined, [...summary.send, ...owedKnown], noise, at, cfg.urgentClientErrors), new Map());
   const send = claims.size ? summary.send.filter((r) => !claims.has(r.key)) : summary.send;
   const shown = claims.size ? { ...summary, send } : summary; // for the rows card and the investigator
   const byIssue = new Map<string, FlaggedRow[]>();
@@ -313,7 +308,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   }
 
   // New or worse only: a 6-hour reminder of something already posted isn't news.
-  const urgentRows = send.filter((r) => r.novelty !== 'reminder' && urgent(r, noise));
+  const urgentRows = send.filter((r) => r.novelty !== 'reminder' && urgent(r, noise, cfg.urgentClientErrors));
   // The rows the investigator still owes an answer: new or worse, or left
   // uncovered by an earlier run. A reminder of a row it already explained is
   // not one: it would only be reported again. A row held back by a click isn't
@@ -321,7 +316,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   const pending = [...send, ...owedKnown.filter((r) => !claims.has(r.key))].filter((r) => state.needsInvestigation(r.key));
   // A run only for a row big enough to read (the card's "to look at", sized as
   // if new): small rows on their own don't spend one.
-  const worthALook = pending.some((r) => urgent(r, noise) || bucketOf({ ...r, novelty: 'fresh' }, cfg.attentionFloor, noise.protected(r)) === 'look');
+  const worthALook = pending.some((r) => urgent(r, noise, cfg.urgentClientErrors) || bucketOf({ ...r, novelty: 'fresh' }, cfg.attentionFloor, noise.protected(r)) === 'look');
 
   let skip: string | undefined;
   if (!o.llm) skip = 'LLM disabled for this run';
@@ -367,12 +362,12 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       newsPending: o.post && sink.outbox ? (id) => sink.outbox!.newsPending(id) : undefined,
       reached: o.post && sink.outbox ? (id) => sink.outbox!.reached(id) : undefined,
       clicks: o.buttons,
-      breaksMute: (k) => !!byKey.get(k) && breaksMute(byKey.get(k)!, noise),
+      breaksMute: (k) => !!byKey.get(k) && breaksMute(byKey.get(k)!, noise, cfg.urgentClientErrors),
     };
     // A challenger checks the reports before the channel sees them: always for
     // urgent rows (the gate: rollout rows too), otherwise once a report would
     // be shown there as critical or major. Quiet replies in an issue's thread need none.
-    const gate = needsChallenge(pending, noise);
+    const gate = needsChallenge(pending, noise, cfg.urgentClientErrors);
     const toChannel = (reports: Report[]) => gate || reports.some((r) => record('checking what the channel would see', () => shownInChannel(o.issues, r, at, filing), true));
     log(`investigating ${pending.length} row(s) with ${monitor.agent.spec.model}${gate ? ', then a challenger' : ''}…`);
     // Rows no report covered stay pending for another attempt, then are given
@@ -392,7 +387,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
         agent: monitor.agent,
         trigger: o.trigger ?? 'patrol',
         task: monitorTask([...rowKeys], listed),
-        data: renderSummary(shown),
+        data: renderSummary(shown, { forModel: true }),
         tools: monitorTools(tel, cfg, at),
         output: {
           tool: 'submit_report',
@@ -438,13 +433,18 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     const filed: FileOptions = { ...filing, remind: inv.challenge !== undefined };
     for (const [i, out] of inv.outputs.entries()) {
       // A report the challenger says doesn't hold up becomes minor: kept in the
-      // run and answer.md, not posted, and it opens or raises no issue. A
-      // protected journey is never hidden: it is posted with the objection.
+      // run and answer.md, not posted, and it opens or raises no issue. So does
+      // one the channel would see that the challenger did not agree with: it
+      // said "partly", escalated, or didn't finish. Only a checked finding is
+      // news. A protected journey is never hidden: it is posted with the objection.
       const item = verdictOn(inv.challenge, i + 1);
-      const fails = item?.holds === 'no' && POSTED.has(out.severity);
+      const agreed = !!inv.challenge && finished(inv.challenge) && (item ? item.holds === 'yes' : inv.challenge.verdict === 'upheld');
+      const news = POSTED.has(out.severity) && !agreed && record('checking what the channel would see', () => shownInChannel(o.issues, out, at, filed), true);
+      const fails = POSTED.has(out.severity) && (item?.holds === 'no' || news);
       const kept = fails && out.rows.some((k) => !!byKey.get(k) && noise.protected(byKey.get(k)!));
       const r: Report = fails && !kept ? { ...out, severity: 'minor' } : out;
       if (fails && !kept) held++;
+      const why = item?.holds === 'no' ? 'the second check says it does not hold up' : !inv.challenge || !finished(inv.challenge) ? 'the second check did not finish' : `the second check did not agree (${item?.holds ?? inv.challenge.verdict})`;
       const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId, filed), { action: 'none' }) : { action: 'none' };
       result.filed.push(f);
       const cc = [...new Set([...(cfg.slackOncall && pagesOncall(f, r) ? [cfg.slackOncall] : []), ...ownersOf(r)])];
@@ -461,7 +461,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       if (o.post && (f.action === 'reopened' || (f.action === 'raised' && f.unmuted))) sink.outbox?.updateRoot(f.issue.id);
       if (post) toSlack++;
       if (post?.repeat) quiet++;
-      const note = `${filingNote(f, r)}${!fails ? '' : kept ? '; the second check says it does not hold up, posted anyway: a protected journey' : `; was ${out.severity}, the second check says it does not hold up`}${unchecked ? '; not verified: no second check ran' : ''}`;
+      const note = `${filingNote(f, r)}${!fails ? '' : kept ? `; ${why}, posted anyway: a protected journey` : `; was ${out.severity}, ${why}`}${unchecked ? '; not verified: no second check ran' : ''}`;
       if (o.issues || fails || unchecked) log(`report ${i + 1} ${note}`);
       answer.push(`### Report ${i + 1} · ${note}`, '', card.markdown, '');
     }

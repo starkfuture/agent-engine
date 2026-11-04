@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fence, redact, templateOf } from '../src/engine/text.js';
+import { fence, identitiesOf, redact, templateOf } from '../src/engine/text.js';
+import type { LogLine } from '../src/clients/telemetry.js';
+import { Evidence } from '../src/engine/evidence.js';
+import { monitorTools } from '../src/investigate/tools.js';
+import { FakeTelemetry, testConfig } from './fake.js';
 import { workloadOf } from '../src/patrol/collectors.js';
 import { withMatcher } from '../src/investigate/tools.js';
 
@@ -62,4 +66,41 @@ test('withMatcher handles all selector shapes', () => {
   assert.equal(withMatcher('metric{b="2"}', 'a="1"'), 'metric{b="2",a="1"}');
   assert.equal(withMatcher('{__name__=~"x_.*"}', 'a="1"'), '{__name__=~"x_.*",a="1"}');
   assert.equal(withMatcher('{namespace="microservices"}', 'app="ecom"'), '{namespace="microservices",app="ecom"}');
+});
+
+test('who a line is about: identity fields, key=value in the text and VINs; not request or trace ids', () => {
+  assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'failed', userId: 'u-123', ctx: { vin: 'WSTRK000000001234' }, traceId: 'abc123def456', requestId: 'r-1' })).sort(), ['userid=u-123', 'vin=WSTRK000000001234']);
+  assert.deepEqual(identitiesOf('parent_create_not_found: operation=MODIFY_STATUS orderId=9b2f0c1e-1111-2222-3333-444455556666'), ['orderid=9b2f0c1e-1111-2222-3333-444455556666']);
+  assert.deepEqual(identitiesOf('upload for WSTRK000000001234 rejected'), ['vin=WSTRK000000001234']);
+  assert.deepEqual(identitiesOf('Token revoked or user inactive'), []);
+  // An email-valued field once, not again as a prefix from the text.
+  assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'denied', userId: 'alice@example.test' })), ['userid=alice@example.test']);
+  // Keycloak's plain-text events: the IP counts, a null user doesn't.
+  assert.deepEqual(identitiesOf('type="LOGIN_ERROR", realmId="stark", clientId="storefront", userId="null", ipAddress="203.0.113.7", error="invalid_user_credentials"').sort(), ['clientid=storefront', 'ip=203.0.113.7']);
+  assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'rejected', remote_addr: '203.0.113.8' })), ['ip=203.0.113.8']);
+  // Request and trace ids are not vehicles, nor is a 17-digit number.
+  assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'retry', userId: 'u-1', requestId: 'ABCDEFGH123456789', meta: { traceId: 'ZYXWVUTS987654321' } })), ['userid=u-1']);
+  assert.deepEqual(identitiesOf('retry requestId=ABCDEFGH123456789 for user'), []);
+  assert.deepEqual(identitiesOf('order 12345678901234567 failed'), []);
+  // Plain text takes the same keys as structured lines, short values too.
+  assert.deepEqual(identitiesOf('sync failed orderId=1 ip=203.0.113.1').sort(), ['ip=203.0.113.1', 'orderid=1']);
+  // A value redacted before it reached us is unknown, not one identity.
+  assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'denied', ipAddress: '<ip>', userId: '<email>' })), []);
+});
+
+test('log_search counts the distinct users a template mentions, past its two samples, and shows only the counts', async () => {
+  class Logs extends FakeTelemetry {
+    override readonly has = { loki: true, tempo: false };
+    override async lokiRange(): Promise<LogLine[]> {
+      // One client retrying (u-1, 6 times) and five more users once each: 11 lines, one template.
+      const users = ['u-1', 'u-1', 'u-1', 'u-1', 'u-1', 'u-1', 'u-2', 'u-3', 'u-4', 'u-5', 'u-6'];
+      return users.map((u, i) => ({ labels: { app: 'ecom-service-production' }, tsNs: String((Date.parse('2026-11-04T10:00:00Z') + i * 1000) * 1e6), line: JSON.stringify({ level: 'error', msg: 'JWT Strategy validation error', userId: u, vin: i < 6 ? 'WSTRK000000000001' : 'WSTRK000000000002' }) }));
+    }
+  }
+  const tools = monitorTools(new Logs(() => []), testConfig(), new Date('2026-11-04T10:15:00Z'))(new Evidence(), 'author');
+  const out = await tools.find((t) => t.name === 'log_search')!.handler({ minutes: 30, errors_only: true, end_minutes_ago: 0, limit: 300 } as never, {});
+  const text = (out.content[0] as { text: string }).text;
+  assert.match(text, /11× ecom-service-production JWT Strategy validation error/);
+  assert.match(text, /distinct: 6 userid, 2 vin/);
+  assert.doesNotMatch(text, /u-5|u-6/, 'only the two samples show any value');
 });
