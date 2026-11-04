@@ -82,6 +82,10 @@ test('who a line is about: identity fields, key=value in the text and VINs; not 
   assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'retry', userId: 'u-1', requestId: 'ABCDEFGH123456789', meta: { traceId: 'ZYXWVUTS987654321' } })), ['userid=u-1']);
   assert.deepEqual(identitiesOf('retry requestId=ABCDEFGH123456789 for user'), []);
   assert.deepEqual(identitiesOf('order 12345678901234567 failed'), []);
+  // Plain text takes the same keys as structured lines, short values too.
+  assert.deepEqual(identitiesOf('sync failed orderId=1 ip=203.0.113.1').sort(), ['ip=203.0.113.1', 'orderid=1']);
+  // A value redacted before it reached us is unknown, not one identity.
+  assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'denied', ipAddress: '<ip>', userId: '<email>' })), []);
 });
 
 test('log_search counts the distinct users a template mentions, past its two samples, and shows only the counts', async () => {

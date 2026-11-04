@@ -129,9 +129,10 @@ export function messageOf(line: string): { level?: string; msg: string; context?
 // same names written as key=value in the text, and VINs anywhere. Callers
 // count them; the values never leave the tool.
 const IDENTITY_KEY = /^(user_?id|customer_?id|account_?id|order_?id|vin|client_?id|client_?ip|ip|ip_?address|remote_?addr|sub)$/i;
-const IDENTITY_TEXT = /\b(user_?id|customer_?id|account_?id|order_?id|client_?id|client_?ip|ip_?address|remote_?addr|vin)["']?\s*[=:]\s*["']?([\w.@+:-]{4,128})/gi;
+const IDENTITY_TEXT = /\b(user_?id|customer_?id|account_?id|order_?id|client_?id|client_?ip|ip|ip_?address|remote_?addr|sub|vin)["']?\s*[=:]\s*["']?([\w.@+:-]{1,128})/gi;
 const VIN = /\b[A-HJ-NPR-Z0-9]{17}\b/g;
-const NO_ID = /^(null|undefined|none|unknown|-)$/i;
+// No identity, or a redacted one (recordings and replays hold "<ip>"): unknown, not one.
+const NO_ID = /^(null|undefined|none|unknown|-|<[a-z_]+>)$/i;
 // Ids of the request, not of who it is about: never scanned for VINs.
 const REQUEST_KEY = /^(request|trace|span|correlation|req|message|event|x_?request)_?id$/i;
 const REQUEST_TEXT = /\b(?:request|trace|span|correlation|req|message|event)_?id["']?\s*[=:]\s*["']?[\w-]+/gi;
