@@ -7,7 +7,7 @@
 
 never_suppress:
   - section: http
-    route: '.*(login|logout|token|sign-?up|register|password|reset|confirm|checkout|payment|order).*'
+    route: '.*(login|logout|token|sign-?up|register|password|reset|confirm|checkout|payment|order|refresh|grant).*'
     status: '5..'
   - section: http
     service: keycloak

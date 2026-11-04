@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { generateKeyPairSync } from 'node:crypto';
-import { mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -258,4 +258,13 @@ test('serve refuses a reachable bind without the Keycloak sign-in: CLI tokens ar
   const r = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--import', 'tsx', 'src/cli.ts', 'serve', '--host', '0.0.0.0', '--port', '0'], { cwd: join(import.meta.dirname, '..'), env, encoding: 'utf8', timeout: 60_000 });
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /serving on 0\.0\.0\.0 needs the Keycloak sign-in/);
+});
+
+test('replay ignores Slack settings: no outbox database next to the runs, nothing outside SRE_OUT_DIR', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cli-'));
+  const runsDir = join(dir, 'runs');
+  const outDir = join(dir, 'out');
+  const env = { ...process.env, ENGINE_RUNS_DIR: runsDir, SRE_OUT_DIR: outDir, SLACK_WEBHOOK_URL: 'https://hooks.slack.com/services/T000/B000/xxxxxxxx', SLACK_BOT_TOKEN: '', ANTHROPIC_API_KEY: '', KEYCLOAK_ISSUER: '' };
+  const r = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--import', 'tsx', 'src/cli.ts', 'replay', '--from', '2026-10-26T10:00:00Z', '--to', '2026-10-26T10:00:00Z', '--replay', join(dir, 'export')], { cwd: join(import.meta.dirname, '..'), env, encoding: 'utf8', timeout: 60_000 });
+  assert.ok(!existsSync(join(runsDir, 'engine.db')), `replay opened the Slack outbox (exit ${r.status}): ${r.stderr}`);
 });
