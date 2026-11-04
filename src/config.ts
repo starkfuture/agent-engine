@@ -65,6 +65,12 @@ export interface Config {
   // A reported row is back to normal only after this long without firing. A
   // row that flickers stays one problem instead of a recovery every hour.
   recoverAfterMinutes: number;
+  // News (a fresh or worse row) must hold this many patrols in a row before
+  // the AI investigates it. Urgent rows never wait. 1: at once.
+  confirmPatrols: number;
+  // A jump in client errors (4xx) is urgent too: posted at once by code. Off:
+  // it waits for a second patrol and the AI, like any other row.
+  urgentClientErrors: boolean;
   attentionFloor: number; // fresh or worse event rows below this count are "quiet" on the card, not "to look at"
   sources: Sources;
   noiseFile: string;
@@ -223,6 +229,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
     tempoUid: opt(env.TEMPO_DATASOURCE_UID),
     windowMinutes: num(env.PATROL_WINDOW_MINUTES, 15, 'PATROL_WINDOW_MINUTES'),
     recoverAfterMinutes: num(env.PATROL_RECOVER_AFTER_MINUTES, 60, 'PATROL_RECOVER_AFTER_MINUTES'),
+    confirmPatrols: Math.max(1, num(env.PATROL_CONFIRM_PATROLS, 2, 'PATROL_CONFIRM_PATROLS')),
+    urgentClientErrors: env.PATROL_URGENT_CLIENT_ERRORS === '1',
     attentionFloor: num(env.PATROL_ATTENTION_FLOOR, DEFAULT_FLOOR, 'PATROL_ATTENTION_FLOOR'),
     sources: loadSources(r(env.SRE_SOURCES_FILE ?? 'config/sources.yaml')),
     noiseFile: r(env.SRE_NOISE_FILE ?? 'config/noise.yaml'),

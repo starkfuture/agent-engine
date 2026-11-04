@@ -6,6 +6,17 @@ import type { Noise, NoiseRule } from './noise.js';
 import type { Novelty, State } from './state.js';
 import type { Row, SourceHealth } from './types.js';
 
+// Rows the AI must never be able to hide: protected journeys (never_suppress),
+// big jumps and rollout rows (a stalled rollout, an Argo CD app degraded or a
+// failed sync). They are posted at once, with or without the AI. A jump in
+// client errors (4xx) is not: it is usually one client or a few until the AI
+// shows otherwise, so it waits its turn like any other row, unless
+// clientErrors (PATROL_URGENT_CLIENT_ERRORS) says a 4xx jump is urgent too.
+export function urgent(r: Row, noise: Noise, clientErrors = false): boolean {
+  const clientError = r.section === 'http' && /^4\d\d$/.test(r.status ?? '');
+  return r.section === 'rollout' || noise.protected(r) || ((clientErrors || !clientError) && r.counts.now >= 50 && r.counts.now >= 5 * Math.max(1, r.score.expected));
+}
+
 export interface FlaggedRow extends Row {
   novelty: Novelty;
   firstSeen: string;
@@ -22,6 +33,9 @@ export interface Summary {
   send: FlaggedRow[];
   // Still firing, already reported, not worse. Listed, not investigated again.
   known: FlaggedRow[];
+  // News seen in fewer patrols in a row than PATROL_CONFIRM_PATROLS: no AI
+  // run and no post yet. Urgent rows never wait.
+  waiting: FlaggedRow[];
   suppressed: Array<{ row: Row; rule: NoiseRule }>;
   recovered: string[];
   deploys: Deploys;
@@ -72,6 +86,7 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
 
   const send: FlaggedRow[] = [];
   const known: FlaggedRow[] = [];
+  const waiting: FlaggedRow[] = [];
   const suppressed: Summary['suppressed'] = [];
   const flagged = new Set<string>();
 
@@ -85,11 +100,11 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
       continue;
     }
     const novelty = state.novelty(row, at);
-    state.seen(row, at, rowSources.get(row.key)!);
+    const held = state.seen(row, at, rowSources.get(row.key)!, urgent(row, noise, cfg.urgentClientErrors) ? undefined : { windowMin: w, patrols: cfg.confirmPatrols });
     const firstSeen = state.firstSeen(row.key) ?? at.toISOString();
     const after = afterDeploy(row.service, firstSeen, deploys, s.deploys.aliases);
     const f: FlaggedRow = { ...row, novelty, firstSeen, ...(after ? { afterDeploy: after } : {}) };
-    (novelty === 'known' ? known : send).push(f);
+    (novelty === 'known' ? known : held ? waiting : send).push(f);
   }
 
   const healthy = new Set(sources.filter(s => s.ok).map(s => s.source));
@@ -108,6 +123,7 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
     windowMinutes: w,
     send: send.sort(order),
     known: known.sort(order),
+    waiting: waiting.sort(order),
     suppressed,
     recovered,
     deploys,
@@ -130,7 +146,9 @@ export function rowLine(r: FlaggedRow): string {
   );
 }
 
-export function renderSummary(s: Summary): string {
+// forModel: without the rows still waiting for a second patrol. The
+// investigator isn't asked about them yet; the patrol file lists them.
+export function renderSummary(s: Summary, o: { forModel?: boolean } = {}): string {
   const out: string[] = [`Patrol at ${s.at}, window ${s.windowMinutes} min. Counts are events in the window.`];
   out.push('', `## New or worse (${s.send.length})`);
   for (const r of s.send) {
@@ -138,6 +156,7 @@ export function renderSummary(s: Summary): string {
     if (r.detail) out.push(`  detail: ${r.detail.replace(/\n/g, ' ')}`);
   }
   if (s.known.length) out.push('', `## Still firing, already reported (${s.known.length})`, ...s.known.map((r) => `- ${rowLine(r)}`));
+  if (s.waiting?.length && !o.forModel) out.push('', `## Waiting for the next patrol: news once, not investigated yet (${s.waiting.length})`, ...s.waiting.map((r) => `- ${rowLine(r)}`));
   if (s.recovered.length) out.push('', `## Recovered since last patrol (${s.recovered.length})`, ...s.recovered.map((k) => `- ${k}`));
   out.push('', `## ${deploysHeading(s.deploys)}`, ...deployLines(s.deploys));
   const down = s.sources.filter((x) => !x.ok);
