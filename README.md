@@ -132,7 +132,7 @@ A rollback to an older template reuses its old ReplicaSet. It shows on the deplo
 
 A critical or major AI report opens an **issue**: the engine's record of one cause, with a short id like `I-7f3a`. It is the bot's finding, not an incident (a person may promote it to one on the team's board, and the bot can be wrong). It lives in the engine's SQLite file next to the outbox: `issues`, `issue_rows` (the rows it covers) and an append-only `issue_events` (opened, report_linked, severity_raised, resolved, reopened, reminded, rows_posted).
 
-The investigator is shown the open issues and those resolved in the last 24 h (at most 20, as fenced data: id, title, severity, first seen, last report, rows, latest cause). Each report says `"issue": "<id>"` when it has the same cause, even on different rows, or `"new"`. An id that wasn't on the list is rejected and the model resubmits.
+The investigator is shown the open issues, those resolved in the last 24 h and those with a Not an issue that still lasts (at most 20, as fenced data: id, title, severity, first seen, last report, rows, latest cause). Each report says `"issue": "<id>"` when it has the same cause, even on different rows, or `"new"`. An id that wasn't on the list is rejected and the model resubmits.
 
 What a report posts:
 
@@ -142,7 +142,7 @@ What a report posts:
 | same issue, same or lower severity | a reply in the issue's thread, **not** shown in the channel, also after 24 h | nothing (the card and `get_run` keep it) | no |
 | same issue, but the channel has heard nothing about it for 24 h (no new, raised, reopened or reminder post, and no urgent rows card in its thread, counted when Slack accepted it, not when it was queued) | a reply in its thread, also shown in the channel (at most once a day per open issue, so a chronic one isn't hidden for good; not while news about it is still queued) | a message | yes |
 | same issue, severity rises (major → critical) | a reply in its thread, also shown in the channel | a message | yes |
-| a resolved issue (it came back) | reopens it; a reply in its thread, also shown in the channel | a message | yes |
+| a resolved issue (it came back) | reopens it; a reply in its thread, also shown in the channel (unless a Not an issue still covers it: see the buttons below) | a message | yes |
 | critical or major, with no issue record (it is off, or failed) | a message | a message | yes |
 | minor or noise | not posted, as before; a linked one's rows still join the issue | nothing | no |
 
@@ -162,7 +162,8 @@ With Socket Mode on (`SLACK_APP_TOKEN`; setup in `slack/README.md`), an issue's 
 | a report raises it to critical | a reply in its thread, also shown in the channel | the same, and the mute ends |
 | a protected journey (`never_suppress`) | the usual path: the rows card in the channel, an AI run | the same: a person can't silence a protected journey |
 | a big jump on its rows (urgent: 50+ events and 5× expected) | one line by code in its thread; no AI run | the usual path: the rows card in its thread, shown in the channel, and an AI run; the mute stays |
-| it resolves | the message says resolved and loses its buttons; On it ends | the same; the mute ends |
+| it resolves | the message says resolved and loses its buttons; On it ends | the same; the mute stays for its 7 days |
+| it comes back after it resolved | as any return: reopened, shown in the channel | within the 7 days, a report on rows it held when it resolved (and no other row joined it since), at the same or lower severity, reopens it quietly: not posted, its message shows the mute again, and its rows get no further AI run. A new row, a protected journey, a big jump or a rise to critical reopens it as news and ends the mute |
 | it never resolves | On it stays | the mute ends after 7 days |
 
 - **Undo** takes either back. Not an issue asks to confirm first.

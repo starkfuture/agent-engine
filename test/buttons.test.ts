@@ -17,7 +17,7 @@ import { SlackOutbox, type SlackMessage, type Transport } from '../src/output/sl
 import { Issues, type Click } from '../src/patrol/issues.js';
 import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
-import { patrolOnce, type MonitorAgent, type PatrolResult } from '../src/runner.js';
+import { fileReport, patrolOnce, postFor, shownInChannel, type FileOptions, type MonitorAgent, type PatrolResult } from '../src/runner.js';
 import { ACTION, controlsFor, onClick, type ButtonIds } from '../src/slack/buttons.js';
 import { startButtons, type SocketClient } from '../src/slack/socket.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -142,8 +142,8 @@ function payload(action: string, issue: string, o: { user?: string; ts?: string;
 }
 
 // A patrol world with one engine.db, the buttons on unless `buttons: false`.
-function setup(o: { decide?: Decide; buttons?: boolean; noise?: Noise } = {}) {
-  const c: Config = testConfig();
+function setup(o: { decide?: Decide; buttons?: boolean; noise?: Noise; recoverAfterMinutes?: number } = {}) {
+  const c: Config = { ...testConfig(), ...(o.recoverAfterMinutes ? { recoverAfterMinutes: o.recoverAfterMinutes } : {}) };
   const db = join(c.runsDir, 'engine.db');
   const clock = { now: new Date(T0) };
   const issues = new Issues(db);
@@ -339,6 +339,121 @@ test('the mute ends after 7 days even if the issue never resolves', async () => 
   assert.deepEqual(w.issues.events(id).at(-1)!.data, { reason: '7 days' });
   assert.ok(w.logs.includes(`${id}: Not an issue ended after 7 days; its rows are investigated again`));
   assert.deepEqual(buttons(w.t.updates.at(-1)!.blocks), OPEN);
+});
+
+// I-8b89 on 11-03/04: a Major at 15:15Z, Not an issue at 15:28Z, its row quiet
+// from the 15:30Z patrol, resolved at 16:15Z (an hour without firing, #22),
+// and the same row back at 01:45Z. MUTE_DAYS from the click is 11-10 15:28Z.
+const RIDES = '/v2/vehicles/:vin/rides';
+const NOV3 = 31.25; // 11-03 15:15Z
+const BACK = 41.75; // 11-04 01:45Z
+const UNTIL = '2026-11-10T15:28:00.000Z';
+async function dismissedThenResolved(o: { rides?: (t: number) => number; also?: Schedule; decide?: Decide } = {}) {
+  const tel = schedule({ [RIDES]: o.rides ?? ((t) => between(NOV3, NOV3 + 0.25)(t) || between(BACK, BACK + 0.25)(t)), ...o.also });
+  const w = setup({ recoverAfterMinutes: 60, ...(o.decide ? { decide: o.decide } : {}) });
+  const id = opened(await w.patrol(tel, NOV3));
+  await w.click('dismissed', id, { user: 'U0BOB' }, NOV3 + 13 / 60);
+  for (const h of [31.5, 31.75, 32]) assert.deepEqual((await w.patrol(tel, h)).resolved, [], 'held for an hour without firing');
+  assert.deepEqual((await w.patrol(tel, 32.25)).resolved, [id], 'resolved at 16:15Z');
+  return { w, tel, id };
+}
+
+test('I-8b89: Not an issue outlasts the issue resolving, and the same row back at the same severity stays muted', async () => {
+  const { w, tel, id } = await dismissedThenResolved();
+  assert.equal(w.issues.disposition(id, at(32.25)), undefined, 'resolved: no mute in force');
+  assert.deepEqual(w.issues.keptMute(id, at(32.25)), { kind: 'dismissed', by: 'U0BOB', at: at(NOV3 + 13 / 60).toISOString(), until: UNTIL, rows: [key(RIDES)] }, 'but kept for its return');
+  assert.deepEqual(w.issues.events(id).at(-1)!.data, { rows: [key(RIDES)], kept: 'dismissed', until: UNTIL });
+  const sent = w.t.sent.length; // the issue and its one resolved note
+  const updates = w.t.updates.length;
+
+  const back = await w.patrol(tel, BACK);
+  assert.deepEqual(back.filed.map((f) => f.action), ['muted']);
+  assert.equal(w.t.sent.length, sent, 'no "Back again" in the channel, nor in the thread');
+  assert.ok(w.logs.includes(`report 1 reopened ${id}: it came back, still Not an issue (not posted)`));
+  assert.equal(back.investigation?.challenge, undefined, 'a report the buttons keep quiet is not challenged');
+  assert.equal(w.issues.get(id)!.status, 'open');
+  assert.deepEqual(w.issues.disposition(id, at(BACK)), { kind: 'dismissed', by: 'U0BOB', at: at(NOV3 + 13 / 60).toISOString(), until: UNTIL }, 'the same mute, to its first end');
+  // Its message shows the mute again, with Undo: not its buttons as if unmuted.
+  assert.equal(w.t.updates.length, updates + 1);
+  assert.deepEqual(buttons(w.t.updates.at(-1)!.blocks), [ACTION.undo]);
+  assert.match(note(w.t.updates.at(-1)!.blocks), /^🔕 Not an issue: <@U0BOB> at 11-03 15:28Z/);
+  assert.deepEqual(w.issues.events(id).map((e) => e.type), ['opened', 'dismissed', 'resolved', 'reopened', 'report_linked']);
+  assert.equal(w.issues.lastNewsAt(id), at(NOV3).toISOString(), 'a quiet return is not news');
+  assert.deepEqual(w.issues.claims([key(RIDES)], at(BACK + 0.25)).get(key(RIDES))?.kind, 'dismissed', 'its row gets no AI run again while the mute lasts');
+  assert.deepEqual(
+    w.issues.noiseCandidates().map((c) => [c.issue, c.status, c.rows, c.dismissals.length]),
+    [[id, 'open', [key(RIDES)], 1]],
+    'still one noise-rule candidate',
+  );
+});
+
+test('a return more than a day after the issue resolved still links to it and stays muted, while the mute lasts', async () => {
+  const later = 32.25 + 26; // 11-04 18:15Z: past the 24 h a resolved issue is otherwise listed
+  const { w, tel, id } = await dismissedThenResolved({ rides: (t) => between(NOV3, NOV3 + 0.25)(t) || between(later, later + 0.25)(t) });
+  assert.deepEqual(w.issues.listed(at(later)).issues.map((i) => i.id), [id], 'listed for the investigator while its mute lasts');
+  assert.deepEqual(w.issues.listed(new Date(Date.parse(UNTIL) + 1)).issues, [], 'and no longer once it is over');
+  const sent = w.t.sent.length;
+  const back = await w.patrol(tel, later);
+  assert.equal(w.session.seen.length, 2, 'its return is investigated');
+  assert.deepEqual(back.filed.map((f) => f.action), ['muted'], 'it links instead of opening a new issue');
+  assert.equal(w.t.sent.length, sent);
+});
+
+test('a return Not an issue does not cover reopens the issue as news and ends the mute: a big jump, a row it did not cover, a rise to critical', async () => {
+  const cases = {
+    'a big jump': await dismissedThenResolved({ rides: (t) => between(NOV3, NOV3 + 0.25)(t) || between(BACK, BACK + 0.25, 300)(t) }),
+    'a row it did not cover': await dismissedThenResolved({ also: { '/v2/vehicles/:vin/trips': between(BACK, BACK + 0.25) } }),
+    'a rise to critical': await dismissedThenResolved({ decide: (_rows, issues) => ({ issue: issues[0] ?? 'new', severity: issues.length ? 'critical' : 'major' }) }),
+  };
+  for (const [what, { w, tel, id }] of Object.entries(cases)) {
+    const back = await w.patrol(tel, BACK);
+    assert.deepEqual(back.filed.map((f) => f.action), ['reopened'], what);
+    assert.deepEqual([w.t.sent.at(-1)!.thread_ts, w.t.sent.at(-1)!.reply_broadcast], [ROOT, true], `${what}: shown in the channel`);
+    assert.ok(w.logs.includes(`report 1 reopened ${id}: it came back (broadcast)`), what);
+    assert.equal(w.issues.disposition(id, at(BACK)), undefined, `${what}: the mute is over`);
+    assert.deepEqual(w.issues.events(id).find((e) => e.type === 'mute_lifted')?.data.reason, what === 'a rise to critical' ? 'critical' : 'came back', what);
+    assert.deepEqual(buttons(w.t.updates.at(-1)!.blocks), OPEN, `${what}: its buttons are back`);
+    assert.match(note(w.t.updates.at(-1)!.blocks), /Marked Not an issue before by <@U0BOB> on 11-03/, what);
+  }
+  const jump = cases['a big jump'].w.t.sent.at(-2)!;
+  assert.match(jump.text, /^Patrol 2026-11-04 01:45Z/, 'the big jump got its rows card first, as any urgent row');
+});
+
+test("what the channel would see of a resolved issue's return is what fileReport posts, with a Not an issue kept or not", () => {
+  const k = key(RIDES);
+  const world = (severity: Report['severity']) => {
+    const issues = Issues.memory();
+    const i = issues.open({ title: 'Rides return 401', severity, rows: [k], hypothesis: 'h' }, at(0));
+    issues.click(i.id, 'dismissed', 'U0BOB', at(0.25));
+    issues.resolve(i.id, at(1));
+    return { issues, id: i.id };
+  };
+  const clicks: FileOptions = { clicks: true };
+  const trips = key('/v2/vehicles/:vin/trips');
+  const cases: Array<{ what: string; was?: Report['severity']; over?: Partial<Report>; hours?: number; o?: FileOptions; minorFirst?: string[]; action: string }> = [
+    { what: 'the same row, the same severity', action: 'muted' },
+    { what: 'a lower severity', was: 'critical', action: 'muted' },
+    { what: 'critical again, on an issue that was critical', was: 'critical', over: { severity: 'critical' }, action: 'muted' },
+    { what: 'a protected row or a big jump', o: { ...clicks, breaksMute: (x) => x === k }, action: 'reopened' },
+    { what: 'a row the mute did not cover', over: { rows: [k, trips] }, action: 'reopened' },
+    { what: 'a row that joined while it was resolved (a minor report), which the mute would then cover too', minorFirst: [trips], action: 'reopened' },
+    { what: 'a rise to critical', over: { severity: 'critical' }, action: 'reopened' },
+    { what: 'after its mute ended', hours: 7 * 24 + 1, action: 'reopened' },
+    { what: 'the buttons off', o: {}, action: 'reopened' },
+  ];
+  for (const c of cases) {
+    const { issues, id } = world(c.was ?? 'major');
+    if (c.minorFirst) assert.equal(fileReport(issues, report({ rows: c.minorFirst, issue: id, severity: 'minor' }), at(5), undefined, clicks).action, 'linked');
+    const r = report({ rows: [k], issue: id, ...c.over });
+    const when = at(c.hours ?? 10);
+    const o = c.o ?? clicks;
+    const shown = shownInChannel(issues, r, when, o);
+    const f = fileReport(issues, r, when, undefined, o);
+    assert.equal(f.action, c.action, c.what);
+    assert.equal(shown, !!postFor(f, r)?.broadcast, `${c.what}: shownInChannel reads fileReport's rule`);
+    assert.equal(issues.get(id)!.status, 'open', c.what);
+    assert.equal(issues.disposition(id, when)?.kind, c.action === 'muted' ? 'dismissed' : undefined, c.what);
+  }
 });
 
 // ---- Undo -------------------------------------------------------------------------
