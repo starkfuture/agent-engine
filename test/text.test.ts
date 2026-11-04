@@ -73,6 +73,11 @@ test('who a line is about: identity fields, key=value in the text and VINs; not 
   assert.deepEqual(identitiesOf('parent_create_not_found: operation=MODIFY_STATUS orderId=9b2f0c1e-1111-2222-3333-444455556666'), ['orderid=9b2f0c1e-1111-2222-3333-444455556666']);
   assert.deepEqual(identitiesOf('upload for WSTRK000000001234 rejected'), ['vin=WSTRK000000001234']);
   assert.deepEqual(identitiesOf('Token revoked or user inactive'), []);
+  // An email-valued field once, not again as a prefix from the text.
+  assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'denied', userId: 'alice@example.test' })), ['userid=alice@example.test']);
+  // Keycloak's plain-text events: the IP counts, a null user doesn't.
+  assert.deepEqual(identitiesOf('type="LOGIN_ERROR", realmId="stark", clientId="storefront", userId="null", ipAddress="203.0.113.7", error="invalid_user_credentials"').sort(), ['clientid=storefront', 'ip=203.0.113.7']);
+  assert.deepEqual(identitiesOf(JSON.stringify({ msg: 'rejected', remote_addr: '203.0.113.8' })), ['ip=203.0.113.8']);
 });
 
 test('log_search counts the distinct users a template mentions, past its two samples, and shows only the counts', async () => {

@@ -128,28 +128,44 @@ export function messageOf(line: string): { level?: string; msg: string; context?
 // structured line (user, customer, account, order, vehicle, client, IP), the
 // same names written as key=value in the text, and VINs anywhere. Callers
 // count them; the values never leave the tool.
-const IDENTITY_KEY = /^(user_?id|customer_?id|account_?id|order_?id|vin|client_?id|client_?ip|ip|remote_?addr|sub)$/i;
-const IDENTITY_TEXT = /\b(user_?id|customer_?id|account_?id|order_?id|client_?id|vin)["']?\s*[=:]\s*["']?([\w.:-]{4,64})/gi;
+const IDENTITY_KEY = /^(user_?id|customer_?id|account_?id|order_?id|vin|client_?id|client_?ip|ip|ip_?address|remote_?addr|sub)$/i;
+const IDENTITY_TEXT = /\b(user_?id|customer_?id|account_?id|order_?id|client_?id|client_?ip|ip_?address|remote_?addr|vin)["']?\s*[=:]\s*["']?([\w.@+:-]{4,128})/gi;
 const VIN = /\b[A-HJ-NPR-Z0-9]{17}\b/g;
+const NO_ID = /^(null|undefined|none|unknown|-)$/i;
 export function identitiesOf(line: string): string[] {
   const out = new Set<string>();
-  const kind = (k: string) => k.toLowerCase().replace(/_/g, '');
+  const kind = (k: string) => {
+    const c = k.toLowerCase().replace(/_/g, '');
+    return c === 'ipaddress' || c === 'clientip' || c === 'remoteaddr' ? 'ip' : c;
+  };
+  const add = (k: string, v: string) => {
+    if (!NO_ID.test(v)) out.add(`${kind(k)}=${v}`);
+  };
+  // Free text: key=value pairs and VINs. In a structured line only the values
+  // that aren't identity fields themselves, so a field isn't counted twice.
+  const scan = (text: string) => {
+    for (const m of text.matchAll(IDENTITY_TEXT)) add(m[1]!, m[2]!);
+    for (const m of text.matchAll(VIN)) add('vin', m[0]);
+  };
   const walk = (v: unknown, depth: number): void => {
+    if (typeof v === 'string') return scan(v);
     if (depth > 3 || !v || typeof v !== 'object') return;
     for (const [k, x] of Object.entries(v)) {
-      if (IDENTITY_KEY.test(k) && (typeof x === 'string' || typeof x === 'number') && String(x).length <= 100) out.add(`${kind(k)}=${x}`);
-      else walk(x, depth + 1);
+      if (IDENTITY_KEY.test(k) && (typeof x === 'string' || typeof x === 'number')) {
+        if (String(x).length <= 128) add(k, String(x));
+      } else walk(x, depth + 1);
     }
   };
   const t = line.trim();
+  let structured = false;
   if (t.startsWith('{'))
     try {
       walk(JSON.parse(t), 0);
+      structured = true;
     } catch {
       /* not JSON */
     }
-  for (const m of line.matchAll(IDENTITY_TEXT)) out.add(`${kind(m[1]!)}=${m[2]}`);
-  for (const m of line.matchAll(VIN)) out.add(`vin=${m[0]}`);
+  if (!structured) scan(line);
   return [...out];
 }
 
