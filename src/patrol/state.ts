@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { Notices } from '../output/notices.js';
 import type { Row } from './types.js';
 
 // What the patrol remembers between runs. Small JSON file locally; a table later.
@@ -33,6 +34,7 @@ export interface StateData {
   // The investigator's last run was refused (a cap, the kill switch): the
   // skipped run that recorded it. Ends with the next run that is admitted.
   held?: { reason: string; since: string; runId: string };
+  notices?: Notices; // what the channel was told about pauses and blind sources
 }
 
 const H = 3600_000;

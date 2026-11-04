@@ -8,8 +8,9 @@ import { runAgent, type Engine, type RunResult } from './engine/run.js';
 import { monitorTask } from './investigate/prompt.js';
 import { checkReport, Report, ReportShape } from './investigate/report.js';
 import { monitorTools } from './investigate/tools.js';
-import { patrolCard, recoveredCard, reportCard, worseCard, type Card, type IssueRef } from './output/card.js';
+import { patrolCard, pauseText, recoveredCard, reportCard, worseCard, type Card, type IssueRef } from './output/card.js';
 import type { CardSink, EmitSlack } from './output/sink.js';
+import { announceBlind, announcePause, announceResume, heldNow, type Say } from './output/notices.js';
 import { recentDeploys } from './patrol/deploys.js';
 import { bucketOf } from './patrol/digest.js';
 import { MUTE_DAYS, RANK, type Disposition, type Issue, type Issues, type Severity } from './patrol/issues.js';
@@ -223,6 +224,15 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     result.cards.push(file);
     if (slack) result.slack.push(file);
   };
+  // Code's notices (output/notices.ts): top-level, about no rows, so the webhook posts them too.
+  const say: Say = (card, name) => {
+    log(`notice: ${card.text}`);
+    emit(card, `${stamp(summary.at)}-${name}`, { kind: 'rows', keys: [], broadcast: true });
+  };
+  // The hold the investigator's last refused run recorded, if it still holds:
+  // the rows card says the AI is paused, and the run isn't recorded again.
+  const now = monitor?.engine.now?.() ?? new Date();
+  const heldBy = monitor ? heldNow(state.data.held, now, monitor.engine.stopFile) : undefined;
   // A failed send waits for the next patrol, including when the urgent card
   // was attempted before the investigator. Do not retry it again at finish().
   let slackWaiting = false;
@@ -235,6 +245,8 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   // Finish by saving the state and delivering any reports/recoveries. Urgent
   // rows take the separate fast path below, before the model starts.
   const finish = async () => {
+    announceBlind(state.data, summary.sources, summary.at, say);
+    if (monitor) announcePause(state.data, heldNow(state.data.held, now, monitor.engine.stopFile), summary.at, say);
     state.save();
     // An issue is resolved once every row of it is back to normal (which needs
     // healthy observers and recoverAfterMinutes without firing), with one
@@ -319,7 +331,8 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   // delays or hides those. Otherwise it stays on disk and the AI's reports decide.
   // A protected journey among the urgent rows needs a person now: the card mentions the on-call.
   const oncall = urgentRows.some((r) => noise.protected(r)) ? cfg.slackOncall : undefined;
-  const card = patrolCard(shown, skip ? `not investigated: ${skip}` : 'AI investigation started', {
+  const paused = heldBy !== undefined ? pauseText(heldBy) : undefined;
+  const card = patrolCard(shown, skip ? `not investigated: ${skip}` : paused ? `AI paused: ${paused}` : 'AI investigation started', {
     owners: o.owners,
     oncall,
     floor: cfg.attentionFloor,
@@ -364,11 +377,9 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       if (gaveUp.length) log(`gave up on ${gaveUp.length} row(s) after ${ATTEMPTS} attempts: ${gaveUp.join(', ')}`);
     };
     // One skipped run per hold, not one per patrol: while the cap or the kill
-    // switch that refused an earlier run still holds, the refusal isn't recorded
-    // again. A daily cap ends with its UTC day.
-    const now = monitor.engine.now?.() ?? new Date();
+    // switch that refused an earlier run still holds (heldBy), the refusal isn't
+    // recorded again.
     const hold = state.data.held;
-    const heldBy = hold && (!/daily cap/.test(hold.reason) || hold.since.slice(0, 10) === now.toISOString().slice(0, 10)) ? hold.reason : undefined;
     let inv: RunResult<Report>;
     let admitted = false;
     try {
@@ -389,6 +400,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
         heldBy,
         onAdmitted: () => {
           admitted = true;
+          announceResume(state.data, summary.at, say); // after a pause the channel heard about, before the reports
         },
       });
     } catch (e) {
