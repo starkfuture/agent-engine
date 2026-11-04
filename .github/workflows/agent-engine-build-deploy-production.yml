@@ -2,10 +2,13 @@ name: agent-engine - ArgoCD Production
 
 run-name: agent-engine production deployment by @${{ github.actor }} from branch ${{ github.ref_name }}
 
-# One image, two apps: agent-engine (monitor + codebase; reads prod telemetry)
-# and agent-engine-web (research; internet only). A push to main deploys both,
-# so changes go through PRs. Every push to main runs (no path filter). Production directly: the engine is read-only over
-# the platform.
+# One image. A push to main builds it and, with PROD_DEPLOY on, deploys
+# agent-engine (monitor + codebase; reads prod telemetry) to production through
+# argo-cd: deploy-argocd writes the tag into apps/agent-engine/prod/values.yaml
+# and syncs. So merging to main is the release, and changes go through PRs.
+# Every push to main runs (no path filter). Production directly: the engine is
+# read-only over the platform. agent-engine-web (research; internet only) joins
+# once it has an argo-cd app.
 
 on:
   workflow_dispatch:
@@ -62,17 +65,17 @@ jobs:
   deploy-to-prod:
     needs: [build]
     # Only main deploys; a manual run from another branch builds an image and stops.
-    # Nothing deploys until the repo variable PROD_DEPLOY is "true": set it once
-    # argo-cd has apps/agent-engine*/prod/values.yaml and the deploy secrets
-    # exist. Until then every run is build-only and its tag goes into argo-cd by PR.
+    # Nothing deploys until the repo variable PROD_DEPLOY is "true" (it needs the
+    # GH_ARGOCD_APP_PK and ARGOCD_PROD_TKN secrets). Until then every run is
+    # build-only and its tag goes into argo-cd by PR.
     if: ${{ github.ref == 'refs/heads/main' && !inputs.skip-deploy && vars.PROD_DEPLOY == 'true' }}
     runs-on: kubernetes-runner-light-production
     timeout-minutes: 10
     strategy:
-      # Both deploys commit to argo-cd: one at a time.
-      max-parallel: 1
+      # Only agent-engine runs in prod. agent-engine-web (the web agents, apart
+      # from prod data) has no argo-cd app yet: add it here when it has one.
       matrix:
-        app: [agent-engine, agent-engine-web]
+        app: [agent-engine]
 
     permissions:
       contents: read
