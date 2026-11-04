@@ -726,6 +726,7 @@ test('what the channel would see: a new issue, a rise, a reopen, a reminder, or 
   assert.equal(shownInChannel(issues, r({}), at(1)), false, 'the same cause again: a quiet reply');
   assert.equal(shownInChannel(issues, r({ severity: 'critical' }), at(1)), true, 'a severity rise');
   assert.equal(shownInChannel(issues, r({}), at(24)), true, 'a 24 h reminder');
+  assert.equal(shownInChannel(issues, r({}), at(24), { remind: false }), false, 'no reminder from a run no challenger saw: a quiet reply, as fileReport files it');
   assert.equal(shownInChannel(undefined, r({}), at(1)), true, 'no issue record: posted on its own');
   assert.equal(shownInChannel(issues, r({ issue: 'new', severity: 'minor' }), at(1)), false, 'minor is never shown');
   issues.resolve(open.id, at(2));

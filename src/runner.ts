@@ -130,7 +130,7 @@ export function shownInChannel(issues: Issues | undefined, r: Report, at: Date, 
   if (o.reached && !o.reached(i.id)) return true; // opened without posting, or its first post failed: this one is its first
   if (d?.kind === 'acknowledged' || o.newsPending?.(i.id)) return false; // On it, or news still queued: no reminder
   const news = o.newsAt?.(i.id) ?? issues.lastNewsAt(i.id);
-  return !!news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000; // the 24 h reminder
+  return o.remind !== false && !!news && at.getTime() - Date.parse(news) >= REMIND_HOURS * 3600_000; // the 24 h reminder, when one may go out
 }
 
 // The posting rule. News (a new issue, a higher severity, a recurrence) is a
