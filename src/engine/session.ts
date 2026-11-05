@@ -2,6 +2,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSdkMcpServer, query, type HookCallbackMatcher, type HookEvent, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 
 // Everything one model session needs. The engine builds it; a Session runs it.
 // Tests swap in a fake Session that calls the tool handlers directly.
@@ -152,8 +153,47 @@ export class SpendMeter {
   }
 }
 
+// The SDK's in-process MCP server refuses a call that leaves out a field with
+// a zod default ("expected nonoptional"), though the schema it lists for the
+// model marks that field optional. So the server gets each top-level default
+// as a plain optional field, the default said in its description, and the
+// handler gets that field's default (zod's getter: a fresh copy, or what a
+// default function returns) when it was left out. Nothing else is parsed
+// again: the server's own parse, transforms and async checks included, stands.
+export function forServer(t: SdkMcpToolDefinition<any>): SdkMcpToolDefinition<any> {
+  const shape = t.inputSchema as Record<string, z.ZodType>;
+  const defaults = Object.entries(shape).filter((e): e is [string, z.ZodDefault] => e[1] instanceof z.ZodDefault);
+  // Only a plain top-level .default() is adapted; anything else that holds a
+  // default is refused here, when the tools are built. A check chained after
+  // .default() lives on the default itself, and the server only gets the field
+  // inside it. A .prefault(), or a .default() under .optional(), .nullable(),
+  // .readonly(), .transform() or .pipe(), the server refuses when left out.
+  const wrapped = (x: z.ZodType): boolean =>
+    x instanceof z.ZodDefault || x instanceof z.ZodPrefault || ((x instanceof z.ZodOptional || x instanceof z.ZodNullable || x instanceof z.ZodReadonly) && wrapped(x.def.innerType as z.ZodType)) || (x instanceof z.ZodPipe && wrapped(x.def.in as z.ZodType));
+  for (const [k, x] of Object.entries(shape)) {
+    if (x instanceof z.ZodDefault && x.def.checks?.length) throw new Error(`${t.name}: ${k} has a check after .default(), which the server would drop: put the check before .default()`);
+    if (wrapped(x instanceof z.ZodDefault ? (x.unwrap() as z.ZodType) : x)) throw new Error(`${t.name}: ${k} holds a default the server refuses to leave out (a .prefault(), or a .default() under .optional(), .nullable(), .readonly(), .transform() or .pipe()): make it a plain .default() on the field`);
+  }
+  if (!defaults.length) return t;
+  const said = (d: z.ZodDefault) => {
+    const why = d.description ?? (d.unwrap() as z.ZodType).description;
+    return `${why ? `${why} ` : ''}(default ${JSON.stringify(d.def.defaultValue)})`;
+  };
+  return {
+    ...t,
+    inputSchema: { ...shape, ...Object.fromEntries(defaults.map(([k, d]) => [k, (d.unwrap() as z.ZodType).optional().describe(said(d))])) },
+    handler: (args: Record<string, unknown>, extra) => {
+      const filled = { ...args };
+      for (const [k, d] of defaults) if (filled[k] === undefined) filled[k] = d.def.defaultValue;
+      return t.handler(filled, extra);
+    },
+  };
+}
+
+export const inProcessServer = (tools: SdkMcpToolDefinition<any>[]) => createSdkMcpServer({ name: MCP_NAME, version: '0.1.0', tools: tools.map(forServer), alwaysLoad: true, timeout: 60_000 });
+
 export const sdkSession: Session = async function* (r) {
-  const server = createSdkMcpServer({ name: MCP_NAME, version: '0.1.0', tools: r.tools, alwaysLoad: true, timeout: 60_000 });
+  const server = inProcessServer(r.tools);
   const plugins = r.pluginDir ? [{ type: 'local' as const, path: r.pluginDir }] : [];
   const run = query({
     prompt: r.prompt,
