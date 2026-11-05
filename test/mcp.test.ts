@@ -15,7 +15,7 @@ import type { Engine } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
 import { Store } from '../src/engine/store.js';
 import { Login } from '../src/mcp/login.js';
-import { buildServer, startHttp, type McpContext } from '../src/mcp/server.js';
+import { buildServer, EXPORT_PART, startHttp, type McpContext } from '../src/mcp/server.js';
 import { Users, type User } from '../src/mcp/users.js';
 import { fakeSession, fetchResponse, ok, readResponse, say, type Script } from './fake-session.js';
 import { cluster, ECR, FakeTelemetry, MIN, testConfig, world } from './fake.js';
@@ -510,4 +510,46 @@ test('get_run on a monitor run: reports from before answer.md, an unreadable cha
   assert.doesNotMatch(research, /Slack delivery/);
   run('20261103T101500Z-monitor-abcdef', 'monitor', { 'output.json': JSON.stringify([report]) }, 'bo');
   assert.match((await (await connect(ctx, who('ana'))).call('get_run', { run_id: '20261103T101500Z-monitor-abcdef' })).text, /no run 20261103T101500Z-monitor-abcdef/);
+});
+
+test('export_run: admins only and read-only; a run’s files redacted again, in parts that join into one JSON object', async () => {
+  const { ctx, who } = context(fakeSession());
+  const id = '20261104T120000Z-monitor-abcdef';
+  ctx.engine.store.skipped({ id, agent: 'monitor', version: 'abc', trigger: 'patrol', now: new Date(), note: 'fixture' });
+  const dir = join(ctx.engine.runsDir, 'monitor', id);
+  mkdirSync(dir, { recursive: true });
+  // An email that got into the files anyway: redacted on the way out.
+  const item = { id: 'E-abcd-1', by: 'author', tool: 'log_search', args: { service: 'auth' }, text: 'login failed for someone@example.com' };
+  writeFileSync(join(dir, 'input.md'), '# monitor @ abc\n\nask ops@example.com\n');
+  writeFileSync(join(dir, 'evidence.jsonl'), `${JSON.stringify(item)}\n${JSON.stringify({ ...item, id: 'E-abcd-2', text: 'y'.repeat(70_000) })}\n`);
+  const reports = [{ title: 'Login fails', severity: 'major', rows: ['http|auth|/login|500'] }];
+  writeFileSync(join(dir, 'output.json'), JSON.stringify(reports));
+
+  assert.ok(!(await (await connect(ctx, who('ana'))).client.listTools()).tools.some((t) => t.name === 'export_run'), 'members do not see it');
+  const { client, call } = await connect(ctx, who('root'));
+  assert.equal((await client.listTools()).tools.find((t) => t.name === 'export_run')?.annotations?.readOnlyHint, true);
+  const first = await call('export_run', { run_id: id });
+  const second = await call('export_run', { run_id: id, part: 2 });
+  assert.match(first.text, /^export_run 20261104T120000Z-monitor-abcdef part 1 of 2\n/);
+  assert.match(second.text, /^export_run 20261104T120000Z-monitor-abcdef part 2 of 2\n/);
+  // A whole response, header included, stays within the cap; a full part comes close to it.
+  assert.ok(first.text.length <= EXPORT_PART && first.text.length > EXPORT_PART - 20, String(first.text.length));
+  assert.ok(second.text.length <= EXPORT_PART);
+  const files = JSON.parse([first, second].map((p) => p.text.slice(p.text.indexOf('\n') + 1)).join('')) as Record<string, string>;
+  assert.deepEqual(Object.keys(files), ['input.md', 'evidence.jsonl', 'output.json']); // no challenge.json: none was written
+  assert.equal(files['input.md'], '# monitor @ abc\n\nask <email>\n');
+  const lines = files['evidence.jsonl']!.split('\n').filter(Boolean).map((l) => JSON.parse(l) as typeof item);
+  assert.deepEqual(lines[0], { ...item, text: 'login failed for <email>' });
+  assert.equal(lines[1]!.text.length, 70_000);
+  assert.deepEqual(JSON.parse(files['output.json']!), reports);
+  assert.match((await call('export_run', { run_id: id, part: 3 })).text, /^error: .* has 2 part\(s\)$/);
+
+  // Nothing to export: an unknown run, one still running, one without a folder.
+  assert.match((await call('export_run', { run_id: '20261104T120000Z-monitor-000000' })).text, /^error: no run/);
+  const running = '20261104T121500Z-monitor-abcdef';
+  ctx.engine.store.admit({ id: running, agent: 'monitor', version: 'v', trigger: 'patrol', now: new Date(), deadlineMs: 60_000, reserve: 1, agentCap: 100, globalCap: 100 });
+  assert.match((await call('export_run', { run_id: running })).text, /still running/);
+  const skipped = '20261104T123000Z-monitor-abcdef';
+  ctx.engine.store.skipped({ id: skipped, agent: 'monitor', version: 'v', trigger: 'patrol', now: new Date(), note: 'kill switch' });
+  assert.match((await call('export_run', { run_id: skipped })).text, /has no run folder/);
 });

@@ -55,16 +55,20 @@ const StoredChallenge = z.object({
   note: z.string().optional(),
 });
 
+// A run's challenge.json; undefined when there is none or it can't be read.
+export function storedChallenge(dir: string): ChallengeResult | undefined {
+  try {
+    return StoredChallenge.parse(JSON.parse(readFileSync(join(dir, 'challenge.json'), 'utf8')));
+  } catch {
+    return undefined;
+  }
+}
+
 // get_run's answer for a monitor run from before answer.md was written: its
 // reports, rendered as their cards were. A challenge.json that can't be read
 // leaves the cards unchallenged; get_run says so separately.
 export function storedMonitorAnswer(dir: string, row: RunRow, reports: StoredReport[]): string {
-  let challenge: ChallengeResult | undefined;
-  try {
-    challenge = StoredChallenge.parse(JSON.parse(readFileSync(join(dir, 'challenge.json'), 'utf8')));
-  } catch {
-    /* no challenge, or an unreadable one */
-  }
+  const challenge = storedChallenge(dir);
   const cards = reports.flatMap((r, i) => [`### Report ${i + 1}`, '', reportCard({ ...r, issue: r.issue ?? 'new' }, row.started_at, `run ${row.id}`, challenge, [], undefined, undefined, verdictOn(challenge, i + 1)).markdown, '']);
   return stripImages(redact([`# Monitor reports · run started ${row.started_at}`, '', ...cards].join('\n')));
 }

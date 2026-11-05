@@ -3,6 +3,9 @@ import { parse } from 'yaml';
 import { z } from 'zod';
 import type { Row } from './types.js';
 
+// What a rule matches on: a row, or a row key read back into its fields (the eval).
+type Fields = Pick<Row, 'section' | 'service' | 'subject' | 'status'>;
+
 const Matcher = z.object({
   section: z.string().optional(),
   service: z.string().optional(),
@@ -29,7 +32,7 @@ const compile = (m: z.infer<typeof Matcher>): Compiled => {
   }
   return c;
 };
-const matches = (c: Compiled, r: Row) =>
+const matches = (c: Compiled, r: Fields) =>
   (!c.section || c.section.test(r.section)) &&
   (!c.service || c.service.test(r.service)) &&
   (!c.route || c.route.test(r.subject)) &&
@@ -49,7 +52,7 @@ export class Noise {
     return new Noise(existsSync(file) ? parse(readFileSync(file, 'utf8')) : {});
   }
 
-  protected(r: Row): boolean {
+  protected(r: Fields): boolean {
     return this.never.some((c) => matches(c, r));
   }
 

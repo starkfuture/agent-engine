@@ -6,7 +6,7 @@ import type { LoadedAgent } from './engine/agent.js';
 import { finished, notRun, verdictOn } from './engine/challenge.js';
 import { runAgent, type Engine, type RunResult } from './engine/run.js';
 import { monitorTask } from './investigate/prompt.js';
-import { checkReport, Report, ReportShape } from './investigate/report.js';
+import { reportOutput, type Report } from './investigate/report.js';
 import { monitorTools } from './investigate/tools.js';
 import { patrolCard, pauseText, recoveredCard, reportCard, worseCard, type Card, type IssueRef } from './output/card.js';
 import type { CardSink, EmitSlack } from './output/sink.js';
@@ -406,13 +406,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
         task: monitorTask([...rowKeys], listed),
         data: renderSummary(shown, { forModel: true }),
         tools: monitorTools(tel, cfg, at),
-        output: {
-          tool: 'submit_report',
-          description: 'Submit one report per distinct problem. Call it once for every problem you found (several calls are fine). Invalid reports come back with the reason; fix and resubmit.',
-          shape: ReportShape,
-          evidenceOf: (r) => r.evidence,
-          check: (r) => checkReport(r, rowKeys, issueIds),
-        },
+        output: reportOutput(rowKeys, issueIds),
         challenge: toChannel,
         heldBy,
         onAdmitted: () => {

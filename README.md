@@ -237,6 +237,20 @@ npm run dev -- replay --from 2026-09-29T00:00:00Z --to 2026-10-01T00:00:00Z --re
 
 A recording answers only the queries it recorded, by exact text and time. A query added since is a miss (in the "not in the recording" count): the logs and traces presence checks and an error counter's scrape-target total then read "not checked" on their source, which stays as read. A miss never makes a source blind that the older queries could read. Record again to check them.
 
+### Eval from past runs
+
+A monitor run keeps its prompt (`input.md`) and every tool result its model saw (`evidence.jsonl`) for the retention (30 days). Saved as an episode, it runs again with an AI change (prompt, severity rules, model) and no telemetry:
+
+```bash
+# An admin saves a run's files over MCP (export_run, part by part) into one folder per episode,
+# optionally with label.json: {"expect": "post" | "no-post", "severity": "major", "note": "…"}
+npm run dev -- eval data/episodes/*   # real model calls: same caps and STOP file; --no-challenge skips the challenger
+```
+
+- The AI's tools keep their names and schemas but answer from the recording: the same tool with the same arguments (redacted, as stored) gets the recorded result. Any other call is an error for the model and a counted miss; so is a call recorded twice with different results (two emails, say, redact the same), counted as ambiguous.
+- The challenger runs as the patrol decides it, as far as row keys tell: rollout rows, protected journeys, or a report that would post. A big jump alone isn't seen (it needs the row's counts).
+- Each episode gets `eval-result.json`: the reports and whether each would post (the patrol's rule with no issue record: critical or major, and the challenger agrees, or a protected journey), hits, misses and ambiguous calls, cost and turns, prod's reports under the same rule, and the outcome against `label.json`: match, mismatch, or inconclusive when the author got no recorded result, a due challenge didn't finish, or the run didn't.
+
 ### Tests
 
 ```bash
@@ -323,7 +337,8 @@ claude mcp add --transport http engine http://<host>:8787/mcp --header "Authoriz
 Tools: `list_agents`, `list_repos`, `run_agent` (background; `wait_seconds` ≤ 55
 for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 `proposed_lessons`, `deploys` (code only, read-only: deploys in the last N hours,
-for one service or all); admins add `approve_lesson`, `stop_all`, `resume`.
+for one service or all); admins add `approve_lesson`, `stop_all`, `resume`,
+`export_run` (a run's files, for the eval).
 
 - Who can read a run: the requester and admins, unless the agent has `visibility: everyone` in agent.yaml (monitor, research and codebase do). Someone else's private run answers like a missing one. Agents that read customer data keep the default.
 - Requests with a browser `Origin` header are refused unless listed in `ENGINE_ALLOWED_ORIGINS`.

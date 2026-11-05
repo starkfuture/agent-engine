@@ -54,6 +54,8 @@ const active = (ctx: McpContext) => ACTIVE.get(ctx) ?? (ACTIVE.set(ctx, new Map(
 
 const RUN_ID = /^\d{8}T\d{6}Z-[a-z][a-z0-9-]*-[0-9a-f]{6}$/;
 const EV_ID = /^E-[0-9a-f]{4}-\d+$/;
+// Under Claude Code's default limit on one tool result (25k tokens).
+export const EXPORT_PART = 60_000;
 const text = (t: string) => ({ content: [{ type: 'text' as const, text: t }] });
 const err = (t: string) => ({ content: [{ type: 'text' as const, text: `error: ${t}` }], isError: true });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -442,6 +444,47 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
           return text(lines.length ? redact(`${lines.join('\n\n')}\n\nA rule that hides rows for good is a reviewed change to config/noise.yaml.`) : 'none');
         },
       );
+    // An episode for the offline eval (`eval` in the CLI): the run's prompt,
+    // every tool result its model saw, its reports and its challenge, redacted
+    // again on the way out. One response holds at most EXPORT_PART characters.
+    s.registerTool(
+      'export_run',
+      {
+        description: `Admin: one run's input.md, evidence.jsonl, output.json and challenge.json (those it has), redacted, to save as an eval episode. In parts of at most ${EXPORT_PART} characters: the first line of each says which part of how many; the rest of every part, joined in order, is one JSON object of file name → content.`,
+        inputSchema: { run_id: z.string(), part: z.number().int().min(1).optional().describe('Default 1') },
+        annotations: { readOnlyHint: true },
+      },
+      async ({ run_id, part }) => {
+        const denied = notAdminNow();
+        if (denied) return denied;
+        if (!RUN_ID.test(run_id)) return err('not a run id');
+        const row = ctx.engine.store.get(run_id);
+        if (!readable(row)) return err(`no run ${run_id}`);
+        if (row.status === 'running') return err(`${run_id} is still running; export it once it has ended`);
+        const dir = runFolder(ctx, row.agent, row.id);
+        if (!existsSync(join(dir, 'input.md'))) return err(`${run_id} has no run folder (never started, or older than the retention)`);
+        const files: Record<string, string> = {};
+        for (const name of ['input.md', 'evidence.jsonl', 'output.json', 'challenge.json']) {
+          if (!existsSync(join(dir, name))) continue;
+          const raw = readFileSync(join(dir, name), 'utf8');
+          try {
+            // JSON is redacted value by value, so it stays JSON.
+            if (name === 'input.md') files[name] = redact(raw);
+            else if (name === 'evidence.jsonl') files[name] = raw.split('\n').filter((l) => l.trim()).map((l) => `${safeJson(JSON.parse(l))}\n`).join('');
+            else files[name] = safeJson(JSON.parse(raw), 1);
+          } catch {
+            return err(`${name} of ${run_id} can't be read`);
+          }
+        }
+        const all = JSON.stringify(files);
+        const head = (n: number | string, of: number | string) => `export_run ${run_id} part ${n} of ${of}\n`;
+        const size = EXPORT_PART - head('999999', '999999').length; // room for the header: a whole response stays within EXPORT_PART
+        const parts = Math.max(1, Math.ceil(all.length / size));
+        const n = part ?? 1;
+        if (n > parts) return err(`${run_id} has ${parts} part(s)`);
+        return text(head(n, parts) + all.slice((n - 1) * size, n * size));
+      },
+    );
     s.registerTool('list_users', { description: 'Admin: users, roles and how they sign in.', inputSchema: {} }, async () => {
       const denied = notAdminNow();
       if (denied) return denied;
