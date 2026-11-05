@@ -42,7 +42,7 @@ const PERMANENT = new Set(['invalid_blocks', 'invalid_blocks_format', 'msg_too_l
 
 const NO_UNFURL = { unfurl_links: false, unfurl_media: false }; // link previews are an outbound channel
 
-export function botTransport(token: string, channel: string, timeoutMs = 10_000): Transport & { team(): Promise<string> } {
+export function botTransport(token: string, channel: string, timeoutMs = 10_000): Transport & { team(): Promise<string>; workspaceUrl(): Promise<string> } {
   const call = async (method: string, body: Record<string, unknown>) => {
     const res = await fetch(`https://slack.com/api/${method}`, {
       method: 'POST',
@@ -52,7 +52,7 @@ export function botTransport(token: string, channel: string, timeoutMs = 10_000)
     });
     if (res.status === 429) throw new SlackError('Slack: rate limited', Number(res.headers.get('retry-after') ?? 30));
     if (!res.ok) throw new SlackError(`Slack: HTTP ${res.status}`);
-    const j = (await res.json()) as { ok: boolean; ts?: string; team_id?: string; error?: string };
+    const j = (await res.json()) as { ok: boolean; ts?: string; team_id?: string; url?: string; error?: string };
     if (!j.ok) throw new SlackError(`Slack: ${j.error ?? 'unknown error'}`, j.error === 'ratelimited' ? 30 : undefined, PERMANENT.has(j.error ?? ''));
     return j;
   };
@@ -70,6 +70,42 @@ export function botTransport(token: string, channel: string, timeoutMs = 10_000)
       if (!j.team_id) throw new SlackError('Slack: auth.test returned no team');
       return j.team_id;
     },
+    // The workspace's address (https://<name>.slack.com/), for links to messages.
+    async workspaceUrl() {
+      const j = await call('auth.test', {});
+      if (!j.url) throw new SlackError('Slack: auth.test returned no url');
+      return j.url;
+    },
+  };
+}
+
+// Links to issue threads for people who can open the channel. The workspace
+// address is asked once (auth.test), and again at most every 10 minutes while
+// it fails; until then there is no link.
+export function slackPermalinks(workspaceUrl: () => Promise<string>, channel: string, o: { clock?: () => number; log?: (s: string) => void } = {}): (ts: string) => Promise<string | undefined> {
+  const clock = o.clock ?? Date.now;
+  let base: string | undefined;
+  let failedAt = -Infinity;
+  let asking: Promise<void> | undefined;
+  return async (ts) => {
+    if (!/^\d{9,10}\.\d{6}$/.test(ts) || !/^[CG][A-Z0-9]{2,20}$/.test(channel)) return undefined;
+    if (!base && clock() - failedAt >= 600_000) {
+      asking ??= workspaceUrl()
+        .then((u) => {
+          const url = new URL(u);
+          if (url.protocol !== 'https:' || !/(^|\.)slack\.com$/.test(url.hostname)) throw new Error(`not a Slack workspace address: ${url.hostname}`);
+          base = `${url.origin}/`;
+        })
+        .catch((e: unknown) => {
+          failedAt = clock();
+          o.log?.(`Slack workspace address unknown, findings have no thread links for 10 min: ${(e as Error).message}`);
+        })
+        .finally(() => {
+          asking = undefined;
+        });
+      await asking;
+    }
+    return base ? `${base}archives/${channel}/p${ts.replace('.', '')}` : undefined;
   };
 }
 

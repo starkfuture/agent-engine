@@ -18,6 +18,8 @@ import { deployLines, deploysHeading, listDeploys, workloadFor } from '../patrol
 import { METADATA_PATH, Refused, serverName, type Login } from './login.js';
 import { expiresAt, type User, type Users } from './users.js';
 import type { Issues } from '../patrol/issues.js';
+import { FEED_PATH, type FindingsApi } from '../api/http.js';
+import { KEY_ID, KEY_NAME, MAX_KEY_DAYS, SCOPES, type ApiKey } from '../api/keys.js';
 
 // The engine over MCP, for several developers. One process holds the engine:
 // budgets, run history and the kill switch stay in one place; people connect
@@ -34,6 +36,7 @@ export interface McpContext {
   log?: (s: string) => void;
   telemetry?: Telemetry; // production metrics/logs/traces, for agents with tool_pack: telemetry
   issues?: Issues; // the monitor's issue record, for noise_candidates
+  api?: FindingsApi; // GET /api/v1/findings with API keys, and the admin tools that manage them
 }
 
 interface Active {
@@ -420,7 +423,11 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       const target = ctx.users.list().find((u) => u.name === name) ?? ctx.users.byEmail(name);
       if (!target) return err(`no user ${name}`);
       if (target.name === user.name) return err('you cannot remove yourself');
-      return ctx.users.remove(target.name) ? text(`${target.name} removed`) : err(`no user ${name}`);
+      if (!ctx.users.remove(target.name)) return err(`no user ${name}`);
+      // Their API keys stop with them (the feed also checks the owner on every request).
+      const keys = ctx.api?.keys.revokeOwnedBy(target.name, user.name) ?? [];
+      for (const id of keys) ctx.log?.(`api key ${id} revoked by ${user.name}: owner ${target.name} removed`);
+      return text(`${target.name} removed${keys.length ? `; ${keys.length} API key(s) of theirs revoked` : ''}`);
     });
     // "Not an issue" clicks in Slack. Read-only: a permanent rule stays a
     // reviewed change to config/noise.yaml.
@@ -448,8 +455,82 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       const rows = ctx.users.list().map((u) => `${u.name.padEnd(16)} ${u.role.padEnd(6)} ${!u.token_sha256 ? 'keycloak' : new Date(expiresAt(u)).getTime() > Date.now() ? `token until ${new Date(expiresAt(u)).toISOString().slice(0, 10)}` : 'expired'}  ${u.email ?? ''}`);
       return text(rows.join('\n') || 'no users');
     });
+    if (ctx.api) apiKeyTools(s, ctx, ctx.api, user, notAdminNow);
   }
   return s;
+}
+
+const day = (iso: string) => iso.slice(0, 10);
+function keyLine(k: ApiKey, ownerActive: boolean, now = Date.now()): string {
+  const state = k.revoked_at
+    ? `revoked ${day(k.revoked_at)} by ${k.revoked_by}`
+    : Date.parse(k.expires_at) <= now
+      ? `expired ${day(k.expires_at)}`
+      : !ownerActive
+        ? 'dead: its owner no longer has access'
+        : `active until ${day(k.expires_at)}`;
+  return `${k.id}  ${k.name.padEnd(16)} ${k.owner.padEnd(12)} ${k.scopes.join(',')}  created ${day(k.created_at)}  last used ${k.last_used_at ? `${k.last_used_at.slice(0, 16)}Z` : 'never'}  ${state}`;
+}
+
+// API keys for the read-only findings feed. Admin-only, like inviting people:
+// a key reads production findings without a sign-in. A key never works on
+// /mcp, so it can't call these or any other tool.
+function apiKeyTools(s: McpServer, ctx: McpContext, api: FindingsApi, user: User, notAdminNow: () => ReturnType<typeof err> | undefined): void {
+  const feedUrl = `${(ctx.cfg.mcp.login?.publicUrl ?? '<engine url>').replace(/\/+$/, '')}${FEED_PATH}`;
+  s.registerTool(
+    'create_api_key',
+    {
+      description: `Admin: make an API key for a local tool (e.g. Lookout) to read the findings feed (GET ${FEED_PATH}): the engine's critical and major issues. It reads nothing else: no MCP tools, no admin actions. Shown once; only its hash is kept. Note: the key passes through this conversation.`,
+      inputSchema: {
+        name: z.string().regex(KEY_NAME).describe('What it is for, e.g. lookout-ana (2-41 of a-z 0-9 . _ -)'),
+        scopes: z.array(z.enum(SCOPES)).min(1).default(['findings:read']),
+        expires_in_days: z.number().int().min(1).max(MAX_KEY_DAYS).default(90),
+      },
+    },
+    async ({ name, scopes, expires_in_days }) => {
+      const denied = notAdminNow();
+      if (denied) return denied;
+      try {
+        const { key, secret } = api.keys.create({ name, owner: user.name, ownerEmail: user.email, ownerSince: user.added_at, scopes, days: expires_in_days });
+        ctx.log?.(`api key ${key.id} "${key.name}" created by ${user.name} (${key.scopes.join(',')}, expires ${day(key.expires_at)})`);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: [
+                `API key ${key.id} "${key.name}" · ${key.scopes.join(', ')} · expires ${day(key.expires_at)} · owner ${user.name}`,
+                `It reads GET ${feedUrl} only (header: Authorization: Bearer <key>). It stops working when revoked (revoke_api_key), when it expires, or when ${user.name} is removed.`,
+                'The key follows. It is shown this once and not stored: paste it into the tool now. Do not repeat it, summarise it or write it to a file.',
+              ].join('\n'),
+            },
+            // For the person, not the model (MCP content annotation; a client may still show it to both).
+            { type: 'text' as const, text: secret, annotations: { audience: ['user' as const], priority: 1 } },
+          ],
+        };
+      } catch (e) {
+        return err((e as Error).message);
+      }
+    },
+  );
+  s.registerTool(
+    'list_api_keys',
+    { description: 'Admin: API keys for the findings feed: id, name, owner, scopes, created, last used, and whether it is active, expired or revoked. Never the key itself.', inputSchema: {}, annotations: { readOnlyHint: true } },
+    async () => {
+      const denied = notAdminNow();
+      if (denied) return denied;
+      const keys = api.keys.list();
+      return text(keys.length ? keys.map((k) => keyLine(k, api.ownerActive(k))).join('\n') : 'no API keys');
+    },
+  );
+  s.registerTool('revoke_api_key', { description: 'Admin: revoke an API key by its id (from list_api_keys). It stops working on its next request.', inputSchema: { id: z.string().regex(KEY_ID) } }, async ({ id }) => {
+    const denied = notAdminNow();
+    if (denied) return denied;
+    const r = api.keys.revoke(id, user.name);
+    if (r === 'unknown') return err(`no API key ${id}`);
+    if (r === 'already') return text(`API key ${id} was already revoked`);
+    ctx.log?.(`api key ${id} revoked by ${user.name}`);
+    return text(`API key ${id} revoked; it stops working on its next request`);
+  });
 }
 
 // Shutdown (SIGTERM on a redeploy): stop every run this server started and
@@ -504,13 +585,17 @@ export function startHttp(ctx: McpContext, opts: { host: string; port: number })
       if (!res.headersSent) res.writeHead(code, { 'content-type': 'application/json', ...headers });
       res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: msg }, id: null }));
     };
+    let feed = false;
     try {
       const url = new URL(req.url ?? '/', 'http://x');
       if (url.pathname === '/healthz') return void res.writeHead(200).end('ok');
       // RFC 9728 puts the document at the path-suffixed form; some clients try the bare one.
       const isMetadata = url.pathname === METADATA_PATH || url.pathname === '/.well-known/oauth-protected-resource';
-      if (url.pathname !== '/mcp' && !(isMetadata && ctx.login)) return send(404, 'not found');
-      if (local && !LOOPBACK.has((req.headers.host ?? '').replace(/:\d+$/, '').replace(/^\[|\]$/g, ''))) return send(403, 'bad host');
+      feed = url.pathname === FEED_PATH && !!ctx.api;
+      // The feed answers in its own shape ({ error }), never as JSON-RPC.
+      const deny = (code: number, msg: string) => (feed ? void res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify({ error: msg })) : send(code, msg));
+      if (url.pathname !== '/mcp' && !(isMetadata && ctx.login) && !feed) return send(404, 'not found');
+      if (local && !LOOPBACK.has((req.headers.host ?? '').replace(/:\d+$/, '').replace(/^\[|\]$/g, ''))) return deny(403, 'bad host');
       if (isMetadata) {
         if (req.method !== 'GET') return send(405, 'GET only', { allow: 'GET' });
         return void res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'max-age=300' }).end(JSON.stringify(ctx.login!.metadata()));
@@ -518,9 +603,13 @@ export function startHttp(ctx: McpContext, opts: { host: string; port: number })
       // Browsers send Origin; MCP clients don't. A page in a developer's
       // browser must not drive the endpoint (MCP spec: validate Origin).
       const origin = req.headers.origin;
-      if (origin && !(ctx.cfg.mcp.allowedOrigins ?? []).includes(origin)) return send(403, 'origin not allowed');
+      if (origin && !(ctx.cfg.mcp.allowedOrigins ?? []).includes(origin)) return deny(403, 'origin not allowed');
+      // The read-only findings feed: API keys only, and no MCP server is built.
+      if (feed) return await ctx.api!.handle(req, res, url);
       const auth = req.headers.authorization ?? '';
       const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : undefined;
+      // An API key reads the findings feed and nothing else.
+      if (token?.startsWith('ae_')) return send(401, `API keys only read ${FEED_PATH}; MCP needs a sign-in`, { 'www-authenticate': ctx.login ? ctx.login.challenge() : 'Bearer' });
       let user: User | undefined;
       if (ctx.login) {
         try {
@@ -549,7 +638,12 @@ export function startHttp(ctx: McpContext, opts: { host: string; port: number })
     } catch (e) {
       const status = (e as { status?: number }).status ?? (e instanceof SyntaxError ? 400 : 500);
       ctx.log?.(`http ${status}: ${(e as Error).message}`);
-      send(status, status === 500 ? 'internal error' : (e as Error).message);
+      const msg = status === 500 ? 'internal error' : (e as Error).message;
+      if (feed) {
+        if (!res.headersSent) res.writeHead(status, { 'content-type': 'application/json' });
+        return void res.end(JSON.stringify({ error: msg }));
+      }
+      send(status, msg);
     }
   });
   server.listen(opts.port, opts.host);
