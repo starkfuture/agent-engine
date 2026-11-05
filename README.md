@@ -259,6 +259,7 @@ npm run smoke:llm    # real model, fake telemetry: the monitor + challenger end 
 | `src/investigate/` | Monitor: telemetry tools, task prompt (with the issue list), report schema. |
 | `src/output/` | Card rendering (Slack Block Kit and Markdown), the sink and the Slack outbox (bot or webhook). |
 | `src/slack/` | The buttons on an issue's message: rendering, clicks, and the Socket Mode connection. |
+| `src/api/` | The read-only findings feed (`GET /api/v1/findings`) and its API keys. |
 | `slack/` | The Slack app (manifest and Slack CLI project). |
 | `src/runner.ts`, `src/cli.ts` | Patrol orchestration (card first, challenge gate) and commands. |
 
@@ -323,7 +324,8 @@ claude mcp add --transport http engine http://<host>:8787/mcp --header "Authoriz
 Tools: `list_agents`, `list_repos`, `run_agent` (background; `wait_seconds` ≤ 55
 for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 `proposed_lessons`, `deploys` (code only, read-only: deploys in the last N hours,
-for one service or all); admins add `approve_lesson`, `stop_all`, `resume`.
+for one service or all); admins add `approve_lesson`, `stop_all`, `resume`, and
+`create_api_key`, `list_api_keys`, `revoke_api_key` for the findings feed (below).
 
 - Who can read a run: the requester and admins, unless the agent has `visibility: everyone` in agent.yaml (monitor, research and codebase do). Someone else's private run answers like a missing one. Agents that read customer data keep the default.
 - Requests with a browser `Origin` header are refused unless listed in `ENGINE_ALLOWED_ORIGINS`.
@@ -350,3 +352,39 @@ for one service or all); admins add `approve_lesson`, `stop_all`, `resume`.
 - Callers name a repo; they never pass a path. Scheduled agents (monitor) can't be started over MCP.
 - Bind is loopback by default. Anywhere else, `serve` refuses to start without the Keycloak sign-in (CLI tokens are loopback-only), and TLS goes in front (tokens travel in a header).
 - `mcp-stdio --as <user>` serves the same tools over stdio for one local user.
+
+## Findings feed for local tools (API keys)
+
+Local tools such as Lookout read the engine's findings over plain HTTP with an API key. A key reads this feed and nothing else: `/mcp` refuses it, so it can't call a tool or an admin action.
+
+A **finding is an issue** (`I-7f3a`): one cause that an AI report rated critical or major, the reports the engine itself posts (see "Issues: one cause, one thread"). Minor and noise reports, the code-only urgent rows cards and raw patrol rows are not findings.
+
+```
+GET {ENGINE_URL}/api/v1/findings?cursor=<opaque> | since=<ISO 8601, first call only>
+                                &min_level=critical|major (default major)
+                                &status=open|resolved|all (default all)
+                                &limit=1..200 (default 50)
+Authorization: Bearer ae_<id>_<secret>
+
+200 {
+  "findings": [ {
+    "id": "I-7f3a", "level": "critical"|"major", "status": "open"|"resolved",
+    "title": string, "summary": string, "services": string[], "repos": string[],
+    "runId": string|null, "url": string|null, "ack": "on_it"|"not_an_issue"|null,
+    "at": ISO, "openedAt": ISO, "resolvedAt": ISO|null
+  } ],
+  "next": "<cursor>", "more": boolean
+}
+```
+
+- **Polling:** keep `next` and pass it as `cursor`; while `more` is true, call again at once. The feed lists every issue that changed after the cursor (opened, a report linked, raised, reopened, resolved, its On it / Not an issue state, or its Slack thread arrived), once per page, with its current state, in the order of its first change. A cursor never skips a change: an issue that changes again comes again. Reminders and rows cards in its thread are not changes. Without `cursor` or `since`, the first call starts at the beginning.
+- **Why a cursor and not a time:** events carry their patrol window's time, which is up to ~15 min (plus the investigation) older than when they are written, and many share one time. A time cursor would skip what was written after a poll. `at`, `openedAt` and `resolvedAt` are patrol-window times; `at` is the latest linked report.
+- **Fields:** `summary` is the latest report's likely cause, one line, redacted again on the way out; it is model-written, so render it as plain untrusted text. `services` come from the issue's rows (never the rows themselves: subjects could hold names before #25). `repos` is `[]`: the engine has no service → repo map yet. `runId` is the latest monitor run about it (MCP `get_run`; its folder ages out after 30 days). `url` is the issue's Slack thread when it reached Slack through the bot (null for the webhook, or before it reached Slack). `ack`: On it, or Not an issue while its 7-day mute lasts (a mute kept on a resolved issue runs out without a change; if the issue comes back, its reopening is one). Titles and summaries lose Slack controls (`<@U…>`, `<!channel>`) and the issue's own row keys.
+- **Errors** are `{ "error": "…" }`: 400 a bad parameter (unknown names too), 401 a missing, unknown, revoked or expired key, or one whose maker no longer has access (`WWW-Authenticate: Bearer realm="agent-engine-api"`, never the Keycloak challenge), 403 a key without `findings:read`, 405 anything but GET, 429 over 30 requests a minute per key (burst 10; `Retry-After`), 503 the database can't be read (`Retry-After: 30`). A browser `Origin` is refused as on `/mcp`.
+
+**Keys.** Admins manage them over MCP: `create_api_key { name, scopes: ["findings:read"], expires_in_days: 1..365 (default 90) }` returns the key once, `list_api_keys` shows id, name, owner, scopes, created, last used and state (never the key), `revoke_api_key { id }`.
+- Format `ae_<12 hex id>_<43 base64url>`: 32 random bytes. Only a SHA-256 of the key is stored, in the engine's SQLite file (`api_keys`, and the append-only `api_key_events`: created, revoked), so keys survive restarts and an older image ignores them. Checked in constant time; `last_used_at` moves at most once a minute.
+- A key works while the user who made it may use the engine: `remove_user` and `user remove` revoke their keys, and a key is bound to that user record (name, email and when it was added), so someone added again later, under the same name or email, doesn't revive it.
+- Log lines say who created or revoked which key id, and which key id was refused and why (at most one line a minute per key and reason). They never carry a key. A key that leaks into text is masked like other secrets.
+- The key passes through the admin's MCP client: it is a tool result, marked for the user (`audience: ["user"]`), but a client may show it to its model too. Paste it into the tool and don't ask the model to repeat it.
+- Hosted, the feed is on the internal gateway like `/mcp` (VPN). The HTTPRoute must list `/api/v1/findings`.

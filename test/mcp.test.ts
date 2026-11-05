@@ -20,6 +20,11 @@ import { Users, type User } from '../src/mcp/users.js';
 import { fakeSession, fetchResponse, ok, readResponse, say, type Script } from './fake-session.js';
 import { cluster, ECR, FakeTelemetry, MIN, testConfig, world } from './fake.js';
 import { fakeKeycloak } from './fake-keycloak.js';
+import { DatabaseSync } from 'node:sqlite';
+import { FindingsFeed } from '../src/api/findings.js';
+import { FindingsApi } from '../src/api/http.js';
+import { ApiKeys, KEY_FORMAT } from '../src/api/keys.js';
+import { Issues } from '../src/patrol/issues.js';
 
 const tmp = (p: string) => mkdtempSync(join(tmpdir(), p));
 const lastId = (t: string) => [...t.matchAll(/evidence_id: (E-[0-9a-f]{4}-\d+)/g)].at(-1)?.[1] ?? 'none';
@@ -510,4 +515,217 @@ test('get_run on a monitor run: reports from before answer.md, an unreadable cha
   assert.doesNotMatch(research, /Slack delivery/);
   run('20261103T101500Z-monitor-abcdef', 'monitor', { 'output.json': JSON.stringify([report]) }, 'bo');
   assert.match((await (await connect(ctx, who('ana'))).call('get_run', { run_id: '20261103T101500Z-monitor-abcdef' })).text, /no run 20261103T101500Z-monitor-abcdef/);
+});
+
+// The findings feed and its API keys, on the context's engine database. Log lines are kept.
+function withApi(ctx: McpContext, rate = { burst: 100, perMinute: 6000 }) {
+  const file = join(ctx.engine.runsDir, 'engine.db');
+  const lines: string[] = [];
+  ctx.log = (l) => lines.push(l);
+  ctx.issues = new Issues(file);
+  ctx.api = new FindingsApi(new ApiKeys(file), new FindingsFeed(file), { users: ctx.users, log: ctx.log, rate });
+  return { file, lines, keys: ctx.api.keys };
+}
+
+async function listen(t: { skip: (m: string) => void; after: (f: () => void) => void }, ctx: McpContext): Promise<string | undefined> {
+  const server = startHttp(ctx, { host: '127.0.0.1', port: 0 });
+  let skipped = false;
+  await new Promise<void>((r, j) => (server.listening ? r() : server.once('listening', r).once('error', j))).catch((e: NodeJS.ErrnoException) => {
+    if (e.code !== 'EPERM') throw e;
+    t.skip('local port binding not allowed here');
+    skipped = true;
+  });
+  if (skipped) return undefined;
+  t.after(() => void server.close());
+  return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+}
+
+test('API keys over MCP: admins only, shown once, never listed, revoked with their owner', async () => {
+  const { ctx, who } = context(fakeSession());
+  const { lines, keys } = withApi(ctx);
+  const names = async (u: string) => (await (await connect(ctx, who(u))).client.listTools()).tools.map((t) => t.name);
+  for (const t of ['create_api_key', 'list_api_keys', 'revoke_api_key']) {
+    assert.ok(!(await names('ana')).includes(t), `member must not see ${t}`);
+    assert.ok((await names('root')).includes(t), `admin sees ${t}`);
+  }
+  const { client, call } = await connect(ctx, who('root'));
+  const made = (await client.callTool({ name: 'create_api_key', arguments: { name: 'lookout-root' } })) as { content: Array<{ text: string; annotations?: { audience?: string[] } }>; isError?: boolean };
+  assert.equal(made.isError, undefined);
+  assert.equal(made.content.length, 2);
+  assert.match(made.content[0]!.text, /^API key [0-9a-f]{12} "lookout-root" · findings:read · expires \d{4}-\d{2}-\d{2} · owner root$/m);
+  assert.match(made.content[0]!.text, /GET <engine url>\/api\/v1\/findings only/);
+  const secret = made.content[1]!.text;
+  assert.match(secret, KEY_FORMAT, 'the key is its own block');
+  assert.deepEqual(made.content[1]!.annotations?.audience, ['user']);
+  const id = KEY_FORMAT.exec(secret)![1]!;
+  assert.ok(!made.content[0]!.text.includes(secret));
+
+  const listed = (await call('list_api_keys')).text;
+  assert.match(listed, new RegExp(`^${id}  lookout-root +root +findings:read  created \\d{4}-\\d{2}-\\d{2}  last used never  active until \\d{4}-\\d{2}-\\d{2}$`, 'm'));
+  assert.ok(!listed.includes(secret.slice(16)), 'the list never shows the key');
+  assert.match((await call('create_api_key', { name: 'x', expires_in_days: 400 })).text, /error|Invalid|400/i);
+  assert.equal((await call('create_api_key', { name: 'x', expires_in_days: 400 })).isError, true);
+
+  assert.match((await call('revoke_api_key', { id })).text, new RegExp(`API key ${id} revoked`));
+  assert.match((await call('revoke_api_key', { id })).text, /already revoked/);
+  assert.match((await call('revoke_api_key', { id: '0123456789ab' })).text, /error: no API key/);
+  assert.match((await call('list_api_keys')).text, new RegExp(`${id} .* revoked \\d{4}-\\d{2}-\\d{2} by root`));
+  assert.equal(keys.verify(secret).ok, false);
+
+  // Removing a user revokes their keys.
+  ctx.users.setRole('bo', 'admin');
+  const bo = await connect(ctx, who('bo'));
+  const boKey = ((await bo.client.callTool({ name: 'create_api_key', arguments: { name: 'bo-laptop', expires_in_days: 7 } })) as { content: Array<{ text: string }> }).content[1]!.text;
+  assert.equal(keys.verify(boKey).ok, true);
+  assert.match((await call('remove_user', { name: 'bo' })).text, /bo removed; 1 API key\(s\) of theirs revoked/);
+  assert.equal(keys.verify(boKey).ok, false);
+
+  // Demoted after the request was admitted: no key is made.
+  ctx.users.setRole('root', 'member');
+  assert.match((await call('create_api_key', { name: 'late' })).text, /no longer an admin/);
+  assert.equal(keys.list().length, 2);
+
+  assert.ok(lines.some((l) => l.includes(`api key ${id} "lookout-root" created by root`)));
+  assert.ok(lines.some((l) => l.includes(`api key ${id} revoked by root`)));
+  for (const l of lines) assert.ok(!l.includes(secret.slice(16)) && !l.includes(boKey.slice(16)), 'no log line carries a key');
+});
+
+test('HTTP findings feed: API key only, 401/403/405/400/429/503 as documented, never MCP', async (t) => {
+  const { ctx, tokens } = context(fakeSession());
+  const { file, lines, keys } = withApi(ctx, { burst: 2, perMinute: 1 });
+  const base = await listen(t, ctx);
+  if (!base) return;
+  const I = ctx.issues!.open({ title: 'Checkout returns 500', severity: 'major', rows: ['http|ecom-service-production|POST /v3/orders|500'], hypothesis: 'Orders wait for a database connection', run: '20261105T080000Z-monitor-abc123' }, new Date('2026-11-05T08:00:00Z'));
+  const make = (owner = 'root') => {
+    const u = ctx.users.list().find((x) => x.name === owner)!;
+    return keys.create({ name: 'lookout', owner, ownerEmail: u.email, ownerSince: u.added_at, scopes: ['findings:read'], days: 30 }).secret;
+  };
+  const get = (key: string | undefined, query = '', init: RequestInit = {}) => fetch(`${base}/api/v1/findings${query}`, { ...init, headers: { ...(key ? { authorization: `Bearer ${key}` } : {}), ...(init.headers as Record<string, string>) } });
+  const secrets: string[] = [];
+
+  const anon = await get(undefined);
+  assert.equal(anon.status, 401);
+  assert.equal(anon.headers.get('www-authenticate'), 'Bearer realm="agent-engine-api"', 'not the Keycloak challenge');
+  assert.match(((await anon.json()) as { error: string }).error, /API key is required/);
+  const fake = await get(`ae_000000000000_${'x'.repeat(43)}`);
+  assert.equal(fake.status, 401);
+  assert.equal(fake.headers.get('www-authenticate'), 'Bearer realm="agent-engine-api", error="invalid_token"');
+  assert.equal((await get(tokens.ana)).status, 401, 'an MCP token is not an API key');
+
+  const key = make();
+  secrets.push(key);
+  const ok = await get(key);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get('cache-control'), 'no-store');
+  const body = (await ok.json()) as { findings: Array<Record<string, unknown>>; next: string; more: boolean };
+  assert.deepEqual(Object.keys(body), ['findings', 'next', 'more']);
+  assert.deepEqual(body.findings, [
+    {
+      id: I.id,
+      level: 'major',
+      status: 'open',
+      title: 'Checkout returns 500',
+      summary: 'Orders wait for a database connection',
+      services: ['ecom-service-production'],
+      repos: [],
+      runId: '20261105T080000Z-monitor-abc123',
+      url: null,
+      ack: null,
+      at: '2026-11-05T08:00:00.000Z',
+      openedAt: '2026-11-05T08:00:00.000Z',
+      resolvedAt: null,
+    },
+  ]);
+  assert.equal(body.more, false);
+  const again = (await (await get(key, `?cursor=${body.next}`)).json()) as { findings: unknown[]; next: string };
+  assert.deepEqual(again.findings, [], 'nothing new after the cursor');
+  assert.equal(again.next, body.next);
+  assert.ok(keys.get(KEY_FORMAT.exec(key)![1]!)!.last_used_at, 'last_used_at recorded');
+
+  // Rate limit: per key. This key has used its burst of 2.
+  const limited = await get(key);
+  assert.equal(limited.status, 429);
+  assert.ok(Number(limited.headers.get('retry-after')) >= 1);
+  const other = make();
+  secrets.push(other);
+  assert.equal((await get(other, '?min_level=critical')).status, 200, 'another key has its own limit');
+
+  // Bad parameters, other methods, a browser page.
+  const bad = await get(other, '?min_level=info');
+  assert.equal(bad.status, 400);
+  assert.match(((await bad.json()) as { error: string }).error, /critical or major/);
+  const post = await get(other, '', { method: 'POST' });
+  assert.equal(post.status, 405);
+  assert.equal(post.headers.get('allow'), 'GET');
+  const browser = await get(make(), '', { headers: { origin: 'https://evil.test' } });
+  assert.equal(browser.status, 403);
+  assert.deepEqual(await browser.json(), { error: 'origin not allowed' });
+
+  // A key without the scope; revoked, expired, and an owner who was removed.
+  const raw = new DatabaseSync(file);
+  const scoped = make();
+  raw.prepare(`UPDATE api_keys SET scopes = '["other:read"]' WHERE id = ?`).run(KEY_FORMAT.exec(scoped)![1]!);
+  const denied = await get(scoped);
+  assert.equal(denied.status, 403);
+  assert.equal(denied.headers.get('www-authenticate'), 'Bearer realm="agent-engine-api", error="insufficient_scope", scope="findings:read"');
+  const revoked = make();
+  keys.revoke(KEY_FORMAT.exec(revoked)![1]!, 'root');
+  const r401 = await get(revoked);
+  assert.equal(r401.status, 401);
+  assert.match(((await r401.json()) as { error: string }).error, /revoked/);
+  const expired = make();
+  raw.prepare(`UPDATE api_keys SET expires_at = '2026-01-01T00:00:00.000Z' WHERE id = ?`).run(KEY_FORMAT.exec(expired)![1]!);
+  const e401 = await get(expired);
+  assert.equal(e401.status, 401);
+  assert.match(((await e401.json()) as { error: string }).error, /expired/);
+  const bos = make('bo');
+  assert.equal((await get(bos)).status, 200);
+  ctx.users.remove('bo');
+  const gone = await get(bos);
+  assert.equal(gone.status, 401, 'a removed user’s key stops at once');
+  assert.match(((await gone.json()) as { error: string }).error, /no longer has access/);
+  secrets.push(scoped, revoked, expired, bos);
+
+  // An API key never opens MCP.
+  const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } } };
+  const mcp = await fetch(`${base}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${other}` }, body: JSON.stringify(init) });
+  assert.equal(mcp.status, 401);
+
+  // The database can't be read: 503, said once in the log.
+  ctx.api = new FindingsApi(keys, new FindingsFeed(join(file, 'missing', 'engine.db')), { users: ctx.users, log: ctx.log! });
+  const down = await get(make());
+  assert.equal(down.status, 503);
+  assert.equal(down.headers.get('retry-after'), '30');
+
+  assert.ok(lines.some((l) => /^api: refused key 000000000000 \(unknown\)$/.test(l)), lines.join('\n'));
+  assert.ok(lines.some((l) => / \(revoked\)$/.test(l)));
+  for (const l of lines) for (const k of secrets) assert.ok(!l.includes(k.slice(16)), 'no log line carries a key');
+});
+
+test('HTTP with the Keycloak sign-in: the feed takes API keys, /mcp refuses them with the sign-in challenge', async (t) => {
+  const { ctx } = context(fakeSession());
+  const kc = fakeKeycloak('https://agent-engine.test');
+  ctx.login = new Login(kc.cfg, kc.keys);
+  ctx.users.invite('dee@starkfuture.com', { admin: true });
+  const { keys } = withApi(ctx);
+  const base = await listen(t, ctx);
+  if (!base) return;
+  const dee = ctx.users.list().find((u) => u.name === 'dee')!;
+  const key = keys.create({ name: 'lookout-dee', owner: 'dee', ownerEmail: dee.email, ownerSince: dee.added_at, scopes: ['findings:read'], days: 1 }).secret;
+  assert.equal((await fetch(`${base}/api/v1/findings`, { headers: { authorization: `Bearer ${key}` } })).status, 200);
+  const jwt = await fetch(`${base}/api/v1/findings`, { headers: { authorization: `Bearer ${kc.token({ email: 'dee@starkfuture.com' })}` } });
+  assert.equal(jwt.status, 401, 'a sign-in token is not an API key');
+  const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } } };
+  const mcp = await fetch(`${base}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${key}` }, body: JSON.stringify(init) });
+  assert.equal(mcp.status, 401);
+  assert.equal(mcp.headers.get('www-authenticate'), 'Bearer resource_metadata="https://agent-engine.test/.well-known/oauth-protected-resource/mcp"');
+  // Removed some other way (the CLI) and invited again: the old key stays dead.
+  ctx.users.remove('dee');
+  await new Promise((r) => setTimeout(r, 5)); // a later added_at
+  ctx.users.invite('dee@starkfuture.com', { admin: true });
+  assert.equal((await fetch(`${base}/api/v1/findings`, { headers: { authorization: `Bearer ${key}` } })).status, 401, 'invited again is a new user');
+  // A CLI user under a reused name doesn't own it either.
+  ctx.users.remove('dee');
+  ctx.users.add('dee');
+  assert.equal((await fetch(`${base}/api/v1/findings`, { headers: { authorization: `Bearer ${key}` } })).status, 401);
 });

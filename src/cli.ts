@@ -12,7 +12,7 @@ import { State } from './patrol/state.js';
 import { Issues } from './patrol/issues.js';
 import { rowLine } from './patrol/summary.js';
 import { CardSink } from './output/sink.js';
-import { botTransport, SlackOutbox, webhookTransport } from './output/slack.js';
+import { botTransport, SlackOutbox, slackPermalinks, webhookTransport } from './output/slack.js';
 import { listAgents, loadAgent } from './engine/agent.js';
 import { Store } from './engine/store.js';
 import { redact } from './engine/text.js';
@@ -32,6 +32,9 @@ import { Metrics, startHealth, startMetrics } from './metrics.js';
 import { sweep } from './engine/retention.js';
 import { controlsFor } from './slack/buttons.js';
 import { startButtons } from './slack/socket.js';
+import { ApiKeys } from './api/keys.js';
+import { FindingsFeed } from './api/findings.js';
+import { FindingsApi } from './api/http.js';
 
 const USAGE = `engine <command> [options]
 
@@ -372,7 +375,10 @@ async function main() {
       const name = positionals[2];
       if (!name) throw new Error('usage: user add|remove|promote|demote <name>, user invite <email>');
       if (sub === 'remove') {
-        console.log(users.remove(name) ? `${name} removed; they lose access on their next request` : `no user ${name}`);
+        if (!users.remove(name)) return void console.log(`no user ${name}`);
+        // Their findings-feed API keys go with them.
+        const keys = new ApiKeys(join(cfg.runsDir, 'engine.db')).revokeOwnedBy(name, 'cli');
+        console.log(`${name} removed; they lose access on their next request${keys.length ? `; ${keys.length} API key(s) of theirs revoked` : ''}`);
         return;
       }
       if (sub === 'invite') {
@@ -406,6 +412,12 @@ async function main() {
         users,
         repos: loadRepos(cfg.mcp.reposFile, cfg.mcp.reposDir, cfg.mcp.reposGithub),
         issues: issueRecord(cfg),
+        // The read-only findings feed (GET /api/v1/findings) and its API keys, in the engine's database.
+        api: new FindingsApi(new ApiKeys(join(cfg.runsDir, 'engine.db')), new FindingsFeed(join(cfg.runsDir, 'engine.db')), {
+          users,
+          log,
+          ...(bot && cfg.slackChannel ? { slackLink: slackPermalinks(() => bot.workspaceUrl(), cfg.slackChannel, { log }) } : {}),
+        }),
         ...(cfg.mcp.login ? { login: new Login(cfg.mcp.login) } : {}),
         ...(cfg.mcp.notifySlack && cfg.slackWebhookUrl ? { notify: slackNotifier(cfg.slackWebhookUrl) } : {}),
         ...((): { telemetry?: Telemetry } => {
@@ -444,7 +456,7 @@ async function main() {
         await socket?.stop();
         return shutdown(ctx, 'engine shutting down', 20_000);
       };
-      log(`MCP on http://${host}:${port}/mcp · sign-in ${ctx.login ? `Keycloak ${cfg.mcp.login!.issuer} (client ${cfg.mcp.login!.clientId})` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'}`);
+      log(`MCP on http://${host}:${port}/mcp · sign-in ${ctx.login ? `Keycloak ${cfg.mcp.login!.issuer} (client ${cfg.mcp.login!.clientId})` : 'off (tokens from the CLI)'} · ${ctx.users.list().length} user(s) · ${ctx.repos.size} repo(s) · Slack notify ${ctx.notify ? 'on' : 'off'} · findings feed /api/v1/findings (${ctx.api!.keys.list().filter((k) => !k.revoked_at && Date.parse(k.expires_at) > Date.now()).length} live API key(s))`);
       if (!['127.0.0.1', '::1', 'localhost'].includes(host)) log('not loopback: put TLS in front of this; tokens travel in a header');
       const metrics = metricsServer(cfg);
       // Retention: hourly, and once at start.
