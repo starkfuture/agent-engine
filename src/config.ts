@@ -121,8 +121,14 @@ export interface Config {
     reposGithub: string | undefined; // ENGINE_REPOS_GITHUB: name=owner/repo[@ref],… (env-only hosts)
     // GitHub App (contents: read) the engine fetches those repos as.
     githubApp: { appId: string; installationId: string; privateKeyFile: string } | undefined;
+    // The investigator's telemetry tools for signed-in people (tel_*, src/mcp/telemetry-tools.ts).
+    // aggregate: ENGINE_MCP_TELEMETRY, raw (log lines, traces, PromQL): ENGINE_MCP_TELEMETRY_RAW;
+    // each off, admins or members, off by default. Calls per person in a rolling minute and per
+    // UTC day, overall and for trace_search (Tempo is shared). Unset = off.
+    telemetry?: { aggregate: Exposure; raw: Exposure; perMinute: number; perDay: number; traceSearchPerMinute: number; traceSearchPerDay: number };
   };
 }
+export type Exposure = 'off' | 'admins' | 'members';
 
 const expandHome = (p: string) => (p.startsWith('~/') ? resolve(homedir(), p.slice(2)) : resolve(p));
 // A malformed number must stop the program: NaN in a cap comparison is always
@@ -210,6 +216,13 @@ function loginConfig(env: NodeJS.ProcessEnv): Config['mcp']['login'] {
   return { issuer, jwksUrl, clientId: env.ENGINE_KC_CLIENT_ID || 'agent-engine', publicUrl, domain, admins, scopes };
 }
 
+// A typo must neither open the telemetry tools nor quietly keep them shut.
+function exposure(v: string | undefined, name: string): Exposure {
+  const x = (v ?? '').trim().toLowerCase() || 'off';
+  if (x !== 'off' && x !== 'admins' && x !== 'members') throw new Error(`${name} must be off, admins or members, got "${v}"`);
+  return x;
+}
+
 export function loadSources(file: string): Sources {
   return Sources.parse(parse(readFileSync(file, 'utf8')));
 }
@@ -267,6 +280,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
         env.GITHUB_APP_ID && env.GITHUB_APP_INSTALLATION_ID && env.GITHUB_APP_PRIVATE_KEY_FILE
           ? { appId: env.GITHUB_APP_ID, installationId: env.GITHUB_APP_INSTALLATION_ID, privateKeyFile: expandHome(env.GITHUB_APP_PRIVATE_KEY_FILE) }
           : undefined,
+      telemetry: {
+        aggregate: exposure(env.ENGINE_MCP_TELEMETRY, 'ENGINE_MCP_TELEMETRY'),
+        raw: exposure(env.ENGINE_MCP_TELEMETRY_RAW, 'ENGINE_MCP_TELEMETRY_RAW'),
+        perMinute: num(env.ENGINE_MCP_TELEMETRY_PER_MINUTE, 20, 'ENGINE_MCP_TELEMETRY_PER_MINUTE'),
+        perDay: num(env.ENGINE_MCP_TELEMETRY_PER_DAY, 300, 'ENGINE_MCP_TELEMETRY_PER_DAY'),
+        traceSearchPerMinute: num(env.ENGINE_MCP_TRACE_SEARCH_PER_MINUTE, 5, 'ENGINE_MCP_TRACE_SEARCH_PER_MINUTE'),
+        traceSearchPerDay: num(env.ENGINE_MCP_TRACE_SEARCH_PER_DAY, 50, 'ENGINE_MCP_TRACE_SEARCH_PER_DAY'),
+      },
     },
   };
 }
