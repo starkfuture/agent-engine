@@ -23,6 +23,10 @@ export interface SourceHealth {
   // Read, but not all of it: capped results, some scrape targets down, a
   // presence check not run. Shown under the blind spots; never fails the source.
   note?: string;
+  // Not even whether it reads is known: the search read nothing and the
+  // presence check failed. Neither blind nor back (output/notices.ts), and no
+  // row recovers on it (summary.ts).
+  unknown?: true;
 }
 
 export const rowKey = (r: Pick<Row, 'section' | 'service' | 'subject' | 'status'>) =>

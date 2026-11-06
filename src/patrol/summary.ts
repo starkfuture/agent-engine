@@ -107,7 +107,8 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
     (novelty === 'known' ? known : held ? waiting : send).push(f);
   }
 
-  const healthy = new Set(sources.filter(s => s.ok).map(s => s.source));
+  // A read that can't tell whether the source reads at all (unknown) shows no row back.
+  const healthy = new Set(sources.filter(s => s.ok && !s.unknown).map(s => s.source));
   const recovered = state.recovered(flagged, at, w, cfg.recoverAfterMinutes, (key, owners) => {
     if (owners?.length) return { sources: owners, ok: owners.every(source => healthy.has(source)) };
     // Conservative migration for state saved before collector ownership was
@@ -115,7 +116,7 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
     const section = key.split('|')[0];
     const prefix = section === 'http' || section === 'drop' ? 'http:' : section === 'errors' ? 'counter:' : section === 'workload' ? 'workloads' : section;
     const relevant = sources.filter(s => s.source === prefix || (prefix?.endsWith(':') && s.source.startsWith(prefix)));
-    return { sources: relevant.map(s => s.source), ok: relevant.length > 0 && relevant.every(s => s.ok) };
+    return { sources: relevant.map(s => s.source), ok: relevant.length > 0 && relevant.every(s => healthy.has(s.source)) };
   });
   const order = (a: Row, b: Row) => b.score.z - a.score.z;
   return {

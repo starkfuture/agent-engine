@@ -179,7 +179,39 @@ test('a presence query that errors proves nothing either way: the source stays a
     },
   });
   const s = await buildSummary(tel, cfg(), new Noise({}), State.memory(), AT);
-  assert.deepEqual(sourceOf(s, 'logs'), { source: 'logs', ok: true, note: 'log presence not checked (loki: HTTP 400: max query length)' });
+  // The search read nothing too: whether logs are read at all is unknown (not blind, not back), and no row recovers on it.
+  assert.deepEqual(sourceOf(s, 'logs'), { source: 'logs', ok: true, note: 'log presence not checked (loki: HTTP 400: max query length)', unknown: true });
+  // Errors read in the window show the logs are read: only the note.
+  const read = new Observed({
+    logs: (_q, _s, end) => (end.getTime() === AT.getTime() ? [{ labels: { app: 'checkout' }, tsNs: `${AT.getTime()}000000`, line: 'ERROR payment failed' }] : []),
+    logCounts: () => {
+      throw new Error('loki: HTTP 400: max query length');
+    },
+  });
+  assert.deepEqual(sourceOf(await buildSummary(read, cfg(), new Noise({}), State.memory(), AT), 'logs'), { source: 'logs', ok: true, note: 'log presence not checked (loki: HTTP 400: max query length)' });
+});
+
+test('a row does not recover on a patrol whose read is unknown, only on one that shows the source read', async () => {
+  const c = cfg(); // recovery after 15 min without firing
+  const later = (min: number) => new Date(AT.getTime() + min * MIN);
+  const burst: LogLine[] = Array.from({ length: 20 }, (_, i) => ({ labels: { app: 'checkout' }, tsNs: `${AT.getTime() - i * 1000}000000`, line: `ERROR payment failed ${i}` }));
+  const lines = (at: Date): Series[] => [{ labels: {}, points: [[at.getTime() / 1000, 4200]] }];
+  let presence: (at: Date) => Series[] = lines;
+  const tel = new Observed({ logs: (_q, _s, end) => (end.getTime() === AT.getTime() ? burst : []), logCounts: (_q, _s, end) => presence(end) });
+  const state = State.memory();
+  const first = await buildSummary(tel, c, new Noise({}), state, AT);
+  const pay = first.send.find((r) => r.section === 'logs')!.key;
+  for (const r of first.send) state.reported(r, AT);
+
+  // Nothing read, and the presence check fails: the row's quiet proves nothing.
+  presence = () => {
+    throw new Error('loki: HTTP 503');
+  };
+  const unknown = await buildSummary(tel, c, new Noise({}), state, later(15));
+  assert.equal(sourceOf(unknown, 'logs')?.unknown, true);
+  assert.deepEqual(unknown.recovered, []);
+  presence = lines;
+  assert.deepEqual((await buildSummary(tel, c, new Noise({}), state, later(30))).recovered, [pay], 'lines arrive again: back');
 });
 
 // ---- 4. the investigator's searches at their limit -------------------------------
