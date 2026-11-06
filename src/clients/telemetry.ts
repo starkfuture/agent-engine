@@ -46,6 +46,14 @@ export class SourceError extends Error {
   }
 }
 
+// A query the recording doesn't have: asked by code newer than the recording.
+// It proves nothing about the source ("not checked"), unlike an error it recorded.
+export class NotInRecording extends SourceError {
+  constructor(source: Source) {
+    super(source, 'not in recording');
+  }
+}
+
 // Caps in-flight requests per backend so a patrol (or an investigation during an
 // outage) can't pile load onto a struggling Prometheus or Loki.
 class Gate {
@@ -301,7 +309,7 @@ export class ReplayTelemetry implements Telemetry {
     const source = c.m.startsWith('prom') ? 'prometheus' : c.m.startsWith('loki') ? 'loki' : 'tempo';
     if (!hit) {
       this.misses++;
-      return Promise.reject(new SourceError(source, 'not in recording'));
+      return Promise.reject(new NotInRecording(source));
     }
     if (hit.err) return Promise.reject(new SourceError(source, `recorded error: ${hit.err}`));
     return Promise.resolve(hit.r as T);

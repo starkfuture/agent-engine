@@ -1,6 +1,6 @@
 import type { Config } from '../config.js';
 import type { Telemetry } from '../clients/telemetry.js';
-import { collectCounter, collectHttp, collectLogs, collectTraces, collectWorkloads, noteOf } from './collectors.js';
+import { collectCounter, collectHttp, collectLogs, collectTraces, collectWorkloads, noteOf, spanErrorsOf, type SpanErrors } from './collectors.js';
 import { afterDeploy, collectArgocd, collectRollouts, deployLines, deploysHeading, listDeploys, notRead, type Deploys } from './deploys.js';
 import type { Noise, NoiseRule } from './noise.js';
 import type { Novelty, State } from './state.js';
@@ -44,11 +44,30 @@ export interface Summary {
   waiting: FlaggedRow[];
   suppressed: Array<{ row: Row; rule: NoiseRule }>;
   recovered: string[];
+  // A recovered row decided without its count, and why (trace rows on a capped search).
+  recoveryNotes?: Record<string, string>;
   deploys: Deploys;
   sources: SourceHealth[];
 }
 
 type Job = { source: string; run: () => Promise<Row[]> };
+
+// A trace row whose (service, name) has no span-metric error series (most HTTP
+// roots: their error is on a child span). 'fallback': back as before, once
+// absent from the sample for the hold, with a note. 'unknown': never back while
+// the search is capped, which in prod is every patrol. Open question 5.
+const UNMAPPED_TRACE_ROWS = 'fallback' as 'fallback' | 'unknown';
+
+// A trace row absent this patrol, while the search is capped (collectors.ts, SpanErrors):
+// 'firing': its errors are above steady, so it still fires; 'steady': back after the hold;
+// 'unknown': no count to tell, so no recovery; a note: back after the hold, as before, without a count.
+function traceCount(spans: SpanErrors, key: string): 'firing' | 'steady' | 'unknown' | { note: string } {
+  if ('notChecked' in spans) return { note: 'recovered on a capped sample, count not checked' };
+  if ('unreadable' in spans) return 'unknown';
+  const score = spans.counts.get(key);
+  if (!score) return UNMAPPED_TRACE_ROWS === 'fallback' ? { note: 'recovered on a capped sample, no count' } : 'unknown';
+  return score.verdict === 'steady' ? 'steady' : 'firing';
+}
 
 export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, state: State, at: Date): Promise<Summary> {
   const w = cfg.windowMinutes;
@@ -115,7 +134,7 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
 
   // A read that can't tell whether the source reads at all (unknown) shows no row back.
   const healthy = new Set(sources.filter(s => s.ok && !s.unknown).map(s => s.source));
-  const recovered = state.recovered(flagged, at, w, cfg.recoverAfterMinutes, (key, owners) => {
+  const observe = (key: string, owners: string[] | undefined) => {
     if (owners?.length) return { sources: owners, ok: owners.every(source => healthy.has(source)) };
     // Conservative migration for state saved before collector ownership was
     // recorded: all configured collectors for this section must be healthy.
@@ -123,7 +142,22 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
     const prefix = section === 'http' || section === 'drop' ? 'http:' : section === 'errors' ? 'counter:' : section === 'workload' ? 'workloads' : section;
     const relevant = sources.filter(s => s.source === prefix || (prefix?.endsWith(':') && s.source.startsWith(prefix)));
     return { sources: relevant.map(s => s.source), ok: relevant.length > 0 && relevant.every(s => healthy.has(s.source)) };
+  };
+  // A capped trace search is a sample: a row missing from it is no proof it
+  // stopped. Its uncapped error count decides (set only when capped). A count
+  // above steady fires, as a row a noise rule hides does: the hold starts over.
+  const traces = settled[jobs.findIndex((j) => j.source === 'traces')];
+  const spans = traces?.status === 'fulfilled' ? spanErrorsOf(traces.value) : undefined;
+  const noted = new Map<string, string>();
+  const recovered = state.recovered(flagged, at, w, cfg.recoverAfterMinutes, (key, owners) => {
+    const seen = observe(key, owners);
+    if (!seen.ok || !spans || !key.startsWith('traces|')) return seen;
+    const count = traceCount(spans, key);
+    if (count === 'firing') state.firing(key, at);
+    if (typeof count === 'object') noted.set(key, count.note);
+    return { ...seen, ok: count !== 'firing' && count !== 'unknown' };
   });
+  const recoveryNotes = Object.fromEntries(recovered.filter((k) => noted.has(k)).map((k) => [k, noted.get(k)!]));
   const order = (a: Row, b: Row) => b.score.z - a.score.z;
   return {
     at: at.toISOString(),
@@ -133,6 +167,7 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
     waiting: waiting.sort(order),
     suppressed,
     recovered,
+    ...(Object.keys(recoveryNotes).length ? { recoveryNotes } : {}),
     deploys,
     sources,
   };
@@ -164,7 +199,7 @@ export function renderSummary(s: Summary, o: { forModel?: boolean } = {}): strin
   }
   if (s.known.length) out.push('', `## Still firing, already reported (${s.known.length})`, ...s.known.map((r) => `- ${rowLine(r)}`));
   if (s.waiting?.length && !o.forModel) out.push('', `## Waiting for the next patrol: news once, not investigated yet (${s.waiting.length})`, ...s.waiting.map((r) => `- ${rowLine(r)}`));
-  if (s.recovered.length) out.push('', `## Recovered since last patrol (${s.recovered.length})`, ...s.recovered.map((k) => `- ${k}`));
+  if (s.recovered.length) out.push('', `## Recovered since last patrol (${s.recovered.length})`, ...s.recovered.map((k) => `- ${k}${s.recoveryNotes?.[k] ? ` (${s.recoveryNotes[k]})` : ''}`));
   out.push('', `## ${deploysHeading(s.deploys)}`, ...deployLines(s.deploys));
   const down = s.sources.filter((x) => !x.ok);
   const part = s.sources.filter((x) => x.ok && x.note);
