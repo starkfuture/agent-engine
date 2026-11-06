@@ -41,13 +41,19 @@ export interface IssueRef {
   from?: Report['severity']; // with 'raised': the severity before
 }
 
+// Runbook links from the owners file: https on an allowed host, checked where
+// it is loaded, so they go to Slack as links. `&` is Slack's one entity in them.
+const runbookLabel = (urls: string[]) => (urls.length > 1 ? 'Runbooks' : 'Runbook');
+const runbookSlack = (urls: string[]) => `${runbookLabel(urls)}: ${urls.map((u) => `<${u.replaceAll('&', '&amp;')}>`).join(' · ')}`;
+const runbookMd = (urls: string[]) => `**${runbookLabel(urls)}:** ${urls.join(' · ')}`;
+
 // `cc`: the on-call (SLACK_ONCALL) and owner mentions from the owners file
 // (each validated where it is loaded), the only text that reaches Slack
 // unescaped. `issue`: a new issue shows its id; an update on an existing one
 // is headed by that issue, not by this report's title. `deploys`: one line of
 // recent deploys (code's), on a card that is posted anyway. `item`: the
-// challenger's verdict on this report.
-export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult, cc: string[] = [], issue?: IssueRef, deploys?: string, item?: ItemVerdict): Card {
+// challenger's verdict on this report. `runbooks`: its owners' runbook links.
+export function reportCard(raw: Report, patrolAt: string, footer: string, challenge?: ChallengeResult, cc: string[] = [], issue?: IssueRef, deploys?: string, item?: ItemVerdict, runbooks: string[] = []): Card {
   const r: Report = {
     ...raw,
     title: m(raw.title),
@@ -75,6 +81,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     `**Likely cause:** ${r.cause.hypothesis}`,
     '',
     `**Suggested fix:** ${r.suggested_fix}`,
+    ...(runbooks.length ? ['', runbookMd(runbooks)] : []),
     '',
     '**Evidence**',
     ...r.evidence.map((e) => `- ${e.id}: ${e.claim} (“${e.quote}”)`),
@@ -114,6 +121,7 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
     { type: 'context', elements: [{ type: 'mrkdwn', text: `${lead ? `${esc(lead)} · ` : ''}*${r.status}* ${esc(`since ${when(r.started_at, patrolAt)} · confidence ${r.cause.confidence}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}` }] },
     pair("What's wrong", r.what_broke, 'Impact', r.impact),
     pair('Likely cause', r.cause.hypothesis, 'Suggested fix', r.suggested_fix),
+    ...(runbooks.length ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(runbookSlack(runbooks)) }] }] : []),
     ...(doubt ? [{ type: 'section', text: { type: 'mrkdwn', text: clip(`⚠️ *A second AI check ${doubt.says}, a human decides:* ${esc(brief(noIds(m(doubt.why.join(' '))), 400))}`) } }] : []),
     ...(deploys ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(redact(deploys)), 600) }] }] : []),
     {
@@ -233,8 +241,10 @@ function fit<T>(items: T[], render: (x: T) => string, max: number, chars: number
 export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): Card {
   const d = digest(s.send, o);
   const floor = o.floor ?? DEFAULT_FLOOR;
-  const owner = (l: Line) => o.owners?.ownerOf(l.service);
+  const owner = (l: Line) => o.owners?.ownerOf(l.service)?.primary;
   const mentions = (ls: Line[]) => uniq(ls.map(owner).filter((x): x is string => !!x));
+  // The runbooks of the lines to look at, after them.
+  const runbooks = uniq(d.look.map((l) => o.owners?.ownerOf(l.service)?.runbook).filter((x): x is string => !!x));
   const cc = uniq([...(o.oncall ? [o.oncall] : []), ...mentions(d.look)]);
   const n = d.counts;
   const title = `Patrol ${minute(s.at)}: ${[n.look ? `${n.look} to look at` : 'nothing new to look at', n.ongoing ? `${n.ongoing} still ongoing` : '', n.quiet ? `${n.quiet} quiet` : ''].filter(Boolean).join(' · ')}`;
@@ -261,6 +271,7 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
   const blocks = [
     section(head1),
     ...(d.look.length ? [section(['*To look at*', ...look.shown, ...more(look.hidden, ' to look at', mentions(look.hidden))].join('\n'))] : []),
+    ...(runbooks.length ? [context(runbookSlack(runbooks))] : []),
     ...(d.ongoing.length ? [section([`*${ongoingHead}*`, ...ongoing.shown, ...more(ongoing.hidden)].join('\n'))] : []),
     ...(d.quiet.length ? [context(`_${quietHead}:_ ${[...quiet.shown, ...more(quiet.hidden)].join(' · ')}`)] : []),
     ...(deploys ? [context(SLACK.t(deploys))] : []),
@@ -271,6 +282,7 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
   const md = [
     `## ${title}${cc.length ? ` · cc ${cc.join(' ')}` : ''}`,
     ...(d.look.length ? ['', '**To look at**', ...d.look.map((l) => lookLine(MD, l, s, owner(l)))] : []),
+    ...(runbooks.length ? ['', runbookMd(runbooks)] : []),
     ...(d.ongoing.length ? ['', `**${ongoingHead}**`, ...d.ongoing.map((l) => ongoingLine(MD, l, s))] : []),
     ...(d.quiet.length ? ['', `**${quietHead}**`, ...d.quiet.map((l) => `- ${quietItem(MD, l)}`)] : []),
     ...(deploys ? ['', `_${MD.t(deploys)}_`] : []),
@@ -315,6 +327,16 @@ export function worseCard(rows: Array<{ key: string; now: number; was?: number |
   const text = `${head}: ${lines.length === 1 ? lines[0] : `${lines.length} signals`}`;
   const blocks = [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(`${esc(redact(`${head}\n${lines.map((l) => `• ${l}`).join('\n')}`))}${who}`, 2900) }] }];
   return { text: `${esc(redact(text))}${who}`, blocks, markdown: `**${head}** (On it: ${by}, no AI run)\n${lines.map((l) => `- ${l}`).join('\n')}` };
+}
+
+// ---- escalation: nobody is on an issue --------------------------------------------
+// Code's line in the issue's thread when nobody clicked On it within the owners
+// file's escalation window: it asks the backups (mentions validated where they
+// are loaded). Not shown in the channel; the mention notifies them.
+export function escalationCard(issue: string, minutes: number, backups: string[]): Card {
+  const head = `⏰ Nobody is on ${issue} after ${span(minutes * 60_000)}:`;
+  const text = `${esc(head)} ${backups.join(' ')}, can you take a look?`;
+  return { text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }], markdown: `**${head}** ${backups.join(' ')}, can you take a look?` };
 }
 
 // ---- notices: the AI paused, sources the patrol can't read ------------------------

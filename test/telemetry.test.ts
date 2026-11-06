@@ -7,6 +7,7 @@ import { DirectTelemetry, GrafanaTelemetry, SourceError } from '../src/clients/t
 import type { Engine } from '../src/engine/run.js';
 import { Store } from '../src/engine/store.js';
 import { Metrics } from '../src/metrics.js';
+import { SlackError, SlackOutbox } from '../src/output/slack.js';
 import type { PatrolResult } from '../src/runner.js';
 
 // fetch stub: records each request, answers with the given JSON.
@@ -91,6 +92,50 @@ test('metrics: heartbeat, blind spots, runs and spend in Prometheus text format'
   m2.patrol(at);
   assert.match(m2.render(engine, now), /engine_patrol_last_run_timestamp_seconds/);
   assert.doesNotMatch(m2.render(engine, now), /engine_patrol_last_success/);
+});
+
+test('metrics: the Slack outbox by status and the age of its oldest waiting post, right after the runs', async () => {
+  const runsDir = mkdtempSync(join(tmpdir(), 'runs-'));
+  const engine: Engine = { store: new Store(':memory:'), runsDir, stopFile: join(runsDir, 'STOP'), session: () => (async function* () {})(), dailyCapUsd: 30, llmAvailable: true };
+  const clock = { now: new Date('2026-11-06T10:00:00Z') };
+  const slack = { down: false };
+  const box = new SlackOutbox(':memory:', { threads: false, post: async () => (slack.down ? Promise.reject(new SlackError('Slack: HTTP 503')) : undefined) }, { now: () => clock.now, sleep: async () => {}, gapMs: 0 });
+  const post = (text: string) => box.enqueue({ kind: 'report', message: { text, blocks: [] }, keys: [], broadcast: true });
+  const m = new Metrics();
+  assert.doesNotMatch(m.render(engine, clock.now), /engine_slack_outbox/, 'no outbox: no outbox gauges');
+  m.slackOutbox(box);
+
+  post('delivered');
+  await box.flush();
+  let text = m.render(engine, clock.now);
+  assert.match(text, /^engine_slack_outbox\{status="sent"\} 1$/m);
+  assert.match(text, /^engine_slack_outbox\{status="pending"\} 0$/m, 'every status is there from 0');
+  assert.match(text, /^engine_slack_outbox\{status="gave_up"\} 0$/m);
+  assert.match(text, /^engine_slack_outbox_oldest_pending_age_seconds 0$/m);
+
+  // Slack is down: two posts wait, the oldest for 20 minutes by the next scrape.
+  slack.down = true;
+  post('waiting 1');
+  clock.now = new Date('2026-11-06T10:05:00Z');
+  post('waiting 2');
+  await box.flush();
+  clock.now = new Date('2026-11-06T10:20:00Z');
+  text = m.render(engine, clock.now);
+  assert.match(text, /^engine_slack_outbox\{status="pending"\} 2$/m);
+  assert.match(text, /^engine_slack_outbox_oldest_pending_age_seconds 1200$/m);
+  assert.match(text, /^# HELP engine_slack_outbox Slack posts in the outbox by status: pending not taken by Slack yet, failed and gave_up never delivered\.$/m);
+  assert.match(text, /^# HELP engine_slack_outbox_oldest_pending_age_seconds Age of the oldest Slack post still waiting to be delivered; 0 when none waits\.$/m);
+  for (const line of text.trim().split('\n')) assert.match(line, /^(# (HELP|TYPE) \w+ .+|\w+(\{[^}]*\})? -?[\d.e+]+)$/, line);
+  const names = text.split('\n').filter((l) => l.startsWith('# TYPE ')).map((l) => l.split(' ')[2]);
+  assert.deepEqual(names.slice(names.indexOf('engine_runs_today'), names.indexOf('engine_runs_today') + 3), ['engine_runs_today', 'engine_slack_outbox', 'engine_slack_outbox_oldest_pending_age_seconds']);
+
+  // A day later they are given up: counted as never delivered, and nothing waits.
+  slack.down = false;
+  clock.now = new Date('2026-11-07T10:30:00Z');
+  await box.flush();
+  text = m.render(engine, clock.now);
+  assert.match(text, /^engine_slack_outbox\{status="gave_up"\} 2$/m);
+  assert.match(text, /^engine_slack_outbox_oldest_pending_age_seconds 0$/m);
 });
 
 test('trace ids come back with all 32 hex digits (Tempo search drops leading zeros)', async (t) => {
