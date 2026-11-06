@@ -1,9 +1,10 @@
 import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Config, HttpFamily } from '../config.js';
-import { TEMPO_MAX_MINUTES, type LogLine, type Telemetry } from '../clients/telemetry.js';
+import { TEMPO_MAX_MINUTES, type LogLine, type Sample, type Telemetry } from '../clients/telemetry.js';
 import type { Evidence } from '../engine/evidence.js';
 import type { ToolFactory } from '../engine/run.js';
+import { requireSeries, workloadOf } from '../patrol/collectors.js';
 import { deployLines, deploysHeading, listDeploys } from '../patrol/deploys.js';
 import { fence, identitiesOf, redact, templateOf, truncate } from '../engine/text.js';
 
@@ -65,6 +66,241 @@ async function limitCut(tel: Telemetry, sel: string, lines: LogLine[], end: Date
     out.push(`per-${step}-minute counts not available (${(e as Error).message})`);
   }
   return out;
+}
+
+const minute = (sec: number) => `${new Date(sec * 1000).toISOString().slice(0, 16)}Z`;
+function since(fromSec: number, at: Date): string {
+  const m = Math.max(0, Math.round((at.getTime() / 1000 - fromSec) / 60));
+  return m >= 1440 ? `${Math.floor(m / 1440)}d${Math.floor((m % 1440) / 60)}h` : m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m` : `${m}m`;
+}
+
+// ---- firing_alerts -------------------------------------------------------------
+// Left out: always-on alerts, the engine's own, and routing tests
+// (JourneyRouteTest is one; the Journey* customer journeys stay).
+const ALERTS_SKIP = 'Watchdog|InfoInhibitor|AgentEngine.*|.*RouteTest';
+// Info alerts that fire most of the week (the rules backtest drops both): one count line.
+const NOISY_ALERTS = new Set(['PostgresPodPoolSaturated', 'CPUThrottlingHigh']);
+const ALERT_OBJECTS = ['service', 'app', 'deployment', 'statefulset', 'pod', 'container', 'persistentvolumeclaim', 'horizontalpodautoscaler', 'datname'];
+const SEVERITY_RANK: Record<string, number> = { critical: 0, error: 1, warning: 2, info: 3, none: 4 };
+
+interface Alert {
+  name: string;
+  ns: string; // ecom_namespace when set: a Slack copy's original namespace
+  severity: string;
+  firing: boolean;
+  copy: boolean;
+  objects: Record<string, string>;
+  since?: number;
+  copies: Set<string>;
+}
+
+// ALERTS_FOR_STATE carries the alert's labels without alertstate.
+const alertKey = (l: Record<string, string>) =>
+  JSON.stringify(
+    Object.keys(l)
+      .filter((k) => k !== '__name__' && k !== 'alertstate')
+      .sort()
+      .map((k) => [k, l[k]]),
+  );
+
+function alertOf(l: Record<string, string>, activeSince: Map<string, number>): Alert {
+  const objects: Record<string, string> = {};
+  // An alert on a kube-state-metrics series with no pod or service of its own
+  // carries the exporter's: that names kube-state-metrics, not what is wrong.
+  for (const k of ALERT_OBJECTS) if (l[k] && !l[k]!.includes('kube-state-metrics')) objects[k] = l[k]!;
+  return { name: l.alertname ?? '?', ns: l.ecom_namespace || l.namespace || '', severity: l.severity || 'none', firing: l.alertstate !== 'pending', copy: Boolean(l.ecom_namespace), objects, since: activeSince.get(alertKey(l)), copies: new Set() };
+}
+
+// A Slack copy fires next to its original, on the same object in the same
+// namespace. An original aggregated past every label (PostgresDeadlocks is a
+// bare sum) has no namespace and names no object, so it pairs on its name alone.
+function sameObject(a: Alert, b: Alert): boolean {
+  const shared = Object.keys(a.objects).filter((k) => k in b.objects);
+  const bare = !Object.keys(a.objects).length || !Object.keys(b.objects).length;
+  return (a.ns === b.ns || !a.ns || !b.ns) && (shared.length > 0 || bare) && shared.every((k) => a.objects[k] === b.objects[k]);
+}
+
+async function firingAlerts(tel: Telemetry, cfg: Config, at: Date, a: { namespace?: string; include_pending: boolean; max: number }): Promise<string> {
+  const ns = a.namespace;
+  const scoped = (sel: string) => (ns ? `${withMatcher(sel, `namespace=~${q(ns)}`)} or ${withMatcher(sel, `ecom_namespace=~${q(ns)}`)}` : sel);
+  const [res, state] = await Promise.all([
+    tel.promInstant(scoped(`ALERTS{alertname!~${q(ALERTS_SKIP)}}`), at),
+    tel.promInstant(scoped(`ALERTS_FOR_STATE{alertname!~${q(ALERTS_SKIP)}}`), at).catch((e: Error) => e),
+  ]);
+  const activeSince = new Map(state instanceof Error ? [] : state.map((s) => [alertKey(s.labels), s.value]));
+  const all = res.map((s) => alertOf(s.labels, activeSince));
+  const shown = all.filter((x) => x.firing || a.include_pending);
+  const hiddenPending = all.length - shown.length;
+  const noisy = shown.filter((x) => NOISY_ALERTS.has(x.name) && (x.severity === 'info' || x.severity === 'none'));
+  // A copy folds into its original (its name after "Ecom"), so one condition
+  // counts once; another alert on the same object is another condition.
+  const folded = new Set<Alert>();
+  for (const c of shown.filter((x) => x.copy)) {
+    const o = shown.find((x) => !x.copy && x.name.endsWith(c.name.replace(/^Ecom/, '')) && sameObject(c, x));
+    if (o) {
+      o.copies.add(c.name);
+      o.ns ||= c.ns; // a namespace-less original is listed where its copy says it fires
+      folded.add(c);
+    }
+  }
+  const rest = shown.filter((x) => !folded.has(x) && !noisy.includes(x));
+  const watched = new RegExp(`^(?:${cfg.sources.workloads.namespaces})$`);
+  const listed = ns ? rest : rest.filter((x) => watched.test(x.ns));
+  const others = ns ? [] : rest.filter((x) => !watched.test(x.ns));
+
+  const groups = new Map<string, Alert[]>();
+  for (const x of listed) {
+    const k = [x.name, x.ns, x.severity, x.firing, x.copy].join('\u0000');
+    groups.set(k, [...(groups.get(k) ?? []), x]);
+  }
+  const rank = (x: Alert) => [watched.test(x.ns) ? 0 : 1, SEVERITY_RANK[x.severity] ?? 5, x.firing ? 0 : 1];
+  const ordered = [...groups.values()].sort((g, h) => {
+    const [r, s] = [rank(g[0]!), rank(h[0]!)];
+    return r[0]! - s[0]! || r[1]! - s[1]! || r[2]! - s[2]! || h.length - g.length || g[0]!.name.localeCompare(h[0]!.name);
+  });
+
+  const what = a.include_pending ? 'firing or pending' : 'firing';
+  const where = ns ? 'in this scope' : 'in the watched namespaces';
+  const out = [
+    `alerts at ${at.toISOString()} (Prometheus ALERTS; left out: Watchdog, InfoInhibitor, AgentEngine*, *RouteTest).`,
+    "Context, not proof of cause: an alert says its rule's condition holds, not why. Confirm with the other tools before citing one as the cause.",
+    ns ? `scope: namespace or ecom_namespace =~ ${q(ns)}` : `scope: the watched namespaces (${cfg.sources.workloads.namespaces}) listed; others as counts (pass namespace to list them)`,
+  ];
+  if (state instanceof Error) out.push(`active-since times not available (ALERTS_FOR_STATE: ${state.message})`);
+  out.push(listed.length ? `${listed.length} ${what} ${where}, in ${ordered.length} groups:` : `none ${what} ${where} (the query succeeded${all.length ? '; what it returned is counted below' : ' and returned none'})`);
+  let budget = a.max;
+  for (const g of ordered) {
+    const x = g[0]!;
+    const first = Math.min(...g.map((y) => y.since ?? Infinity));
+    const copies = [...new Set(g.flatMap((y) => [...y.copies]))];
+    const objs = g.map((y) => Object.entries(y.objects).map(([k, v]) => `${k}=${v}`).join(' ')).filter(Boolean);
+    const take = objs.slice(0, Math.max(0, budget));
+    budget -= take.length;
+    out.push(
+      `- ${x.name} [${x.severity}] ${x.ns || '(no namespace)'}${x.copy ? ' (Slack copy; no original fires on the same object)' : ''}: ${g.length} ${x.firing ? 'firing' : 'pending'}` +
+        (Number.isFinite(first) ? `, active since ${minute(first)} (${since(first, at)})` : '') +
+        (copies.length ? `, also sent to Slack as ${copies.join(', ')}` : '') +
+        (take.length ? `: ${take.join('; ')}` : '') +
+        (objs.length > take.length ? ` (+${objs.length - take.length} more)` : ''),
+    );
+  }
+  const counts = (xs: Alert[], by: (x: Alert) => string) => {
+    const m = new Map<string, number>();
+    for (const x of xs) m.set(by(x), (m.get(by(x)) ?? 0) + 1);
+    return [...m].sort((p, r) => r[1] - p[1]);
+  };
+  if (noisy.length)
+    out.push(
+      `known-noisy info alerts (firing most of the week), counted only: ${counts(noisy, (x) => x.name)
+        .map(([name, n]) => `${name} ${n} (${counts(noisy.filter((x) => x.name === name), (x) => x.ns || '(no namespace)').map(([w, k]) => `${w} ${k}`).join(', ')})`)
+        .join('; ')}`,
+    );
+  if (others.length)
+    out.push(
+      `other namespaces (not watched; pass namespace to list them): ${counts(others, (x) => x.ns || '(no namespace)')
+        .map(([w, n]) => {
+          const here = others.filter((x) => (x.ns || '(no namespace)') === w);
+          const sev = counts(here, (x) => x.severity).map(([s, k]) => `${s} ${k}`).join(', ');
+          const names = counts(here, (x) => x.name).slice(0, 5).map(([name]) => name).join(', ');
+          return `${w} ${n} (${sev}: ${names})`;
+        })
+        .join('; ')}`,
+    );
+  if (hiddenPending) out.push(`pending, not shown: ${hiddenPending} (include_pending: true lists them)`);
+  return out.join('\n');
+}
+
+// ---- pod_status --------------------------------------------------------------------
+const PODS_LISTED_MAX = 30; // evidence is cut at 9,000 chars
+const literal = (s: string) => s.replace(/[\\.+*?()|[\]{}^$]/g, '\\$&'); // RE2 metacharacters
+
+interface Pod {
+  ns: string;
+  name: string;
+  workload: string;
+  ready: boolean;
+  phase: string;
+  waiting: string[];
+  terminated: string[];
+  r1: number;
+  r6: number;
+  start?: number;
+}
+
+// -2 completed, -1 healthy, 0.. needs attention (lower first).
+const podRank = (p: Pod) => (p.phase === 'Succeeded' ? -2 : p.phase === 'Failed' ? 4 : !p.ready ? 0 : p.waiting.length ? 1 : p.r1 > 0 ? 2 : p.r6 > 0 ? 3 : -1);
+
+async function podStatus(tel: Telemetry, at: Date, namespace: string, workload: string | undefined): Promise<string> {
+  const ns = `namespace=~${q(namespace)}`;
+  const sel = workload ? `${ns},pod=~${q(`${literal(workload)}.*`)}` : ns;
+  // Waiting and terminated series exist only while a container is in that
+  // state, so their absence reads as "none" only once kube-state-metrics is
+  // known to be read here.
+  // One series per pod and condition (true, false, unknown): count one condition.
+  const present = await requireSeries(tel, `kube_pod_status_ready{${ns},condition="true"}`, at, 'kube-state-metrics').catch((e: Error) => {
+    if (!e.message.startsWith('no kube-state-metrics series')) throw e;
+    throw new Error(`kube-state-metrics missing (not a quiet system): no kube_pod_status_ready series for ${ns} at ${at.toISOString()}. kube-state-metrics is not being read, or no namespace matches; this says nothing about whether pods are ready.`);
+  });
+  const [ready, phase, waiting, terminated, r1, r6, starts] = await Promise.all([
+    tel.promInstant(`kube_pod_status_ready{${sel},condition="true"}`, at),
+    tel.promInstant(`kube_pod_status_phase{${sel}} == 1`, at),
+    tel.promInstant(`kube_pod_container_status_waiting_reason{${sel}} > 0`, at),
+    tel.promInstant(`kube_pod_container_status_last_terminated_reason{${sel}} > 0`, at),
+    tel.promInstant(`sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total{${sel}}[1h]))`, at),
+    tel.promInstant(`sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total{${sel}}[6h]))`, at),
+    tel.promInstant(`kube_pod_start_time{${sel}}`, at),
+  ]);
+  const key = (l: Record<string, string>) => `${l.namespace}/${l.pod}`;
+  const pods = new Map<string, Pod>();
+  for (const s of ready) pods.set(key(s.labels), { ns: s.labels.namespace ?? '?', name: s.labels.pod ?? '?', workload: workloadOf(s.labels.pod ?? '?'), ready: s.value === 1, phase: '?', waiting: [], terminated: [], r1: 0, r6: 0 });
+  const each = (xs: Sample[], f: (p: Pod, s: Sample) => void) => {
+    for (const s of xs) {
+      const p = pods.get(key(s.labels));
+      if (p && Number.isFinite(s.value)) f(p, s);
+    }
+  };
+  each(phase, (p, s) => (p.phase = s.labels.phase ?? '?'));
+  each(waiting, (p, s) => p.waiting.push(`${s.labels.container ?? '?'}=${s.labels.reason ?? '?'}`));
+  each(terminated, (p, s) => p.terminated.push(`${s.labels.container ?? '?'}=${s.labels.reason ?? '?'}`));
+  each(r1, (p, s) => (p.r1 += Math.round(s.value)));
+  each(r6, (p, s) => (p.r6 += Math.round(s.value)));
+  each(starts, (p, s) => (p.start = s.value));
+  if (!pods.size) return `No pods match ${sel} at ${at.toISOString()} (kube-state-metrics reports ${present} pods for ${ns}).`;
+
+  const all = [...pods.values()];
+  const wl = (p: Pod) => `${p.ns}/${p.workload}`;
+  const workloads = new Set(all.map(wl));
+  const attention = all.filter((p) => podRank(p) >= 0).sort((a, b) => podRank(a) - podRank(b) || b.r6 - a.r6 || a.name.localeCompare(b.name));
+  const healthy = all.filter((p) => podRank(p) === -1);
+  const completed = all.filter((p) => podRank(p) === -2).length;
+  const out = [
+    `pods at ${at.toISOString()} in ${ns}${workload ? ` with names starting ${q(workload)}` : ''}: ${all.length} pods in ${workloads.size} workloads, ${all.filter((p) => p.ready).length} ready.`,
+    'Readiness flips during a rollout are normal (new pods start not ready while old ones stop): check recent_changes before calling a not-ready pod a problem.',
+  ];
+  if (!attention.length) out.push('needing attention: none (every pod is ready, nothing is waiting, no restarts in the last 6 h)');
+  else {
+    out.push(`needing attention (not ready, waiting, restarted in the last 6 h, or failed): ${attention.length} pods. "last terminated" is a container's most recent exit, which may be old.`);
+    let listed = 0;
+    for (const w of [...new Set(attention.map(wl))]) {
+      if (listed >= PODS_LISTED_MAX) break;
+      const mine = attention.filter((x) => wl(x) === w);
+      // Out of the pods that are meant to be up: completed and failed (evicted) ones are not.
+      const live = all.filter((p) => wl(p) === w && p.phase !== 'Succeeded' && p.phase !== 'Failed');
+      out.push(`${mine[0]!.workload} [${mine[0]!.ns}]: ${live.filter((p) => p.ready).length} of ${live.length} ready`);
+      for (const p of mine) {
+        if (listed++ >= PODS_LISTED_MAX) break;
+        const bits = [p.ready ? 'ready' : 'NOT READY', p.phase];
+        if (p.waiting.length) bits.push(`waiting ${p.waiting.join(' ')}`);
+        if (p.r1 || p.r6) bits.push(`restarts ${p.r1} in 1 h / ${p.r6} in 6 h`);
+        if (p.terminated.length) bits.push(`last terminated ${p.terminated.join(' ')}`);
+        if (p.start) bits.push(`started ${new Date(p.start * 1000).toISOString().replace('.000Z', 'Z')}`);
+        out.push(`  ${p.name}: ${bits.join(', ')}`);
+      }
+    }
+    if (attention.length > PODS_LISTED_MAX) out.push(`+${attention.length - PODS_LISTED_MAX} more pods needing attention not listed: narrow with workload`);
+  }
+  out.push(`healthy: ${healthy.length} pods ready and Running, nothing waiting, no restarts in 6 h (${new Set(healthy.map(wl)).size} workloads)${completed ? `; completed (Succeeded): ${completed}` : ''}`);
+  return out.join('\n');
 }
 
 // Read-only telemetry tools, anchored at `at` (the patrol time) so a replay of
@@ -214,6 +450,15 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
       }),
     ),
     tool(
+      'pod_status',
+      'Pod readiness across a namespace (kube-state-metrics): not-ready, waiting, recently restarted and failed pods first, by workload, with phase, waiting and last termination reasons, restarts in 1 h and 6 h, start time; healthy pods as one count. Readiness flips during a rollout are normal: see recent_changes.',
+      {
+        namespace: z.string().min(1).max(200).optional().describe('Namespace, exact or regex (default: the watched namespaces)'),
+        workload: z.string().min(2).max(200).optional().describe('Pod name prefix: a Deployment or StatefulSet name, e.g. "ecom-service-production"'),
+      },
+      guard('pod_status', async ({ namespace, workload }) => podStatus(tel, at, namespace ?? cfg.sources.workloads.namespaces, workload)),
+    ),
+    tool(
       'recent_changes',
       'Deploys in the last N hours: new ReplicaSets (scaling is not a deploy), with time, image old → new and rollout state (complete in N min, rolling, stalled, rolled back). Also StatefulSets rolling now, and Argo CD syncs when scraped.',
       { hours: z.number().int().min(1).max(72).default(24) },
@@ -221,6 +466,16 @@ function buildTools(tel: Telemetry, cfg: Config, at: Date, evidence: Evidence, b
         const d = await listDeploys(tel, cfg.sources, at, hours);
         return [`${deploysHeading(d)}:`, ...deployLines(d)].join('\n');
       }),
+    ),
+    tool(
+      'firing_alerts',
+      'Prometheus alerts firing at the patrol time, grouped by alert, namespace and severity, with the objects they name and how long they have been active; watched namespaces listed, others counted. Context, not proof of cause: an alert says a condition holds, not why. Routing tests and always-on alerts left out; known-noisy info alerts counted.',
+      {
+        namespace: z.string().min(1).max(200).optional().describe('Namespace, exact or regex; lists every alert there'),
+        include_pending: z.boolean().default(false),
+        max: z.number().int().min(1).max(200).default(40).describe('Most alerts listed with their objects; the rest are counted'),
+      },
+      guard('firing_alerts', async (a) => firingAlerts(tel, cfg, at, a)),
     ),
     tool(
       'promql',
