@@ -102,20 +102,25 @@ test('trace ids come back with all 32 hex digits (Tempo search drops leading zer
   assert.equal(full!.traceId, '0123456789abcdef0123456789abcdef');
 });
 
-test('metrics: tokens today by agent and kind', () => {
+test('metrics: tokens today by agent, role and kind; the challenger role only where a challenge recorded tokens', () => {
   const runsDir = mkdtempSync(join(tmpdir(), 'runs-'));
   const store = new Store(':memory:');
   const engine: Engine = { store, runsDir, stopFile: join(runsDir, 'STOP'), session: () => (async function* () {})(), dailyCapUsd: 30, llmAvailable: true };
   const now = new Date();
   for (const id of ['r1', 'r2']) {
     store.admit({ id, agent: 'monitor', version: 'v', trigger: 't', now, deadlineMs: 60_000, reserve: 2, agentCap: 10, globalCap: 30 });
-    store.settle(id, { status: 'ok', cost: 0.4, turns: 3, outputs: 1, tokens: { input: 10, output: 2, cacheRead: 300, cacheWrite: 40 }, now });
+    store.settle(id, { status: 'ok', cost: 0.4, turns: 3, outputs: 1, tokens: { input: 10, output: 2, cacheRead: 300, cacheWrite: 40 }, ...(id === 'r2' ? { challengeTokens: { input: 5, output: 7, cacheRead: 900, cacheWrite: 60 } } : {}), now });
   }
+  store.admit({ id: 'c1', agent: 'codebase', version: 'v', trigger: 't', now, deadlineMs: 60_000, reserve: 2, agentCap: 10, globalCap: 30 });
+  store.settle('c1', { status: 'ok', cost: 0.1, turns: 1, outputs: 1, tokens: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }, now });
   const text = new Metrics().render(engine, now);
-  assert.match(text, /^# HELP engine_tokens_today Tokens used by runs started today \(UTC\), by agent and kind\.$/m);
-  assert.match(text, /^engine_tokens_today\{agent="monitor",kind="input"\} 20$/m);
-  assert.match(text, /^engine_tokens_today\{agent="monitor",kind="cache_read"\} 600$/m);
-  assert.match(text, /^engine_tokens_today\{agent="monitor",kind="cache_write"\} 80$/m);
+  assert.match(text, /^# HELP engine_tokens_today Tokens used by runs started today \(UTC\), by agent, session role \(author or challenger\) and kind\.$/m);
+  assert.match(text, /^engine_tokens_today\{agent="monitor",role="author",kind="input"\} 20$/m);
+  assert.match(text, /^engine_tokens_today\{agent="monitor",role="author",kind="cache_read"\} 600$/m);
+  assert.match(text, /^engine_tokens_today\{agent="monitor",role="author",kind="cache_write"\} 80$/m);
+  assert.match(text, /^engine_tokens_today\{agent="monitor",role="challenger",kind="cache_read"\} 900$/m);
+  assert.match(text, /^engine_tokens_today\{agent="codebase",role="author",kind="input"\} 1$/m);
+  assert.doesNotMatch(text, /agent="codebase",role="challenger"/);
   assert.ok(text.indexOf('engine_tokens_today') > text.indexOf('engine_spend_cap_usd'));
   for (const line of text.trim().split('\n')) assert.match(line, /^(# (HELP|TYPE) \w+ .+|\w+(\{[^}]*\})? -?[\d.e+]+)$/, line);
 });

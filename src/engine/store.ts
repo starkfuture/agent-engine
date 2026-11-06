@@ -31,6 +31,12 @@ export interface RunRow {
   output_tokens: number | null;
   cache_read_tokens: number | null;
   cache_write_tokens: number | null;
+  // The same for the challenger session; null when no challenge ran or it
+  // ended without a result event.
+  challenge_input_tokens: number | null;
+  challenge_output_tokens: number | null;
+  challenge_cache_read_tokens: number | null;
+  challenge_cache_write_tokens: number | null;
 }
 
 export interface Admission {
@@ -90,7 +96,7 @@ export class Store {
     if (!cols.has('requested_by')) this.db.exec(`ALTER TABLE runs ADD COLUMN requested_by TEXT`);
     if (!cols.has('heartbeat_at')) this.db.exec(`ALTER TABLE runs ADD COLUMN heartbeat_at TEXT`);
     if (!cols.has('build')) this.db.exec(`ALTER TABLE runs ADD COLUMN build TEXT`);
-    for (const c of ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens']) if (!cols.has(c)) this.db.exec(`ALTER TABLE runs ADD COLUMN ${c} INTEGER`);
+    for (const c of ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'challenge_input_tokens', 'challenge_output_tokens', 'challenge_cache_read_tokens', 'challenge_cache_write_tokens']) if (!cols.has(c)) this.db.exec(`ALTER TABLE runs ADD COLUMN ${c} INTEGER`);
   }
 
   private tx<T>(fn: () => T): T {
@@ -154,10 +160,13 @@ export class Store {
     });
   }
 
-  settle(id: string, s: { status: Exclude<RunStatus, 'running'>; cost: number; turns: number; outputs: number; challenge?: string; note?: string; tokens?: Tokens; now: Date }): void {
+  settle(id: string, s: { status: Exclude<RunStatus, 'running'>; cost: number; turns: number; outputs: number; challenge?: string; note?: string; tokens?: Tokens; challengeTokens?: Tokens; now: Date }): void {
+    const t = (x: Tokens | undefined) => [x?.input ?? null, x?.output ?? null, x?.cacheRead ?? null, x?.cacheWrite ?? null];
     this.db
-      .prepare(`UPDATE runs SET status = ?, cost = ?, turns = ?, outputs = ?, challenge = ?, note = ?, ended_at = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ? WHERE id = ?`)
-      .run(s.status, s.cost, s.turns, s.outputs, s.challenge ?? null, s.note ?? null, s.now.toISOString(), s.tokens?.input ?? null, s.tokens?.output ?? null, s.tokens?.cacheRead ?? null, s.tokens?.cacheWrite ?? null, id);
+      .prepare(
+        `UPDATE runs SET status = ?, cost = ?, turns = ?, outputs = ?, challenge = ?, note = ?, ended_at = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?, challenge_input_tokens = ?, challenge_output_tokens = ?, challenge_cache_read_tokens = ?, challenge_cache_write_tokens = ? WHERE id = ?`,
+      )
+      .run(s.status, s.cost, s.turns, s.outputs, s.challenge ?? null, s.note ?? null, s.now.toISOString(), ...t(s.tokens), ...t(s.challengeTokens), id);
   }
 
   // A run that never started, recorded so `runs` shows why.
@@ -198,13 +207,22 @@ export class Store {
     return this.db.prepare(`SELECT agent, status, COUNT(*) AS n FROM runs WHERE day = ? GROUP BY agent, status ORDER BY agent, status`).all(day) as unknown as Array<{ agent: string; status: string; n: number }>;
   }
 
-  // Tokens of runs started on a UTC day, by agent (metrics). Runs with no
-  // recorded tokens add nothing.
-  tokens(day: string): Array<{ agent: string } & Tokens> {
+  // Tokens of runs started on a UTC day, by agent and session role (metrics).
+  // Runs with no recorded tokens add nothing; the challenger role is listed
+  // only for agents that recorded challenger tokens that day.
+  tokens(day: string): Array<{ agent: string; role: 'author' | 'challenger' } & Tokens> {
+    const sum = (c: string) => `COALESCE(SUM(${c}), 0)`;
     const rows = this.db
-      .prepare(`SELECT agent, COALESCE(SUM(input_tokens), 0) AS input, COALESCE(SUM(output_tokens), 0) AS output, COALESCE(SUM(cache_read_tokens), 0) AS cacheRead, COALESCE(SUM(cache_write_tokens), 0) AS cacheWrite FROM runs WHERE day = ? GROUP BY agent ORDER BY agent`)
-      .all(day) as unknown as Array<{ agent: string } & Tokens>;
-    return rows.map((r) => ({ ...r }));
+      .prepare(
+        `SELECT agent, ${sum('input_tokens')} AS input, ${sum('output_tokens')} AS output, ${sum('cache_read_tokens')} AS cacheRead, ${sum('cache_write_tokens')} AS cacheWrite,
+           COUNT(challenge_input_tokens) AS challenged, ${sum('challenge_input_tokens')} AS cInput, ${sum('challenge_output_tokens')} AS cOutput, ${sum('challenge_cache_read_tokens')} AS cCacheRead, ${sum('challenge_cache_write_tokens')} AS cCacheWrite
+         FROM runs WHERE day = ? GROUP BY agent ORDER BY agent`,
+      )
+      .all(day) as unknown as Array<{ agent: string; challenged: number; cInput: number; cOutput: number; cCacheRead: number; cCacheWrite: number } & Tokens>;
+    return rows.flatMap((r) => [
+      { agent: r.agent, role: 'author' as const, input: r.input, output: r.output, cacheRead: r.cacheRead, cacheWrite: r.cacheWrite },
+      ...(r.challenged ? [{ agent: r.agent, role: 'challenger' as const, input: r.cInput, output: r.cOutput, cacheRead: r.cCacheRead, cacheWrite: r.cCacheWrite }] : []),
+    ]);
   }
 
   get(id: string): RunRow | undefined {

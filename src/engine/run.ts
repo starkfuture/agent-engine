@@ -401,6 +401,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
       turns,
       outputs: outputs.length,
       ...(tokens ? { tokens } : {}),
+      ...(challengeResult?.tokens ? { challengeTokens: challengeResult.tokens } : {}),
       now: clock(),
       ...(challengeResult ? { challenge: challengeResult.verdict } : {}),
       ...(note ? { note } : {}),
