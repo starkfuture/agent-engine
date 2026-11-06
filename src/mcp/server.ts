@@ -16,6 +16,7 @@ import type { Telemetry } from '../clients/telemetry.js';
 import { monitorTools } from '../investigate/tools.js';
 import { deployLines, deploysHeading, listDeploys, workloadFor } from '../patrol/deploys.js';
 import { METADATA_PATH, Refused, serverName, type Login } from './login.js';
+import { spendLines, STATUS_TOOL, statusText } from './status.js';
 import { expiresAt, type User, type Users } from './users.js';
 import type { Issues } from '../patrol/issues.js';
 
@@ -293,32 +294,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
   s.registerTool(
     'spend',
     { description: 'Spend today and this month against the caps, by agent, and yours.', inputSchema: {}, annotations: { readOnlyHint: true } },
-    async () => {
-      const st = ctx.engine.store;
-      const d = today();
-      const here = agentsHere(ctx);
-      const agents = here.map((a) => `  ${a.spec.name.padEnd(9)} $${st.spent(d, a.spec.name).toFixed(2)} of $${a.spec.limits.usd_per_day}`);
-      // An agent's monthly share (the monitor's): what it leaves of the monthly cap is kept for people.
-      const month = ctx.engine.monthlyCapUsd;
-      const shares = here.flatMap((a) => {
-        const cap = ctx.engine.agentMonthlyCapUsd?.[a.spec.name];
-        if (cap === undefined) return [];
-        const kept = month !== undefined && month > cap ? ` (the other $${month - cap} of $${month} is kept for people)` : '';
-        return [`${a.spec.name} $${st.spent(d.slice(0, 7), a.spec.name).toFixed(2)} of $${cap} this month${kept}`];
-      });
-      return text(
-        [
-          `today: $${st.spent(d).toFixed(2)} of $${ctx.engine.dailyCapUsd} · this month: $${st.spent(d.slice(0, 7)).toFixed(2)} of $${ctx.engine.monthlyCapUsd ?? '∞'}`,
-          ...shares,
-          `you today: $${st.spent(d, undefined, user.name).toFixed(2)} of $${user.usd_per_day ?? ctx.cfg.mcp.userDailyCapUsd}`,
-          'by agent today:',
-          ...agents,
-          existsSync(ctx.engine.stopFile) ? 'STOP is set: new runs are skipped.' : '',
-        ]
-          .filter(Boolean)
-          .join('\n'),
-      );
-    },
+    async () => text(spendLines(ctx, user, agentsHere(ctx), today()).join('\n')),
   );
 
   s.registerTool(
@@ -332,6 +308,9 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       return text(existsSync(f) ? readFileSync(f, 'utf8') : 'none');
     },
   );
+
+  // Code only: the last patrol, the issue record and the ledger; no AI run, no cost.
+  if (served(ctx, 'monitor')) s.registerTool('status', STATUS_TOOL, async () => text(statusText(ctx, user, ctx.engine.now?.() ?? new Date(), agentsHere(ctx))));
 
   // Code only: kube-state-metrics (and Argo CD when scraped), no AI run, no cost.
   if (ctx.telemetry)
