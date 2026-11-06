@@ -1,7 +1,7 @@
 import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Evidence } from './evidence.js';
-import { firstTurnUsd, SpendMeter, type Session, type SessionEvent, type SessionRequest } from './session.js';
+import { firstTurnUsd, SpendMeter, tokensOf, type Session, type SessionEvent, type SessionRequest, type Tokens } from './session.js';
 import { fence, safeJson } from './text.js';
 
 // challenge-lite: one blind challenger in a fresh context, with the same read
@@ -50,6 +50,7 @@ export interface ChallengeResult {
   cost: number;
   turns: number;
   toolCalls: number;
+  tokens?: Tokens; // the challenger session's, from its result event (ledger and metrics only)
   note?: string; // set when the challenge didn't finish, or didn't run: why
 }
 
@@ -155,6 +156,7 @@ export async function challengeLite(a: ChallengeArgs): Promise<ChallengeResult> 
   const before = a.evidence.byWhom('challenger');
   let cost = 0;
   let turns = 0;
+  let tokens: Tokens | undefined;
   let gotResult = false;
   let failed: string | undefined;
   const meter = new SpendMeter();
@@ -166,6 +168,7 @@ export async function challengeLite(a: ChallengeArgs): Promise<ChallengeResult> 
         gotResult = true;
         cost = e.cost;
         turns = e.turns;
+        tokens = tokensOf(e.usage);
         if (!e.ok) failed = e.subtype;
       }
     }
@@ -175,7 +178,7 @@ export async function challengeLite(a: ChallengeArgs): Promise<ChallengeResult> 
   if (!gotResult) cost = meter.unsettled(a.usd, firstTurnUsd(a.model, a.usd)); // aborted or crashed: what was spent, plus the turn in flight
   failed ??= gotResult ? undefined : 'no result from the challenger session';
   const toolCalls = a.evidence.byWhom('challenger') - before;
-  const base = { cost, turns, toolCalls };
+  const base = { cost, turns, toolCalls, ...(tokens ? { tokens } : {}) };
 
   // Only a finished challenge that gathered its own evidence can uphold, or hide an item.
   if (!submitted) return { verdict: 'error', blocking: [], notes: [], items: [], overall: '', ...base, note: failed ?? 'challenger submitted nothing' };

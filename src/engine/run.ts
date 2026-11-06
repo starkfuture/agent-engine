@@ -8,7 +8,7 @@ import { FILE_TOOLS, WEB_TOOLS, type LoadedAgent } from './agent.js';
 import { challengeLite, notRun, unsound, type ChallengeResult } from './challenge.js';
 import { Evidence, evidenceHook } from './evidence.js';
 import { pathGuard } from './guard.js';
-import { firstTurnUsd, pluginCopy, SpendMeter, type Session, type SessionEvent, type SessionRequest } from './session.js';
+import { firstTurnUsd, pluginCopy, SpendMeter, tokensOf, type Session, type Tokens, type SessionEvent, type SessionRequest } from './session.js';
 import { freeBytes } from './retention.js';
 import { snapshot, type Snapshot } from './snapshot.js';
 import type { RunStatus, Store } from './store.js';
@@ -191,6 +191,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
   let status: Exclude<RunStatus, 'running'> = 'ok';
   let note: string | undefined;
   let cost = 0;
+  let tokens: Tokens | undefined; // author session's, from its result event; stays unset if the run ends without one
   let turns = 0;
   let dir: string | undefined;
   let challengeResult: ChallengeResult | undefined;
@@ -307,6 +308,7 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
         watchAuthor(e);
         if (e.kind === 'result') {
           gotResult = true;
+          tokens = tokensOf(e.usage);
           cost = e.cost;
           turns = e.turns;
           if (!e.ok) {
@@ -398,6 +400,8 @@ export async function runAgent<T>(engine: Engine, input: RunInput<T>): Promise<R
       cost,
       turns,
       outputs: outputs.length,
+      ...(tokens ? { tokens } : {}),
+      ...(challengeResult?.tokens ? { challengeTokens: challengeResult.tokens } : {}),
       now: clock(),
       ...(challengeResult ? { challenge: challengeResult.verdict } : {}),
       ...(note ? { note } : {}),

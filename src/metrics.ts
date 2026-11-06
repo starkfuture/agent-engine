@@ -72,6 +72,12 @@ export class Metrics {
       ...(engine.monthlyCapUsd !== undefined ? [[{ period: 'month' }, engine.monthlyCapUsd] as [Record<string, string>, number]] : []),
       ...shares.map(([agent, cap]): [Record<string, string>, number] => [{ period: 'month', agent }, cap]),
     ]);
+    gauge('engine_tokens_today', 'Tokens used by runs started today (UTC), by agent, session role (author or challenger) and kind.', engine.store.tokens(day).flatMap((t): Array<[Record<string, string>, number]> => [
+      [{ agent: t.agent, role: t.role, kind: 'input' }, t.input],
+      [{ agent: t.agent, role: t.role, kind: 'output' }, t.output],
+      [{ agent: t.agent, role: t.role, kind: 'cache_read' }, t.cacheRead],
+      [{ agent: t.agent, role: t.role, kind: 'cache_write' }, t.cacheWrite],
+    ]));
     return out.join('\n') + '\n';
   }
 }

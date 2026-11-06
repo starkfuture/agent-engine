@@ -24,7 +24,7 @@ import { writeAnswer } from '../src/engine/answer.js';
 import { Store } from '../src/engine/store.js';
 import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { fail, fakeSession, fetchResponse, ok, readResponse, say } from './fake-session.js';
+import { fail, fakeSession, fetchResponse, ok, okWithUsage, readResponse, say } from './fake-session.js';
 
 const tmp = (p: string) => mkdtempSync(join(tmpdir(), p));
 
@@ -728,7 +728,7 @@ test('challenger runs blind with the task, gathers its own evidence, and can esc
     });
     const again = await sim.mcp('submit_challenge', { objections: [], overall: 'Actually fine.' });
     assert.match(again.text, /already submitted/);
-    yield ok(0.3);
+    yield okWithUsage({ 'claude-opus-5-5': { inputTokens: 9, outputTokens: 8, cacheReadInputTokens: 700, cacheCreationInputTokens: 60 } }, 0.3);
   });
   const e = engine(s);
   const r = await runAgent(e, { agent: loadAgent(d), trigger: 't', task: 'What is configured?', output: findingsOutput });
@@ -738,6 +738,9 @@ test('challenger runs blind with the task, gathers its own evidence, and can esc
   assert.ok(Math.abs(r.cost - 0.5) < 1e-9);
   assert.equal(e.store.get(r.runId)?.challenge, 'escalate');
   assert.equal(e.store.get(r.runId)?.reserve, 1.5); // run + challenge reserved together
+  const row = e.store.get(r.runId)!;
+  assert.deepEqual([row.challenge_input_tokens, row.challenge_output_tokens, row.challenge_cache_read_tokens, row.challenge_cache_write_tokens], [9, 8, 700, 60]);
+  assert.deepEqual(e.store.tokens(row.day).map((t) => t.role), ['author', 'challenger']);
 });
 
 test('a challenge that failed, ended without a result, or checked nothing is never "upheld"', async () => {
@@ -823,4 +826,56 @@ test('real cost re-prices models the CLI does not know, keeps list-priced ones, 
   assert.equal(realCost(0.5, { 'some-new-model': { costBasis: 'unknown', inputTokens: 10 } }), 0.5);
   assert.equal(realCost(0.5, undefined), 0.5);
   assert.ok(Math.abs(realCost(0, { 'claude-sonnet-5-5': sonnet }, 1.1) - 0.0172253 * 1.1) < 1e-6);
+});
+
+test('the ledger row gets the result event\'s tokens, summed over models; a run with no result event leaves them null', async () => {
+  const usage = {
+    'claude-sonnet-5-5': { inputTokens: 100, outputTokens: 20, cacheReadInputTokens: 3000, cacheCreationInputTokens: 400 },
+    'claude-opus-5-5': { inputTokens: 5, outputTokens: 6, cacheReadInputTokens: 7, cacheCreationInputTokens: 8 },
+  };
+  const dir = agentDir('');
+  const e = engine(fakeSession(async function* () { yield okWithUsage(usage); }));
+  const r = await runAgent(e, { agent: loadAgent(dir), trigger: 't', task: 'q', output: findingsOutput });
+  const row = e.store.get(r.runId)!;
+  assert.deepEqual([row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cache_write_tokens], [105, 26, 3007, 408]);
+  assert.deepEqual(e.store.tokens(row.day), [{ agent: 'demo', role: 'author', input: 105, output: 26, cacheRead: 3007, cacheWrite: 408 }]);
+
+  // A result without per-model usage, and a session that dies first: no tokens.
+  const e2 = engine(fakeSession(async function* () { yield ok(); }, async function* () { throw new Error('boom'); }));
+  const r2 = await runAgent(e2, { agent: loadAgent(dir), trigger: 't', task: 'q', output: findingsOutput });
+  const r3 = await runAgent(e2, { agent: loadAgent(dir), trigger: 't', task: 'q', output: findingsOutput });
+  for (const id of [r2.runId, r3.runId]) {
+    const x = e2.store.get(id)!;
+    assert.deepEqual([x.input_tokens, x.output_tokens, x.cache_read_tokens, x.cache_write_tokens], [null, null, null, null]);
+  }
+  assert.deepEqual(e2.store.tokens(e2.store.get(r2.runId)!.day), [{ agent: 'demo', role: 'author', input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }]);
+  assert.equal(e2.store.get(r2.runId)!.challenge_input_tokens, null);
+});
+
+test('a ledger from before the token columns opens, keeps its rows, and stores tokens on new ones', async () => {
+  const file = join(tmp('old-db-'), 'engine.db');
+  const { DatabaseSync } = await import('node:sqlite');
+  const old = new DatabaseSync(file);
+  // The schema as the first version created it, with the columns migrate() added later left out.
+  old.exec(`CREATE TABLE runs (
+    id TEXT PRIMARY KEY, agent TEXT NOT NULL, version TEXT NOT NULL, trigger TEXT NOT NULL,
+    day TEXT NOT NULL, started_at TEXT NOT NULL, deadline_at TEXT NOT NULL, pid INTEGER NOT NULL,
+    reserve REAL NOT NULL, status TEXT NOT NULL, cost REAL, turns INTEGER, outputs INTEGER,
+    challenge TEXT, note TEXT, ended_at TEXT
+  )`);
+  old.exec(`INSERT INTO runs VALUES ('old1', 'monitor', 'v', 't', '2026-10-01', '2026-10-01T00:00:00.000Z', '2026-10-01T00:10:00.000Z', 1, 1, 'ok', 0.5, 2, 1, NULL, NULL, '2026-10-01T00:01:00.000Z')`);
+  old.close();
+
+  const store = new Store(file);
+  const before = store.get('old1')!;
+  assert.equal(before.cost, 0.5);
+  assert.equal(before.input_tokens, null);
+  const now = new Date();
+  store.admit({ id: 'new1', agent: 'monitor', version: 'v', trigger: 't', now, deadlineMs: 60_000, reserve: 1, agentCap: 10, globalCap: 30 });
+  store.settle('new1', { status: 'ok', cost: 0.2, turns: 1, outputs: 0, tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 }, now });
+  const row = store.get('new1')!;
+  assert.deepEqual([row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cache_write_tokens], [1, 2, 3, 4]);
+  assert.equal(row.challenge_input_tokens, null);
+  assert.equal(store.recent(10).length, 2);
+  new Store(file); // a second open does not re-add the columns
 });
