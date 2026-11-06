@@ -468,3 +468,11 @@ test("metrics: spend per agent next to the totals, which stay as they were, and 
   assert.match(new Metrics().render(fresh, new Date('2026-11-04T12:00:00Z')), /^engine_spend_usd\{period="month",agent="monitor"\} 0$/m);
   rmSync(runsDir, { recursive: true, force: true });
 });
+
+test('a source switched off never counts toward "Prometheus read nothing"', async () => {
+  const { prometheusBlind } = await import('../src/output/notices.js');
+  const off = { source: 'argocd', ok: false, error: 'not configured (deploys.argocd: false)', disabled: true } as const;
+  assert.equal(prometheusBlind([off, { source: 'http:v3', ok: true }]), false);
+  assert.equal(prometheusBlind([off, { source: 'http:v3', ok: false, error: 'HTTP 503' }]), true);
+  assert.equal(prometheusBlind([off]), false, 'nothing that could be read failed');
+});

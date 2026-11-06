@@ -68,7 +68,7 @@ const prometheus = (source: string) => source !== 'logs' && source !== 'traces';
 // A patrol that read nothing from Prometheus saw next to nothing: metrics don't
 // count it as a success.
 export function prometheusBlind(sources: SourceHealth[]): boolean {
-  const prom = sources.filter((s) => prometheus(s.source));
+  const prom = sources.filter((s) => prometheus(s.source) && !s.disabled); // a source switched off was never read
   return prom.length > 0 && prom.every((s) => !s.ok);
 }
 
