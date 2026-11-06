@@ -337,7 +337,10 @@ claude mcp add --transport http engine http://<host>:8787/mcp --header "Authoriz
 Tools: `list_agents`, `list_repos`, `run_agent` (background; `wait_seconds` ≤ 55
 for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 `proposed_lessons`, `deploys` (code only, read-only: deploys in the last N hours,
-for one service or all); admins add `approve_lesson`, `stop_all`, `resume`,
+for one service or all), `status` (code only, read-only, where the monitor is
+served: from the last patrol, whether it runs (STALE if not), whether the AI is
+paused, the last monitor run, open issues, source states, deploys and spend);
+admins add `approve_lesson`, `stop_all`, `resume`,
 `export_run` (a run's files, for the eval).
 
 - Who can read a run: the requester and admins, unless the agent has `visibility: everyone` in agent.yaml (monitor, research and codebase do). Someone else's private run answers like a missing one. Agents that read customer data keep the default.
