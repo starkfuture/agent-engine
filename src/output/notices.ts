@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import type { StateData } from '../patrol/state.js';
-import type { SourceHealth } from '../patrol/types.js';
+import { notConfigured, type SourceHealth } from '../patrol/types.js';
 import { blindCard, pausedCard, pauseText, resumedCard, sightCard, type Card } from './card.js';
 
 // Two states look exactly like a quiet channel: the AI paused (a cap, the kill
@@ -64,13 +64,11 @@ export function announceResume(s: StateData, where: Where, at: string, say: Say)
 
 // Everything but logs (Loki) and traces (Tempo) reads Prometheus.
 const prometheus = (source: string) => source !== 'logs' && source !== 'traces';
-// A source with no datasource set up isn't blind: it was never watched.
-const notConfigured = (s: SourceHealth) => /(^|: )not configured\b/.test(s.error ?? '');
 
 // A patrol that read nothing from Prometheus saw next to nothing: metrics don't
 // count it as a success.
 export function prometheusBlind(sources: SourceHealth[]): boolean {
-  const prom = sources.filter((s) => prometheus(s.source));
+  const prom = sources.filter((s) => prometheus(s.source) && !s.disabled); // a source switched off was never read
   return prom.length > 0 && prom.every((s) => !s.ok);
 }
 
