@@ -23,7 +23,7 @@ npm run dev -- stop | resume                            # kill switch for every 
 |---|---|
 | `agent.yaml` | Model, interval, built-in tools, limits (turns, $/run, $/day, deadline), challenge policy, sinks |
 | `CLAUDE.md` | The system prompt |
-| `memory/lessons.md` | Read at every run start; curated by humans |
+| `memory/lessons.md` | Appended to the system prompt; curated by humans. Read at every run start, except by the patrol, which reads the monitor's once when the process starts |
 | `memory/proposed.md` | Where runs propose lessons; a human promotes them (gitignored) |
 | `skills/`, `agents/` | Claude Code skills and subagents, loaded as a local plugin |
 
