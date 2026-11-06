@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import type { Tokens } from './session.js';
 
 export type RunStatus = 'running' | 'ok' | 'no_output' | 'error' | 'budget' | 'deadline' | 'stopped' | 'loop' | 'skipped' | 'crashed';
 
@@ -24,6 +25,12 @@ export interface RunRow {
   requested_by: string | null;
   heartbeat_at: string | null;
   build: string | null; // engine code version
+  // Tokens the author session used, from its result event. Null on rows from
+  // before these columns, and on runs that ended without a result event.
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_write_tokens: number | null;
 }
 
 export interface Admission {
@@ -83,6 +90,7 @@ export class Store {
     if (!cols.has('requested_by')) this.db.exec(`ALTER TABLE runs ADD COLUMN requested_by TEXT`);
     if (!cols.has('heartbeat_at')) this.db.exec(`ALTER TABLE runs ADD COLUMN heartbeat_at TEXT`);
     if (!cols.has('build')) this.db.exec(`ALTER TABLE runs ADD COLUMN build TEXT`);
+    for (const c of ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens']) if (!cols.has(c)) this.db.exec(`ALTER TABLE runs ADD COLUMN ${c} INTEGER`);
   }
 
   private tx<T>(fn: () => T): T {
@@ -146,10 +154,10 @@ export class Store {
     });
   }
 
-  settle(id: string, s: { status: Exclude<RunStatus, 'running'>; cost: number; turns: number; outputs: number; challenge?: string; note?: string; now: Date }): void {
+  settle(id: string, s: { status: Exclude<RunStatus, 'running'>; cost: number; turns: number; outputs: number; challenge?: string; note?: string; tokens?: Tokens; now: Date }): void {
     this.db
-      .prepare(`UPDATE runs SET status = ?, cost = ?, turns = ?, outputs = ?, challenge = ?, note = ?, ended_at = ? WHERE id = ?`)
-      .run(s.status, s.cost, s.turns, s.outputs, s.challenge ?? null, s.note ?? null, s.now.toISOString(), id);
+      .prepare(`UPDATE runs SET status = ?, cost = ?, turns = ?, outputs = ?, challenge = ?, note = ?, ended_at = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ? WHERE id = ?`)
+      .run(s.status, s.cost, s.turns, s.outputs, s.challenge ?? null, s.note ?? null, s.now.toISOString(), s.tokens?.input ?? null, s.tokens?.output ?? null, s.tokens?.cacheRead ?? null, s.tokens?.cacheWrite ?? null, id);
   }
 
   // A run that never started, recorded so `runs` shows why.
@@ -188,6 +196,15 @@ export class Store {
   // Runs started on a UTC day, by agent and status (metrics).
   counts(day: string): Array<{ agent: string; status: string; n: number }> {
     return this.db.prepare(`SELECT agent, status, COUNT(*) AS n FROM runs WHERE day = ? GROUP BY agent, status ORDER BY agent, status`).all(day) as unknown as Array<{ agent: string; status: string; n: number }>;
+  }
+
+  // Tokens of runs started on a UTC day, by agent (metrics). Runs with no
+  // recorded tokens add nothing.
+  tokens(day: string): Array<{ agent: string } & Tokens> {
+    const rows = this.db
+      .prepare(`SELECT agent, COALESCE(SUM(input_tokens), 0) AS input, COALESCE(SUM(output_tokens), 0) AS output, COALESCE(SUM(cache_read_tokens), 0) AS cacheRead, COALESCE(SUM(cache_write_tokens), 0) AS cacheWrite FROM runs WHERE day = ? GROUP BY agent ORDER BY agent`)
+      .all(day) as unknown as Array<{ agent: string } & Tokens>;
+    return rows.map((r) => ({ ...r }));
   }
 
   get(id: string): RunRow | undefined {

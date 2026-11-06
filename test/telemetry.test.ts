@@ -101,3 +101,21 @@ test('trace ids come back with all 32 hex digits (Tempo search drops leading zer
   assert.equal(short!.traceId, '06f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5');
   assert.equal(full!.traceId, '0123456789abcdef0123456789abcdef');
 });
+
+test('metrics: tokens today by agent and kind', () => {
+  const runsDir = mkdtempSync(join(tmpdir(), 'runs-'));
+  const store = new Store(':memory:');
+  const engine: Engine = { store, runsDir, stopFile: join(runsDir, 'STOP'), session: () => (async function* () {})(), dailyCapUsd: 30, llmAvailable: true };
+  const now = new Date();
+  for (const id of ['r1', 'r2']) {
+    store.admit({ id, agent: 'monitor', version: 'v', trigger: 't', now, deadlineMs: 60_000, reserve: 2, agentCap: 10, globalCap: 30 });
+    store.settle(id, { status: 'ok', cost: 0.4, turns: 3, outputs: 1, tokens: { input: 10, output: 2, cacheRead: 300, cacheWrite: 40 }, now });
+  }
+  const text = new Metrics().render(engine, now);
+  assert.match(text, /^# HELP engine_tokens_today Tokens used by runs started today \(UTC\), by agent and kind\.$/m);
+  assert.match(text, /^engine_tokens_today\{agent="monitor",kind="input"\} 20$/m);
+  assert.match(text, /^engine_tokens_today\{agent="monitor",kind="cache_read"\} 600$/m);
+  assert.match(text, /^engine_tokens_today\{agent="monitor",kind="cache_write"\} 80$/m);
+  assert.ok(text.indexOf('engine_tokens_today') > text.indexOf('engine_spend_cap_usd'));
+  for (const line of text.trim().split('\n')) assert.match(line, /^(# (HELP|TYPE) \w+ .+|\w+(\{[^}]*\})? -?[\d.e+]+)$/, line);
+});

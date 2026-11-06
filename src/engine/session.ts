@@ -87,6 +87,31 @@ interface ModelUsage {
   canonicalModel?: string;
 }
 
+export interface Tokens {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+// Tokens of one result event, summed over every model it lists. The result's
+// usage is { cliCostUsd, models: modelUsage }, modelUsage being keyed by model
+// with inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens.
+// Undefined when the event carries no per-model usage.
+export function tokensOf(usage: unknown): Tokens | undefined {
+  const models = (usage as { models?: unknown } | undefined)?.models;
+  if (!models || typeof models !== 'object') return undefined;
+  const t: Tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
+  for (const raw of Object.values(models as Record<string, ModelUsage | undefined>)) {
+    t.input += n(raw?.inputTokens);
+    t.output += n(raw?.outputTokens);
+    t.cacheRead += n(raw?.cacheReadInputTokens);
+    t.cacheWrite += n(raw?.cacheCreationInputTokens);
+  }
+  return t;
+}
+
 // The CLI prices models it doesn't know (costBasis "unknown") at a fallback
 // rate: Sonnet 5.5 is booked at Opus 5.5 prices. Re-price those from tokens
 // with our table; keep the CLI's number for anything we can't price.

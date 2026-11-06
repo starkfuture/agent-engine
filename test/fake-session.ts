@@ -78,6 +78,8 @@ export class Sim {
 export type Script = (s: Sim) => AsyncGenerator<SessionEvent>;
 
 export const ok = (cost = 0.1, turns = 3): SessionEvent => ({ kind: 'result', ok: true, subtype: 'success', cost, turns, text: 'done' });
+// A result whose per-model usage is shaped like the SDK's modelUsage.
+export const okWithUsage = (models: Record<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>, cost = 0.1, turns = 3): SessionEvent => ({ ...(ok(cost, turns) as object), usage: { cliCostUsd: cost, models } }) as SessionEvent;
 export const fail = (subtype: string, cost = 0.1): SessionEvent => ({ kind: 'result', ok: false, subtype, cost, turns: 2, text: '' });
 export const say = (text = '…'): SessionEvent => ({ kind: 'text', text });
 
