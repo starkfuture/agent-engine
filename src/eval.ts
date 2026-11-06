@@ -25,8 +25,47 @@ import { POSTED } from './runner.js';
 // AI change (prompt, severity rules, model) does is read against prod's own
 // reports and a human label.
 
-export const Label = z.object({ expect: z.enum(['post', 'no-post']), severity: ReportShape.severity.optional(), note: z.string().optional() });
+// A label says, per problem among the run's rows, what the run should do with
+// it. A problem's rows are exact row keys, or JavaScript regexes between
+// slashes (/^http\|auth\|/), unanchored; row keys start with their section, so
+// never with a slash. A report is on a problem when one of its rows is.
+// `expect` decides the posting checks; `actionable` (someone should act on it)
+// is recorded, and a problem that is not cannot expect a post. An actionable
+// one may expect none: a minor one, say.
+const regexOf = (pattern: string): RegExp | undefined => (pattern.length > 2 && pattern.startsWith('/') && pattern.endsWith('/') ? new RegExp(pattern.slice(1, -1)) : undefined);
+// A pattern that starts with a slash is a regex or a mistake (/x/i, a lone /):
+// as a row key it would match nothing, silently.
+const valid = (pattern: string) => {
+  if (!pattern.startsWith('/')) return true;
+  try {
+    return !!regexOf(pattern);
+  } catch {
+    return false;
+  }
+};
+export const Problem = z
+  .object({
+    id: z.string().min(1),
+    rows: z.array(z.string().min(1).refine(valid, 'neither a row key nor a valid /regex/')).min(1),
+    actionable: z.boolean(),
+    severity: ReportShape.severity.optional(),
+    expect: z.enum(['post', 'no-post']),
+    note: z.string().optional(),
+  })
+  .refine((p) => p.actionable || p.expect === 'no-post', { message: 'a problem that is not actionable cannot expect a post', path: ['expect'] });
+export type Problem = z.infer<typeof Problem>;
+// v2: the problems. v1, still valid: {expect, severity?, note?}, the whole run
+// as one implicit problem over all of the task's rows. A v1 expect or severity
+// beside problems is refused, not dropped: it would no longer say anything.
+const perProblem = z.undefined({ error: 'with problems, expect and severity go on each problem' }).optional();
+const LabelV2 = z
+  .object({ problems: z.array(Problem).min(1), note: z.string().optional(), expect: perProblem, severity: perProblem })
+  .refine((l) => new Set(l.problems.map((p) => p.id)).size === l.problems.length, { message: 'problem ids must be unique', path: ['problems'] });
+const LabelV1 = z.object({ expect: z.enum(['post', 'no-post']), severity: ReportShape.severity.optional(), note: z.string().optional(), problems: z.undefined().optional() });
+export const Label = z.union([LabelV2, LabelV1]);
 export type Label = z.infer<typeof Label>;
+// As Label.parse, with the error of the form the file is in.
+export const parseLabel = (json: unknown): Label => (json && typeof json === 'object' && 'problems' in json ? LabelV2 : LabelV1).parse(json);
 
 export interface Episode {
   dir: string;
@@ -70,7 +109,7 @@ export function loadEpisode(dir: string): Episode {
     evidence,
     ...(existsSync(join(dir, 'output.json')) ? { prod: ProdReports.parse(JSON.parse(read(dir, 'output.json'))) } : {}),
     ...(prodChallenge ? { prodChallenge } : {}),
-    ...(existsSync(join(dir, 'label.json')) ? { label: Label.parse(JSON.parse(read(dir, 'label.json'))) } : {}),
+    ...(existsSync(join(dir, 'label.json')) ? { label: parseLabel(JSON.parse(read(dir, 'label.json'))) } : {}),
   };
 }
 
@@ -136,6 +175,22 @@ export function recordedTools(items: EvidenceItem[], cfg: Config, tally: Tally):
     }));
 }
 
+// The material-miss rule (plan 1.2, open question 2), in one place so it is
+// easy to change. A material unanswered call makes the episode inconclusive:
+// - any ambiguous call (the recording had it, but can't tell which answer);
+// - an author miss on a tool the recorded run also called (by its author or
+//   challenger): the recording should have been able to answer, so this run
+//   went where it can't follow.
+// A miss on a tool the recording never had is a new tool (one added since,
+// reaching the eval through monitorTools), listed and not material; so is a
+// challenger's miss on a recorded tool.
+export type MissClass = 'material' | 'new tool, not in recording' | 'not material';
+export function classifyMiss(call: Miss, how: 'miss' | 'ambiguous', recorded: ReadonlySet<string>): MissClass {
+  if (how === 'ambiguous') return 'material';
+  if (!recorded.has(call.tool)) return 'new tool, not in recording';
+  return call.by === 'author' ? 'material' : 'not material';
+}
+
 // A row key (section|service|subject|status) read back into its fields.
 function rowOf(key: string) {
   const [section = '', service = '', ...rest] = key.split('|');
@@ -172,11 +227,16 @@ export interface EvalResult {
   hits: Tally['hits'];
   misses: Miss[];
   ambiguous: Miss[];
+  material: Array<Miss & { how: 'miss' | 'ambiguous' }>; // the unanswered calls classifyMiss makes material
+  newTools: string[]; // missed tools the recording never had: not material
   // Why this run says nothing either way: it didn't finish, its author got no
-  // recorded result, or a challenge it was due didn't finish.
+  // recorded result, a challenge it was due didn't finish, a material
+  // unanswered call, or a wrong label (a problem to post that no row of the
+  // task is, a row under both a problem to post and one not to).
   inconclusive?: string;
   prod?: { reports: EvalReport[]; challenge?: string };
   label?: Label;
+  score?: Score; // with a label
   outcome?: 'match' | 'mismatch' | 'inconclusive'; // with a label
 }
 
@@ -186,11 +246,106 @@ const view = (reports: NonNullable<Episode['prod']>, c: ChallengeResult | undefi
     return { title: r.title, severity: r.severity, rows: r.rows, ...(r.issue ? { issue: r.issue } : {}), ...(v ? { holds: v.holds } : {}), posts: wouldPost(r, i + 1, c, noise) };
   });
 
-// A label holds when the run posts what it expects (some report, or none) and,
-// with a severity, when that is its most severe report's.
-function matchLabel(label: Label, reports: EvalReport[]): boolean {
-  const top = reports.reduce<EvalReport['severity'] | undefined>((m, r) => (!m || RANK[r.severity] > RANK[m] ? r.severity : m), undefined);
-  return reports.some((r) => r.posts) === (label.expect === 'post') && (!label.severity || top === label.severity);
+// ---------- the label against the run's reports ----------
+
+type Severity = Report['severity'];
+export interface ProblemScore {
+  id: string;
+  actionable: boolean;
+  expect: Problem['expect'];
+  severity?: Severity; // the label's
+  inRun: boolean; // one of the task's rows is the problem's
+  reports: number; // the run's reports on it
+  posted: number; // of them, the ones that would post
+  top?: Severity; // what the run made of it: its top posted report's severity, else its top report's
+  missed?: true; // expects a post, has a row in the run, and got no post
+  severityMiss?: true; // top is not the label's severity
+  falsePosts?: number; // posts on a no-post problem
+  duplicate?: true; // two or more posts on a problem that expects one
+}
+export interface Score {
+  problems: ProblemScore[];
+  unlabelled: number[]; // posted reports on no problem at all (item numbers, from 1): false posts
+  missed: number;
+  severity: number;
+  falsePosts: number; // posted reports on no problem that expects a post, or on any no-post problem
+  duplicates: number; // problems posted twice or more
+  // A wrong label, so the episode is inconclusive (and no match):
+  notInRun: string[]; // problems to post that no row of the task is
+  conflicts: string[]; // task rows under both a problem to post and one not to: no report on them can be right
+  match: boolean;
+}
+
+// The label as problems. v1's implicit one is the whole run, all of the task's
+// rows: it can't tell two problems apart, so it counts no duplicates.
+export function problemsOf(label: Label, taskRows: readonly string[]): Array<Problem & { implicit?: true }> {
+  if (label.problems) return label.problems;
+  return [{ id: 'label', rows: [...taskRows], actionable: label.expect === 'post', expect: label.expect, ...(label.severity ? { severity: label.severity } : {}), implicit: true }];
+}
+
+const topOf = (rs: readonly EvalReport[]) => rs.reduce<Severity | undefined>((m, r) => (!m || RANK[r.severity] > RANK[m] ? r.severity : m), undefined);
+function matcher(patterns: readonly string[]): (row: string) => boolean {
+  const exact = new Set(patterns);
+  const res = patterns.map(regexOf).filter((re): re is RegExp => !!re);
+  return (row) => exact.has(row) || res.some((re) => re.test(row));
+}
+
+// Each problem against the reports that would post (plan 1.2 gates). Any of
+// these is a mismatch:
+// - missed: a problem that expects a post has no posted report on it (one
+//   with no row in the run is a label error instead, as is a task row under
+//   both a problem to post and one not to);
+// - severity: with a label severity, the run's top severity on the problem is
+//   another one (its top posted report's, else its top report's, so a no-post
+//   problem labelled minor wants a minor report); not judged on a problem
+//   missed, falsely posted, or with no row in the run;
+// - false post: a posted report on no problem that expects a post, or on any
+//   no-post problem;
+// - duplicate: two or more posted reports on one problem that expects a post.
+export function scoreLabel(label: Label, taskRows: readonly string[], reports: readonly EvalReport[]): Score {
+  const problems = problemsOf(label, taskRows).map((p) => ({ p, on: matcher(p.rows) }));
+  const scored = problems.map(({ p, on }): ProblemScore => {
+    const mine = reports.filter((r) => r.rows.some(on));
+    const posted = mine.filter((r) => r.posts);
+    const top = topOf(posted.length ? posted : mine);
+    const inRun = taskRows.some(on);
+    const missed = p.expect === 'post' && inRun && !posted.length;
+    const falsePosts = p.expect === 'no-post' ? posted.length : 0;
+    return {
+      id: p.id,
+      actionable: p.actionable,
+      expect: p.expect,
+      ...(p.severity ? { severity: p.severity } : {}),
+      inRun,
+      reports: mine.length,
+      posted: posted.length,
+      ...(top ? { top } : {}),
+      ...(missed ? { missed: true as const } : {}),
+      ...(p.severity && inRun && !missed && !falsePosts && top !== p.severity ? { severityMiss: true as const } : {}),
+      ...(falsePosts ? { falsePosts } : {}),
+      ...(p.expect === 'post' && !p.implicit && posted.length > 1 ? { duplicate: true as const } : {}),
+    };
+  });
+  // Is the report on a problem (one that expects that, if given)?
+  const lands = (r: EvalReport, expect?: Problem['expect']) => problems.some(({ p, on }) => (!expect || p.expect === expect) && r.rows.some(on));
+  const missed = scored.filter((s) => s.missed).length;
+  const severity = scored.filter((s) => s.severityMiss).length;
+  const falsePosts = reports.filter((r) => r.posts && (!lands(r, 'post') || lands(r, 'no-post'))).length;
+  const duplicates = scored.filter((s) => s.duplicate).length;
+  const notInRun = scored.filter((s) => s.expect === 'post' && !s.inRun).map((s) => s.id);
+  const under = (k: string, expect: Problem['expect']) => problems.some(({ p, on }) => p.expect === expect && on(k));
+  const conflicts = taskRows.filter((k) => under(k, 'post') && under(k, 'no-post'));
+  return {
+    problems: scored,
+    unlabelled: reports.flatMap((r, i) => (r.posts && !lands(r) ? [i + 1] : [])),
+    missed,
+    severity,
+    falsePosts,
+    duplicates,
+    notInRun,
+    conflicts,
+    match: !missed && !severity && !falsePosts && !duplicates && !notInRun.length && !conflicts.length,
+  };
 }
 
 // One episode: the monitor on its prompt, with its recorded tools; the
@@ -223,14 +378,24 @@ export async function evalEpisode(engine: Engine, agent: LoadedAgent, cfg: Confi
   );
   const c = r.challenge;
   const reports = view(r.outputs, c, noise);
-  const inconclusive =
+  const recorded = new Set(ep.evidence.map((e) => e.tool));
+  const unanswered = [...tally.misses.map((m) => ({ ...m, how: 'miss' as const })), ...tally.ambiguous.map((m) => ({ ...m, how: 'ambiguous' as const }))];
+  const material = unanswered.filter((m) => classifyMiss(m, m.how, recorded) === 'material');
+  const newTools = [...new Set(unanswered.filter((m) => classifyMiss(m, m.how, recorded) === 'new tool, not in recording').map((m) => m.tool))];
+  const score = ep.label ? scoreLabel(ep.label, rows, reports) : undefined;
+  const reasons = [
     r.status !== 'ok' && r.status !== 'no_output'
       ? `the run ended ${r.status}${r.note ? ` (${r.note})` : ''}`
       : !tally.hits.author
         ? 'the author got no recorded result'
         : r.outputs.length && gate(r.outputs) && !(c && finished(c))
           ? `a challenge was due and ${c ? `did not finish (${c.note ?? c.verdict})` : 'was skipped'}`
-          : undefined;
+          : undefined,
+    material.length ? `${material.length} material unanswered call(s): ${material.map((m) => `${m.how === 'ambiguous' ? 'ambiguous' : 'missed'} ${m.tool} (${m.by})`).join(', ')}` : undefined,
+    score?.notInRun.length ? `the label's problem(s) to post ${score.notInRun.join(', ')} match no row of the task` : undefined,
+    score?.conflicts.length ? `the label puts row(s) ${score.conflicts.join(', ')} under both a problem to post and one not to` : undefined,
+  ].filter((x): x is string => !!x);
+  const inconclusive = reasons.join('; ') || undefined;
   const result: EvalResult = {
     episode: dir,
     run: { id: r.runId, status: r.status, ...(r.note ? { note: r.note } : {}), ...(r.dir ? { dir: r.dir } : {}) },
@@ -241,9 +406,11 @@ export async function evalEpisode(engine: Engine, agent: LoadedAgent, cfg: Confi
     hits: tally.hits,
     misses: tally.misses,
     ambiguous: tally.ambiguous,
+    material,
+    newTools,
     ...(inconclusive ? { inconclusive } : {}),
     ...(ep.prod ? { prod: { reports: view(ep.prod, ep.prodChallenge, noise), ...(ep.prodChallenge ? { challenge: ep.prodChallenge.verdict } : {}) } } : {}),
-    ...(ep.label ? { label: ep.label, outcome: inconclusive ? 'inconclusive' : matchLabel(ep.label, reports) ? 'match' : 'mismatch' } : {}),
+    ...(ep.label && score ? { label: ep.label, score, outcome: inconclusive ? 'inconclusive' : score.match ? 'match' : 'mismatch' } : {}),
   };
   writeFileSync(join(dir, 'eval-result.json'), safeJson(result, 1) + '\n');
   return result;
@@ -252,6 +419,9 @@ export async function evalEpisode(engine: Engine, agent: LoadedAgent, cfg: Confi
 const severities = (rs: EvalReport[]) => rs.map((r) => `${r.severity}${r.posts ? ' (posts)' : ''}`).join(', ') || 'none';
 const calls = (hits: number, misses: number, ambiguous: number) => `${hits} hit(s), ${misses} miss(es), ${ambiguous} ambiguous: ${misses + ambiguous} of ${hits + misses + ambiguous} call(s) unanswered`;
 const hitsOf = (r: EvalResult) => r.hits.author + r.hits.challenger;
+const labelName = (l: Label) => (l.problems ? `${l.problems.length} problem(s)` : `${l.expect}${l.severity ? ` ${l.severity}` : ''}`);
+const faults = (s: Pick<Score, 'missed' | 'severity' | 'falsePosts' | 'duplicates'>) =>
+  [s.missed && `${s.missed} missed`, s.severity && `${s.severity} severity`, s.falsePosts && `${s.falsePosts} false post(s)`, s.duplicates && `${s.duplicates} duplicate(s)`].filter(Boolean).join(', ');
 
 export function evalLine(r: EvalResult): string {
   return [
@@ -259,20 +429,68 @@ export function evalLine(r: EvalResult): string {
     `reports ${severities(r.reports)}`,
     ...(r.prod ? [`prod ${severities(r.prod.reports)}`] : []),
     calls(hitsOf(r), r.misses.length, r.ambiguous.length),
+    ...(r.newTools.length ? [`new tool, not in recording: ${r.newTools.join(', ')}`] : []),
     `${r.turns} turns`,
     `$${r.cost.toFixed(2)}`,
-    ...(r.label ? [`label ${r.label.expect}${r.label.severity ? ` ${r.label.severity}` : ''}: ${r.outcome === 'mismatch' ? 'MISMATCH' : r.outcome}`] : []),
+    ...(r.label ? [`label ${labelName(r.label)}: ${r.outcome === 'mismatch' && r.score ? `MISMATCH (${faults(r.score)})` : r.outcome}`] : []),
     ...(r.inconclusive ? [`inconclusive: ${r.inconclusive}`] : []),
   ].join(' · ');
 }
 
-export function evalTotals(rs: EvalResult[], failed = 0): string {
+// One line per labelled problem, and one for posted reports on no problem.
+export function problemLines(r: EvalResult): string[] {
+  const s = r.score;
+  if (!s) return [];
+  const verdict = (p: ProblemScore) =>
+    [p.missed && 'MISSED', p.severityMiss && `SEVERITY ${p.top ?? 'none'}, label ${p.severity}`, p.falsePosts && `FALSE POST ×${p.falsePosts}`, p.duplicate && `DUPLICATE ×${p.posted}`].filter(Boolean).join(', ') || 'ok';
+  const what = (p: ProblemScore) =>
+    p.inRun ? `${p.reports} report(s), ${p.posted} posted${p.top ? `, top ${p.top}` : ''} · ${verdict(p)}` : `no row of it in this run${p.expect === 'post' ? ' · LABEL ERROR (inconclusive)' : ''}`;
+  return [
+    ...s.problems.map((p) => `  ${p.id} (${p.actionable ? 'actionable' : 'not actionable'}, ${p.expect}${p.severity ? ` ${p.severity}` : ''}): ${what(p)}`),
+    ...(s.unlabelled.length ? [`  on no problem: ${s.unlabelled.map((i) => `${r.reports[i - 1]!.severity} "${r.reports[i - 1]!.title}"`).join(', ')} · FALSE POST ×${s.unlabelled.length}`] : []),
+    ...(s.conflicts.length ? [`  under a problem to post and one not to: ${s.conflicts.join(', ')} · LABEL ERROR (inconclusive)`] : []),
+  ];
+}
+
+// The eval's exit code: 1 on any mismatch, any inconclusive episode, or an
+// episode that could not run at all (`failed`: a broken folder, say).
+export const evalExitCode = (rs: readonly EvalResult[], failed = 0): 0 | 1 => (failed > 0 || rs.some((r) => r.inconclusive !== undefined || r.outcome === 'mismatch') ? 1 : 0);
+
+// Representative $/day (plan 1.2 f): the eval's mean cost per run (author and
+// challenger, over the episodes whose run started) × the monitor runs per day
+// that a detector replay counts. Undefined when no episode ran.
+export interface CostPerDay {
+  runs: number;
+  perRun: number;
+  runsPerDay: number;
+  perDay: number;
+}
+export function costPerDay(rs: ReadonlyArray<Pick<EvalResult, 'cost' | 'run'>>, runsPerDay: number): CostPerDay | undefined {
+  if (!Number.isFinite(runsPerDay) || runsPerDay < 0) throw new Error(`runs per day must be a number ≥ 0, not ${runsPerDay}`);
+  const ran = rs.filter((r) => r.run.status !== 'skipped');
+  if (!ran.length) return undefined;
+  const perRun = ran.reduce((s, r) => s + r.cost, 0) / ran.length;
+  return { runs: ran.length, perRun, runsPerDay, perDay: perRun * runsPerDay };
+}
+const perDayText = (d: CostPerDay | undefined, runsPerDay: number) =>
+  d ? `$${d.perRun.toFixed(2)}/run × ${d.runsPerDay} runs/day = $${d.perDay.toFixed(2)}/day` : `$/day at ${runsPerDay} runs/day: no episode ran`;
+
+// Problems count in judged episodes only: an inconclusive one says nothing about
+// them. An unlabelled inconclusive episode is counted too: it fails the exit code.
+export function evalTotals(rs: EvalResult[], failed = 0, runsPerDay?: number): string {
   const n = (o: EvalResult['outcome']) => rs.filter((r) => r.outcome === o).length;
-  const sum = (f: (r: EvalResult) => number) => rs.reduce((s, r) => s + f(r), 0);
+  const sum = <T>(xs: readonly T[], f: (x: T) => number) => xs.reduce((s, x) => s + f(x), 0);
+  const judged = rs.flatMap((r) => (r.score && !r.inconclusive ? [r.score] : []));
+  const problems = sum(judged, (s) => s.problems.filter((p) => p.inRun).length);
+  const all = { missed: sum(judged, (s) => s.missed), severity: sum(judged, (s) => s.severity), falsePosts: sum(judged, (s) => s.falsePosts), duplicates: sum(judged, (s) => s.duplicates) };
+  const unlabelledInconclusive = rs.filter((r) => !r.label && r.inconclusive !== undefined).length;
   return [
     `${rs.length} episode(s)${failed ? `, ${failed} failed` : ''}`,
     `labels: ${n('match')} match, ${n('mismatch')} mismatch, ${n('inconclusive')} inconclusive`,
-    calls(sum(hitsOf), sum((r) => r.misses.length), sum((r) => r.ambiguous.length)),
-    `$${sum((r) => r.cost).toFixed(2)}`,
+    ...(unlabelledInconclusive ? [`unlabelled: ${unlabelledInconclusive} inconclusive`] : []),
+    ...(rs.some((r) => r.score) ? [`problems: ${problems} judged${faults(all) ? `, ${faults(all)}` : judged.length ? ', all as labelled' : ''}`] : []),
+    calls(sum(rs, hitsOf), sum(rs, (r) => r.misses.length), sum(rs, (r) => r.ambiguous.length)),
+    `$${sum(rs, (r) => r.cost).toFixed(2)}`,
+    ...(runsPerDay !== undefined ? [perDayText(costPerDay(rs, runsPerDay), runsPerDay)] : []),
   ].join(' · ');
 }
