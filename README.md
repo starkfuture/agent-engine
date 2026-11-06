@@ -335,7 +335,9 @@ claude mcp add --transport http engine http://<host>:8787/mcp --header "Authoriz
 ```
 
 Tools: `list_agents`, `list_repos`, `run_agent` (background; `wait_seconds` ≤ 55
-for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
+for short runs, with MCP progress every 5 s while it waits; over HTTP only with
+`ENGINE_MCP_STREAM=1`, which answers as SSE), `get_run` (a running run lists its
+tool calls so far), `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 `proposed_lessons`, `deploys` (code only, read-only: deploys in the last N hours,
 for one service or all); admins add `approve_lesson`, `stop_all`, `resume`,
 `export_run` (a run's files, for the eval).

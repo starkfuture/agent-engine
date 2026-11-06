@@ -16,6 +16,7 @@ import type { Telemetry } from '../clients/telemetry.js';
 import { monitorTools } from '../investigate/tools.js';
 import { deployLines, deploysHeading, listDeploys, workloadFor } from '../patrol/deploys.js';
 import { METADATA_PATH, Refused, serverName, type Login } from './login.js';
+import { progressBlock, progressLine, progressNotifier, runProgress } from './progress.js';
 import { expiresAt, type User, type Users } from './users.js';
 import type { Issues } from '../patrol/issues.js';
 
@@ -136,7 +137,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
         wait_seconds: z.number().int().min(0).max(55).optional(),
       },
     },
-    async ({ agent: name, task, repo, challenge, wait_seconds }) => {
+    async ({ agent: name, task, repo, challenge, wait_seconds }, extra) => {
       const agent = agentByName(ctx, name);
       if (!agent) return err(`no agent "${name}"; see list_agents`);
       if (agent.spec.code) return err(`${name} runs on its schedule and can't be started here; read its runs with list_runs`);
@@ -194,7 +195,10 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
       }
       runs.set(first.id, { agent: name, user: user.name, controller, done });
       if (wait_seconds) {
-        const f = await Promise.race([done, sleep(wait_seconds * 1000).then(() => undefined)]);
+        const dir = runFolder(ctx, name, first.id);
+        const startedAt = ctx.engine.store.get(first.id)?.started_at ?? new Date().toISOString();
+        const stopProgress = progressNotifier(extra, () => progressLine(name, first.id, runProgress(dir), startedAt, new Date()));
+        const f = await Promise.race([done, sleep(wait_seconds * 1000).then(() => undefined)]).finally(stopProgress);
         if (f?.result) return text(`${summary(f.result)}\n\n${f.answer ?? '(no answer submitted)'}`);
         if (f?.error) return err(f.error);
       }
@@ -231,7 +235,7 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
         ...(reports ? ['Slack delivery: unknown (a run is not linked to its posts yet)'] : []),
         ...(row.note ? [`note: ${redact(row.note)}`] : []),
       ].join('\n');
-      return text(`${head}\n\n${answer || (row.status === 'running' ? '(still running)' : '(no answer)')}${challenge}`);
+      return text(`${head}\n\n${answer || (row.status === 'running' ? progressBlock(runProgress(dir), row.started_at, new Date()) : '(no answer)')}${challenge}`);
     },
   );
 
@@ -582,7 +586,7 @@ export function startHttp(ctx: McpContext, opts: { host: string; port: number })
       if (req.method !== 'POST') return send(405, 'stateless server: POST only', { allow: 'POST' });
       const parsed = await body(req);
       const mcp = buildServer(ctx, user);
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: !ctx.cfg.mcp.stream });
       res.on('close', () => {
         void transport.close();
         void mcp.close();

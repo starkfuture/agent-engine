@@ -121,6 +121,10 @@ export interface Config {
     reposGithub: string | undefined; // ENGINE_REPOS_GITHUB: name=owner/repo[@ref],… (env-only hosts)
     // GitHub App (contents: read) the engine fetches those repos as.
     githubApp: { appId: string; installationId: string; privateKeyFile: string } | undefined;
+    // ENGINE_MCP_STREAM=1: HTTP answers as SSE streams, so run_agent's progress
+    // notifications reach the client while it waits. Unset = one JSON response
+    // per request, and the progress is dropped by the transport.
+    stream?: boolean;
   };
 }
 
@@ -267,6 +271,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = process.
         env.GITHUB_APP_ID && env.GITHUB_APP_INSTALLATION_ID && env.GITHUB_APP_PRIVATE_KEY_FILE
           ? { appId: env.GITHUB_APP_ID, installationId: env.GITHUB_APP_INSTALLATION_ID, privateKeyFile: expandHome(env.GITHUB_APP_PRIVATE_KEY_FILE) }
           : undefined,
+      stream: env.ENGINE_MCP_STREAM === '1',
     },
   };
 }
