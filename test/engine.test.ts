@@ -12,11 +12,18 @@ import { redactDeep } from '../src/engine/text.js';
 import { pathAllowed } from '../src/engine/guard.js';
 import { findingsOutput, type Findings } from '../src/engine/output.js';
 import { runAgent, type Engine, type ToolFactory } from '../src/engine/run.js';
-import type { Session } from '../src/engine/session.js';
+import { forServer, inProcessServer, type Session } from '../src/engine/session.js';
+import { ReportShape, type Report } from '../src/investigate/report.js';
+import type { Telemetry } from '../src/clients/telemetry.js';
+import { monitorTools } from '../src/investigate/tools.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { testConfig } from './fake.js';
 import { snapshot } from '../src/engine/snapshot.js';
 import { writeAnswer } from '../src/engine/answer.js';
 import { Store } from '../src/engine/store.js';
-import { tool } from '@anthropic-ai/claude-agent-sdk';
+import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 import { fail, fakeSession, fetchResponse, ok, readResponse, say } from './fake-session.js';
 
 const tmp = (p: string) => mkdtempSync(join(tmpdir(), p));
@@ -113,6 +120,143 @@ test('malformed numbers and legacy variables stop the program instead of disabli
 });
 
 // ---------- evidence ----------
+
+test('the in-process MCP server takes a call that leaves out a defaulted field, fills the default in, and still refuses bad values', async () => {
+  const cfg = testConfig();
+  cfg.sources.logs.error_filter = '|= "ERROR"';
+  const at = new Date('2026-11-05T12:00:00Z');
+  const asked: Array<{ q: string; end: number; limit: number }> = [];
+  const none = async () => [];
+  const tel: Telemetry = { has: { loki: true, tempo: true }, promInstant: none, promRange: none, lokiMetric: none, tempoSearch: none, lokiRange: async (q, _s, end, limit) => (asked.push({ q, end: end.getTime(), limit }), []) };
+  // Each session puts its tools behind the real server and calls them as the model would.
+  const schemas: Record<string, { required?: string[]; properties: Record<string, { description?: string }> }> = {};
+  const said: Record<string, { text: string; isError: boolean }> = {};
+  const through = (calls: Array<[string, Record<string, unknown>]>): Session =>
+    async function* (r) {
+      const server = inProcessServer(r.tools);
+      const [a, b] = InMemoryTransport.createLinkedPair();
+      await server.instance.connect(a);
+      const client = new Client({ name: 'test', version: '0' });
+      await client.connect(b);
+      for (const t of (await client.listTools()).tools) schemas[t.name] = t.inputSchema as (typeof schemas)[string];
+      for (const [name, args] of calls) {
+        const res = await client.callTool({ name, arguments: args });
+        said[`${name} ${JSON.stringify(args)}`] = { text: (res.content as Array<{ text: string }>).map((c) => c.text).join(''), isError: !!res.isError };
+      }
+      await client.close();
+      yield ok(0.01, 1);
+    };
+  const findings = { title: 'The answer to the question', summary: 'Bottom line: nothing to see.', findings: [{ claim: 'Nothing was found', status: 'inconclusive', evidence: [] }], next_steps: [], not_checked: [] };
+  const sessions = [
+    through([
+      ['log_search', {}],
+      ['log_search', { limit: 5 }],
+      ['submit_findings', findings],
+    ]),
+    through([['submit_challenge', { objections: [], overall: 'Holds up, nothing to object to.' }]]),
+  ];
+  let n = 0;
+  const r = await runAgent(engine((req) => sessions[n++]!(req)), { agent: loadAgent(agentDir('sensitive_tools: true\ntool_pack: telemetry')), trigger: 't', task: 'q', output: findingsOutput, tools: monitorTools(tel, cfg, at), challenge: true });
+
+  // Left out: limit, errors_only, end_minutes_ago. The handler read the defaults.
+  assert.equal(said['log_search {}']?.isError, false, said['log_search {}']?.text);
+  assert.deepEqual(asked, [{ q: '{namespace="microservices"} |= "ERROR"', end: at.getTime(), limit: 300 }], 'errors only, ending at the patrol time, 300 lines; the refused call never ran');
+  assert.equal(said['log_search {"limit":5}']?.isError, true);
+  assert.match(said['log_search {"limit":5}']!.text, /Input validation error/);
+  assert.equal(said[`submit_findings ${JSON.stringify(findings)}`]?.text, 'accepted 1');
+  assert.deepEqual(r.outputs[0]?.lessons, []);
+  assert.equal(said['submit_challenge {"objections":[],"overall":"Holds up, nothing to object to."}']?.text, 'recorded');
+  assert.deepEqual(r.challenge?.items, []);
+  // What the model is shown: optional, with the default said.
+  const log = schemas.log_search!;
+  for (const k of ['limit', 'errors_only', 'end_minutes_ago', 'minutes']) assert.ok(!log.required?.includes(k), k);
+  assert.equal(log.properties.limit?.description, '(default 300)');
+  assert.equal(log.properties.end_minutes_ago?.description, 'Shift the window back from the patrol time (default 0)');
+  assert.ok(!schemas.submit_challenge!.required?.includes('items'));
+  assert.equal(schemas.submit_challenge!.properties.items?.description, 'One verdict for each item of the output. (default [])');
+  assert.match(schemas.submit_findings!.properties.lessons?.description ?? '', /\(default \[\]\)$/);
+});
+
+test('a left-out field gets its default and nothing else is touched: one parse, by the server, so a transform runs once and an async check still works', async () => {
+  const seen: unknown[] = [];
+  const echo = tool(
+    'echo',
+    'Echo its arguments.',
+    { name: z.string().transform((x) => `${x}!`), code: z.string().refine(async (v) => v.length > 1, 'too short'), n: z.number().int().default(1), tags: z.array(z.string()).default([]) },
+    async (args) => (seen.push(args), { content: [{ type: 'text' as const, text: 'ok' }] }),
+  );
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await inProcessServer([echo]).instance.connect(a);
+  const client = new Client({ name: 'test', version: '0' });
+  await client.connect(b);
+  const call = async (args: Record<string, unknown>) => {
+    const r = await client.callTool({ name: 'echo', arguments: args });
+    return { isError: !!r.isError, text: (r.content as Array<{ text: string }>).map((c) => c.text).join('') };
+  };
+  assert.deepEqual(await call({ name: 'x', code: 'ab' }), { isError: false, text: 'ok' });
+  assert.deepEqual(await call({ name: 'y', code: 'cd', n: 5, tags: ['t'] }), { isError: false, text: 'ok' });
+  assert.deepEqual(seen, [
+    { name: 'x!', code: 'ab', n: 1, tags: [] },
+    { name: 'y!', code: 'cd', n: 5, tags: ['t'] },
+  ], 'defaults for the left-out fields only; the given ones kept; the transform ran once');
+  for (const bad of [{ name: 'z', code: 'a' }, { name: 'z', code: 'ab', n: 'five' }]) assert.equal((await call(bad)).isError, true, JSON.stringify(bad));
+  assert.equal(seen.length, 2, 'a refused call never reaches the handler');
+  await client.close();
+});
+
+test('every in-process tool set builds for the server; a default it cannot take (a check after .default(), a wrapped default, a prefault) is refused when it is built', async () => {
+  const at = new Date('2026-11-05T12:00:00Z');
+  const tel = { has: { loki: true, tempo: true } } as Telemetry;
+  const built: string[] = [];
+  const build = (tools: SdkMcpToolDefinition<any>[]) => {
+    for (const t of tools) {
+      forServer(t);
+      built.push(t.name);
+    }
+  };
+  // The telemetry pack, as the author and the challenger get it.
+  for (const by of ['author', 'challenger'] as const) build(monitorTools(tel, testConfig(), at)(new Evidence(), by));
+  // The submit tools as runAgent and the challenger build them: submit_findings (MCP and CLI
+  // agents) and submit_challenge, then the monitor's submit_report (runner.ts).
+  const findings = { title: 'The answer to the question', summary: 'Bottom line: nothing to see.', findings: [{ claim: 'Nothing was found', status: 'inconclusive', evidence: [] }], next_steps: [], not_checked: [] };
+  const sessions: Session[] = [
+    async function* (r) {
+      build(r.tools);
+      await r.tools.find((t) => t.name === 'submit_findings')!.handler(findings, {});
+      yield ok(0.01, 1);
+    },
+    async function* (r) {
+      build(r.tools);
+      yield ok(0.01, 1);
+    },
+    async function* (r) {
+      build(r.tools);
+      yield ok(0.01, 1);
+    },
+  ];
+  let n = 0;
+  const pack = loadAgent(agentDir('sensitive_tools: true\ntool_pack: telemetry'));
+  await runAgent(engine((req) => sessions[n++]!(req)), { agent: pack, trigger: 't', task: 'q', output: findingsOutput, tools: monitorTools(tel, testConfig(), at), challenge: true });
+  await runAgent(engine((req) => sessions[n++]!(req)), { agent: pack, trigger: 't', task: 'q', output: { tool: 'submit_report', description: 'Submit one report.', shape: ReportShape, evidenceOf: (r: Report) => r.evidence }, tools: monitorTools(tel, testConfig(), at) });
+  for (const name of ['service_overview', 'route_timeline', 'log_search', 'recent_changes', 'trace_search', 'submit_findings', 'submit_challenge', 'submit_report']) assert.ok(built.includes(name), name);
+
+  const bad = tool('bad_tool', 'A check after its default.', { n: z.number().default(1).refine((x) => x > 0) }, async () => ({ content: [] }));
+  assert.throws(() => forServer(bad), /^Error: bad_tool: n has a check after \.default\(\), which the server would drop: put the check before \.default\(\)$/);
+  const fine = tool('fine_tool', 'A check before its default.', { n: z.number().refine((x) => x > 0).default(1), m: z.number().optional().default(2) }, async () => ({ content: [] }));
+  assert.doesNotThrow(() => forServer(fine));
+  // Defaults the server refuses when left out, anywhere but plain at the top.
+  const held: Array<[string, z.ZodType]> = [
+    ['.prefault()', z.number().prefault(1)],
+    ['.default().optional()', z.number().default(1).optional()],
+    ['.default().nullable()', z.number().default(1).nullable()],
+    ['.default().nullish()', z.number().default(1).nullish()],
+    ['.default().transform()', z.number().default(1).transform((x) => x * 2)],
+    ['.default().pipe()', z.number().default(1).pipe(z.number())],
+    ['.default(…).optional().default(…)', z.number().default(1).optional().default(2)],
+  ];
+  for (const [what, field] of held)
+    assert.throws(() => forServer(tool('wrapped_tool', 'A wrapped default.', { n: field }, async () => ({ content: [] }))), /^Error: wrapped_tool: n holds a default the server refuses to leave out \(a \.prefault\(\), or a \.default\(\) under \.optional\(\), \.nullable\(\), \.readonly\(\), \.transform\(\) or \.pipe\(\)\): make it a plain \.default\(\) on the field$/, what);
+});
 
 test('evidence must be a real tool result in this run, with a quote that is really in it', async () => {
   const d = agentDir(web);

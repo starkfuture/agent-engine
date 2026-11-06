@@ -10,8 +10,11 @@ const SECRET_KEY = String.raw`[A-Za-z0-9_]*?(?:password|passwd|passphrase|pwd|se
 // street addresses in them are personal data. A bare `name` key is NOT here: it
 // is a service, route or class name everywhere, so a customer name under plain
 // `name` is a known gap. `ipAddress`, `emailAddress` and the like stay readable.
+// An address object ("address":{"line1":…,"city":…}) is masked by its fields:
+// `line1`, `line_2`, `line-3` (Stripe and others) and `street_name` are address
+// keys wherever they sit; `line`, `lineItems` and `pipeline` are not.
 const NAME_KEY = String.raw`(?:first|last|full|given|family|middle|sur)[_-]?name`;
-const ADDRESS_KEY = String.raw`(?:(?:billing|shipping|delivery|home|mailing)[_-]?)?(?:address(?:[_-]?line)?[_-]?[0-9]?|street(?:[_-]?address)?[_-]?[0-9]?|city|zip(?:[_-]?code)?|postcode|postal[_-]?code|house[_-]?number)`;
+const ADDRESS_KEY = String.raw`(?:(?:billing|shipping|delivery|home|mailing)[_-]?)?(?:address(?:[_-]?line)?[_-]?[0-9]?|street[_-]?name|street(?:[_-]?address)?[_-]?[0-9]?|line[_-]?[1-9]|city|zip(?:[_-]?code)?|postcode|postal[_-]?code|house[_-]?number)`;
 const PERSONAL_KEY = `(?:${NAME_KEY}|${ADDRESS_KEY})`;
 // A quoted value, escaped (\"x\") or plain ("x", which may hold \" inside), and
 // the same value with the same quotes around a placeholder, so JSON stays JSON.

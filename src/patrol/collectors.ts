@@ -47,15 +47,17 @@ export async function requireSeries(tel: Telemetry, selector: string, at: Date, 
 // What a source read, but not all of: capped results, part of the scrape
 // targets up, a check that couldn't run. Carried on the rows a collector
 // returns and shown on the source (SourceHealth.note). A note is information,
-// not an outage: the source stays ok, and recovery doesn't look at it.
-type Collected = Row[] & { notes?: string[] };
-function withNotes(rows: Row[], ...notes: Array<string | undefined>): Row[] {
-  const n = notes.filter((x): x is string => !!x);
-  return n.length ? Object.assign(rows, { notes: n }) : rows;
+// not an outage: the source stays ok, and recovery doesn't look at it, unless
+// it says whether the source reads at all is unknown (presence).
+type Note = string | { note: string; unknown: true } | undefined;
+type Collected = Row[] & { notes?: string[]; unknown?: true };
+function withNotes(rows: Row[], ...notes: Note[]): Row[] {
+  const n = notes.filter((x): x is NonNullable<Note> => !!x);
+  return n.length ? Object.assign(rows, { notes: n.map((x) => (typeof x === 'string' ? x : x.note)), ...(n.some((x) => typeof x !== 'string') ? { unknown: true } : {}) }) : rows;
 }
-export const noteOf = (rows: Row[]): { note?: string } => {
-  const n = (rows as Collected).notes;
-  return n?.length ? { note: n.join('; ') } : {};
+export const noteOf = (rows: Row[]): { note?: string; unknown?: true } => {
+  const { notes: n, unknown } = rows as Collected;
+  return n?.length ? { note: n.join('; '), ...(unknown ? { unknown } : {}) } : {};
 };
 
 // Logs and traces have no `up`: an empty error search is also what a broken
@@ -67,9 +69,14 @@ export const noteOf = (rows: Row[]): { note?: string } => {
 //   kept, with a note (lines may have stopped arriving since).
 // - A probe that errors (or that a recording made before it existed doesn't
 //   have) proves nothing either way: the source stays as read, with a note.
+//   With nothing in the "now" search either, whether it reads is unknown: not
+//   blind, and not back from blind either.
 const probe = (read: () => Promise<number>): Promise<number | Error> => read().catch((e: Error) => e);
-function presence(what: string, none: string, n: number | Error, found: number): string | undefined {
-  if (n instanceof Error) return `${what} presence not checked (${n.message})`;
+function presence(what: string, none: string, n: number | Error, found: number): Note {
+  if (n instanceof Error) {
+    const note = `${what} presence not checked (${n.message})`;
+    return found ? note : { note, unknown: true };
+  }
   if (n > 0) return undefined;
   if (!found) throw new Error(`${none} (missing data, not a quiet system)`);
   return `${none}, though the window's search read ${found}: newer ${what === 'log' ? 'lines' : 'traces'} may be missing`;

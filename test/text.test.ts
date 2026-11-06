@@ -157,6 +157,44 @@ test('redactDeep masks person and address keys, including whole address objects'
   assert.equal(JSON.stringify(redactDeep(JSON.stringify({ lastName: 'Okafor' }))).includes('Okafor'), false);
 });
 
+test('an address object in log text loses every street line, city and postcode: plain, escaped and single-quoted', () => {
+  const address = { line1: '12 Quill Lane', line2: 'Flat 3', city: 'Springfield', zip: 'AB1 2CD' };
+  const plain = JSON.stringify({ level: 'error', msg: 'order failed', address, code: 'E1' });
+  const lines = [
+    plain,
+    JSON.stringify({ msg: `order failed: ${JSON.stringify({ address, code: 'E1' })}` }),
+    "order failed {'address': {'line1': '12 Quill Lane', 'line2': 'Flat 3', 'city': 'Springfield', 'zip': 'AB1 2CD'}, 'code': 'E1'}",
+    'order failed address: {"street_name":"Quill Lane","line-3":"Flat 3","house_number":"12"}',
+  ];
+  for (const line of lines) {
+    const s = redact(line);
+    for (const leak of ['Quill', 'Lane', 'Flat 3', 'Springfield', 'AB1 2CD']) assert.ok(!s.includes(leak), `${line} -> ${s}`);
+    assert.ok(s.includes('E1') || !line.includes('E1'), s);
+  }
+  assert.deepEqual(JSON.parse(redact(plain)).address, { line1: '<address>', line2: '<address>', city: '<address>', zip: '<address>' }, 'JSON stays JSON');
+});
+
+test('a brace inside a street value in an enclosing JSON message does not let the street through', () => {
+  const line = JSON.stringify({ level: 'error', msg: 'order failed address: {"street":"12 } Quill Lane"}' });
+  const s = redact(line);
+  assert.ok(!s.includes('Quill') && !s.includes('Lane'), s);
+  assert.equal(JSON.parse(s).msg, 'order failed address: {"street":"<address>"}');
+});
+
+test('log lines with no address keep the template, and so the row key, they had before line and street-name fields were masked', () => {
+  // Each line with its template as 7f27897 made it.
+  const before: Array<[string, string]> = [
+    ['{"level":"error","context":"OrderService","msg":"Order 64b1f0c2a1b2c3d4e5f6a7b8 failed: {\\"code\\":\\"E42\\",\\"line\\":12}","time":"2026-11-05T12:00:00.000Z"}', '[OrderService] Order <oid> failed: {"code":"E42","line":<n>}'],
+    ['{"level":"error","msg":"validation failed","errors":[{"path":"line_items[0].sku","message":"Required"}],"addressId":"a1"}', 'validation failed'],
+    ['    at OrderService.place (/app/dist/orders/service.js:120:15) {"line":120,"column":15}', 'at OrderService.place (/app/dist/orders/service.js:<n>:<n>) {"line":<n>,"column":<n>}'],
+    ["TypeError: Cannot read properties of undefined (reading 'id') at line 1 column 5 { code: 'E_NULL', retry: {max: 3} }", "TypeError: Cannot read properties of undefined (reading 'id') at line <n> column <n> { code: 'E_NULL', retry: {max: <n>} }"],
+    ['ERROR Failed to parse config {timeout: 30, retries: {max: 3}} for request 8c1f2e', 'ERROR Failed to parse config {timeout: <n>, retries: {max: <n>}} for request 8c1f2e'],
+    ["Error: connect ECONNREFUSED 10.0.0.5:5432 { errno: -111, code: 'ECONNREFUSED', syscall: 'connect', port: 5432 }", "Error: connect ECONNREFUSED <ip>:<n> { errno: -<n>, code: 'ECONNREFUSED', syscall: 'connect', port: <n> }"],
+    ['payment failed for order 1234 with status=declined {"reason":"insufficient_funds","pipeline":"p2"}', 'payment failed for order <n> with status=declined {"reason":"insufficient_funds","pipeline":"p2"}'],
+  ];
+  for (const [line, template] of before) assert.equal(templateOf(line), template, line);
+});
+
 test('a log-row sample, key and subject carry no names or addresses', async () => {
   const lines = Array.from({ length: 20 }, (_, i) => ({ ts: new Date(), line: referral(i, `Jane${i}x`, `Smithers${i}x`, `${i} Quill Lane`), labels: { app: 'backend-production' } }));
   const tel = { lokiRange: async (_q: string, _s: Date, end: Date) => (end.getTime() === AT.getTime() ? lines : []) } as unknown as Telemetry;

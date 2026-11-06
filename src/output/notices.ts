@@ -78,7 +78,8 @@ export function prometheusBlind(sources: SourceHealth[]): boolean {
 // ("also blind" while others still are). One outage, however it spreads: it is
 // over when every source that was said reads again in one patrol, with one
 // message, and how long each was blind. A source no longer patrolled (taken
-// out of the config) leaves it quietly.
+// out of the config) leaves it quietly. One whose read proves nothing either
+// way (unknown: its presence check failed) neither starts nor ends it.
 export function announceBlind(s: StateData, where: Where, sources: SourceHealth[], at: string, say: Say): void {
   const said = s.notices?.[where]?.blind ?? {};
   const failed = sources.filter((x) => !x.ok && !notConfigured(x));
@@ -88,7 +89,7 @@ export function announceBlind(s: StateData, where: Where, sources: SourceHealth[
     told(s, where).blind = { ...said, ...Object.fromEntries(fresh.map((x) => [x.source, at])) };
     return;
   }
-  if (failed.length || !Object.keys(said).length) return;
+  if (failed.length || !Object.keys(said).length || sources.some((x) => x.unknown && Object.hasOwn(said, x.source))) return;
   const ok = new Set(sources.filter((x) => x.ok).map((x) => x.source));
   const back = Object.entries(said).filter(([k]) => ok.has(k)).map(([source, since]) => ({ source, since }));
   if (back.length) say(sightCard(back, at), 'sources-back');

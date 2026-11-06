@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { test } from 'node:test';
 import type { Config } from '../src/config.js';
-import { SourceError, type Sample } from '../src/clients/telemetry.js';
+import { SourceError, type Sample, type Series } from '../src/clients/telemetry.js';
 import { loadAgent } from '../src/engine/agent.js';
 import type { Engine } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
@@ -297,6 +297,34 @@ test('one outage, however it spreads: a source that joins it is said once, and i
   ]);
   assert.match(sent[1]!.all, /workloads, rollouts: prometheus HTTP 502/);
   assert.match(sent[2]!.all, /http:legacy-v1: blind for 45 min\\n• workloads, rollouts: blind for 30 min/);
+});
+
+test('a presence check that errors proves nothing: logs said blind are not back until a patrol shows them read', async () => {
+  const c = cfg();
+  const { box, texts } = webhook();
+  let presence: () => Series[] = () => [];
+  // Loki answers every search with no line at all; its presence count is the test's.
+  class Logs extends FakeTelemetry {
+    override readonly has = { loki: true, tempo: false };
+    override async lokiMetric(): Promise<Series[]> {
+      return presence();
+    }
+  }
+  const tel = new Logs(world);
+  const state = State.memory();
+  const pass = (time: string) => patrolOnce(tel, c, new Noise({}), state, new CardSink(c.outDir, box), new Date(time), { llm: false, post: true });
+
+  await pass('2026-09-28T12:15:00Z');
+  assert.deepEqual(texts(), ['⚠️ Blind at 12:15Z: the patrol could not read logs']);
+  presence = () => {
+    throw new SourceError('loki', 'HTTP 503: upstream unavailable');
+  };
+  const unknown = await pass('2026-09-28T12:30:00Z'); // the searches are still empty, and the check fails
+  assert.equal(unknown.summary.sources.find((s) => s.source === 'logs')?.ok, true, 'not blind either: the source stays as read');
+  assert.deepEqual(texts().slice(1), [], 'and not back: nothing shows the logs are read');
+  presence = () => [{ labels: {}, points: [[Date.parse('2026-09-28T12:45:00Z') / 1000, 4200]] }];
+  await pass('2026-09-28T12:45:00Z');
+  assert.deepEqual(texts().slice(1), ['✅ The patrol reads logs again at 12:45Z, after 30 min blind']);
 });
 
 test('a patrol in which every Prometheus source failed is not a successful patrol; one with any of them read is', async () => {
