@@ -141,15 +141,43 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
 // ---- rendering for the LLM and for humans -----------------------------------
 const fmt = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
 
-export function rowLine(r: FlaggedRow): string {
+// Impact facts, computed once so the author and the challenger rate the same
+// numbers: the share of the route's requests failing with this status, whether
+// the route's 2xx held against 1 d and 7 d ago (inside ±20%, or 2 sigma for
+// small counts), and "chronic" once the patrol has seen the row for a day.
+export const CHRONIC_HOURS = 24;
+const pct = (x: number) => `${x >= 0.1 ? Math.round(x * 100) : (x * 100).toFixed(1)}%`;
+function okTrend(ok: Row['counts']): string {
+  const base = [ok.d1, ok.d7].filter((x) => x > 0);
+  if (!base.length) return ok.now ? `2xx new (${ok.now})` : 'no 2xx';
+  const lo = Math.min(...base);
+  const hi = Math.max(...base);
+  const slack = (x: number) => Math.max(0.2 * x, 2 * Math.sqrt(x + 1));
+  const was = `(${ok.now} vs 1d ${ok.d1}, 7d ${ok.d7})`;
+  if (ok.now < lo - slack(lo)) return `2xx down ${pct(1 - ok.now / lo)} ${was}`;
+  if (ok.now > hi + slack(hi)) return `2xx up ${pct(ok.now / hi - 1)} ${was}`;
+  return '2xx flat';
+}
+export function impactFacts(r: FlaggedRow, at?: string): string[] {
+  const out: string[] = [];
+  if (r.totals?.now) out.push(`${pct(r.counts.now / r.totals.now)} of route requests`);
+  if (r.success) out.push(okTrend(r.success));
+  if (at && Date.parse(at) - Date.parse(r.firstSeen) >= CHRONIC_HOURS * 3600_000) out.push(`chronic since ${r.firstSeen.slice(5, 16).replace('T', ' ')}Z`);
+  return out;
+}
+
+// at: the patrol time, for "chronic" (left out without it).
+export function rowLine(r: FlaggedRow, at?: string): string {
   const c = r.counts;
   const t = r.totals ? ` | traffic now ${r.totals.now} (1d ${r.totals.d1}, 7d ${r.totals.d7})` : '';
+  const facts = impactFacts(r, at);
+  const imp = facts.length ? ` | impact: ${facts.join(', ')}` : '';
   const status = r.status ? ` ${r.status}` : '';
   const tr = r.truncated ? ' [counts are lower bounds]' : '';
   const dep = r.afterDeploy ? ` | ${r.afterDeploy}` : '';
   return (
     `[${r.section}] ${r.service} ${r.subject}${status}: ${r.score.verdict.toUpperCase()} (${r.novelty}, ${r.score.trend}, first seen ${r.firstSeen})` +
-    ` — now ${c.now}, 1h ago ${c.h1}, 1d ago ${c.d1}, 7d ago ${c.d7}, expected ${fmt(r.score.expected)}, z ${fmt(r.score.z)}${t}${tr}${dep}`
+    ` — now ${c.now}, 1h ago ${c.h1}, 1d ago ${c.d1}, 7d ago ${c.d7}, expected ${fmt(r.score.expected)}, z ${fmt(r.score.z)}${t}${imp}${tr}${dep}`
   );
 }
 
@@ -159,11 +187,11 @@ export function renderSummary(s: Summary, o: { forModel?: boolean } = {}): strin
   const out: string[] = [`Patrol at ${s.at}, window ${s.windowMinutes} min. Counts are events in the window.`];
   out.push('', `## New or worse (${s.send.length})`);
   for (const r of s.send) {
-    out.push(`- ${rowLine(r)}`);
+    out.push(`- ${rowLine(r, s.at)}`);
     if (r.detail) out.push(`  detail: ${r.detail.replace(/\n/g, ' ')}`);
   }
-  if (s.known.length) out.push('', `## Still firing, already reported (${s.known.length})`, ...s.known.map((r) => `- ${rowLine(r)}`));
-  if (s.waiting?.length && !o.forModel) out.push('', `## Waiting for the next patrol: news once, not investigated yet (${s.waiting.length})`, ...s.waiting.map((r) => `- ${rowLine(r)}`));
+  if (s.known.length) out.push('', `## Still firing, already reported (${s.known.length})`, ...s.known.map((r) => `- ${rowLine(r, s.at)}`));
+  if (s.waiting?.length && !o.forModel) out.push('', `## Waiting for the next patrol: news once, not investigated yet (${s.waiting.length})`, ...s.waiting.map((r) => `- ${rowLine(r, s.at)}`));
   if (s.recovered.length) out.push('', `## Recovered since last patrol (${s.recovered.length})`, ...s.recovered.map((k) => `- ${k}`));
   out.push('', `## ${deploysHeading(s.deploys)}`, ...deployLines(s.deploys));
   const down = s.sources.filter((x) => !x.ok);

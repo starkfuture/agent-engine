@@ -125,12 +125,17 @@ export async function collectHttp(tel: Telemetry, f: HttpFamily, at: Date, windo
   ]);
   const routeTotals = new Map<string, Counts>();
   const svcTotals = new Map<string, Counts>();
+  // The route's 2xx, from the same per-status series: whether successes stayed
+  // flat while errors rose (a client retrying) or fell with them (users lost).
+  const routeOk = new Map<string, Counts>();
   for (const [k, { counts }] of cells) {
-    const [svc, route] = k.split('\u0000') as [string, string];
-    for (const [m, key] of [
+    const [svc, route, status] = k.split('\u0000') as [string, string, string];
+    const into: Array<[Map<string, Counts>, string]> = [
       [routeTotals, `${svc}\u0000${route}`],
       [svcTotals, svc],
-    ] as const) {
+    ];
+    if (/^2/.test(status)) into.push([routeOk, `${svc}\u0000${route}`]);
+    for (const [m, key] of into) {
       const acc = m.get(key) ?? zero();
       for (const s of SLOTS) acc[s] += counts[s];
       m.set(key, acc);
@@ -151,7 +156,7 @@ export async function collectHttp(tel: Telemetry, f: HttpFamily, at: Date, windo
       subject,
       status,
       counts: round(counts),
-      ...(totals ? { totals: round(totals) } : {}),
+      ...(totals ? { totals: round(totals), success: round(routeOk.get(`${service}\u0000${subject}`) ?? zero()) } : {}),
       score,
       query,
     });

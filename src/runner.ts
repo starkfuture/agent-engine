@@ -8,7 +8,7 @@ import { runAgent, type Engine, type RunResult } from './engine/run.js';
 import { monitorTask } from './investigate/prompt.js';
 import { reportOutput, type Report } from './investigate/report.js';
 import { monitorTools } from './investigate/tools.js';
-import { patrolCard, pauseText, recoveredCard, reportCard, worseCard, type Card, type IssueRef } from './output/card.js';
+import { patrolCard, pauseText, recoveredCard, reportCard, tooLowCard, worseCard, type Card, type IssueRef } from './output/card.js';
 import type { CardSink, EmitSlack } from './output/sink.js';
 import { announceBlind, announcePause, announceResume, heldNow, type Say } from './output/notices.js';
 import { recentDeploys } from './patrol/deploys.js';
@@ -448,14 +448,16 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       // one the channel would see that the challenger did not agree with: it
       // said "partly", escalated, or didn't finish. Only a checked finding is
       // news. A protected journey is never hidden: it is posted with the objection.
+      // A finished check's severity "too high" takes the same path as "no".
       const item = verdictOn(inv.challenge, i + 1);
       const agreed = !!inv.challenge && finished(inv.challenge) && (item ? item.holds === 'yes' : inv.challenge.verdict === 'upheld');
+      const rated = (s: 'too_high' | 'too_low') => !!inv.challenge && finished(inv.challenge) && item?.severity === s;
       const news = POSTED.has(out.severity) && !agreed && record('checking what the channel would see', () => shownInChannel(o.issues, out, at, filed), true);
-      const fails = POSTED.has(out.severity) && (item?.holds === 'no' || news);
+      const fails = POSTED.has(out.severity) && (item?.holds === 'no' || rated('too_high') || news);
       const kept = fails && out.rows.some((k) => !!byKey.get(k) && noise.protected(byKey.get(k)!));
       const r: Report = fails && !kept ? { ...out, severity: 'minor' } : out;
       if (fails && !kept) held++;
-      const why = item?.holds === 'no' ? 'the second check says it does not hold up' : !inv.challenge || !finished(inv.challenge) ? 'the second check did not finish' : `the second check did not agree (${item?.holds ?? inv.challenge.verdict})`;
+      const why = item?.holds === 'no' ? 'the second check says it does not hold up' : rated('too_high') ? 'the second check says its severity is too high' : !inv.challenge || !finished(inv.challenge) ? 'the second check did not finish' : `the second check did not agree (${item?.holds ?? inv.challenge.verdict})`;
       const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId, filed), { action: 'none' }) : { action: 'none' };
       result.filed.push(f);
       const cc = [...new Set([...(cfg.slackOncall && pagesOncall(f, r) ? [cfg.slackOncall] : []), ...ownersOf(r)])];
@@ -471,10 +473,16 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       // Back from resolved, or Not an issue ended: its buttons are back. Back
       // while Not an issue lasts: its message shows the mute again, with Undo.
       if (o.post && (f.action === 'reopened' || (f.action === 'muted' && f.reopened) || (f.action === 'raised' && f.unmuted))) sink.outbox?.updateRoot(f.issue.id);
+      // Rated too low: one line in its issue's thread, never news in the channel,
+      // and the rating stands. Not under Not an issue, and only in a thread that
+      // is there already or that this report starts.
+      const low = rated('too_low') && f.action !== 'none' && f.action !== 'muted' ? f.issue.id : undefined;
+      if (low && (post || (o.post && record('reading the outbox', () => sink.outbox?.reached(low) ?? false, false))))
+        emit(tooLowCard(r, item!.reason), `${stamp(summary.at)}-${i + 1}-too-low`, { kind: 'report', keys: r.rows, broadcast: false, issue: low, repeat: true });
       if (post) toSlack++;
       if (post?.repeat) quiet++;
-      const note = `${filingNote(f, r)}${!fails ? '' : kept ? `; ${why}, posted anyway: a protected journey` : `; was ${out.severity}, ${why}`}${unchecked ? '; not verified: no second check ran' : ''}`;
-      if (o.issues || fails || unchecked) log(`report ${i + 1} ${note}`);
+      const note = `${filingNote(f, r)}${!fails ? '' : kept ? `; ${why}, posted anyway: a protected journey` : `; was ${out.severity}, ${why}`}${unchecked ? '; not verified: no second check ran' : ''}${rated('too_low') ? '; the second check says its severity is too low' : ''}`;
+      if (o.issues || fails || unchecked || rated('too_low')) log(`report ${i + 1} ${note}`);
       answer.push(`### Report ${i + 1} · ${note}`, '', card.markdown, '');
     }
     log(`${toSlack} of ${inv.outputs.length} report(s) go to Slack${quiet ? ` (${quiet} as a quiet reply in an issue's thread)` : ''}${held ? `; ${held} held back by the second check` : ''}`);

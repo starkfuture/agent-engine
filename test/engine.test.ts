@@ -20,7 +20,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { testConfig } from './fake.js';
 import { snapshot } from '../src/engine/snapshot.js';
-import { writeAnswer } from '../src/engine/answer.js';
+import { storedChallenge, writeAnswer } from '../src/engine/answer.js';
 import { Store } from '../src/engine/store.js';
 import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
@@ -687,6 +687,40 @@ test('judge: a "no" on one item of the output needs a real evidence id; a broken
   const broke = unsound({ ...j, items: [...j.items, yes], overall: 'o', cost: 0, turns: 0, toolCalls: 1 }, 'same call 3×: promql');
   assert.equal(broke.verdict, 'error');
   assert.deepEqual(broke.items.map((i) => [i.item, i.holds]), [[1, 'partly'], [2, 'partly']], 'no agreement from a broken challenge');
+});
+
+test('judge: a severity "too_high" needs a real evidence id, like a "no"; a broken challenge drops it; "too_low" stays', () => {
+  const ev = new Evidence();
+  const id = ev.add('challenger', 'promql', {}, 'x').id;
+  const j = judge([], ev, [
+    { item: 1, holds: 'yes', severity: 'too_high', reason: 'One client retrying; 200s flat.', evidence: [id] },
+    { item: 2, holds: 'yes', severity: 'too_high', reason: 'Feels big.', evidence: [] },
+    { item: 3, holds: 'no', severity: 'too_high', reason: 'Wrong and too high.', evidence: ['E-0000-1'] },
+    { item: 4, holds: 'partly', severity: 'too_low', reason: 'Checkout is failing for many.', evidence: [] },
+    { item: 5, holds: 'yes', reason: 'No severity verdict: older challengers, other agents.', evidence: [] },
+  ]);
+  assert.deepEqual(
+    j.items.map((i) => [i.item, i.holds, i.severity ?? '-', i.downgraded ?? '']),
+    [
+      [1, 'yes', 'too_high', ''],
+      [2, 'yes', '-', 'said too_high without a valid evidence id'],
+      [3, 'partly', '-', 'said no and too_high without a valid evidence id'],
+      [4, 'partly', 'too_low', ''],
+      [5, 'yes', '-', ''],
+    ],
+  );
+  assert.equal(j.verdict, 'upheld', 'a severity verdict alone is not a dissent on the facts');
+  const broke = unsound({ ...j, items: [{ ...j.items[0]!, holds: 'partly' }, j.items[3]!], overall: 'o', cost: 0, turns: 0, toolCalls: 0 }, 'challenger checked nothing itself');
+  assert.deepEqual(broke.items.map((i) => [i.item, i.severity ?? '-', i.downgraded ?? '']), [[1, '-', 'challenger checked nothing itself'], [4, 'too_low', '']], 'an unfinished check hides nothing');
+});
+
+test('a stored challenge.json reads its severity verdicts, and one from before them still parses', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'challenge-'));
+  const base = { verdict: 'upheld', overall: 'Holds up.', blocking: [], notes: [], cost: 0.1, turns: 2, toolCalls: 1 };
+  writeFileSync(join(dir, 'challenge.json'), JSON.stringify({ ...base, items: [{ item: 1, holds: 'yes', reason: 'Counts match.', evidence: [] }] }));
+  assert.deepEqual(storedChallenge(dir)?.items, [{ item: 1, holds: 'yes', reason: 'Counts match.', evidence: [] }]);
+  writeFileSync(join(dir, 'challenge.json'), JSON.stringify({ ...base, items: [{ item: 1, holds: 'yes', severity: 'too_high', reason: '200s flat.', evidence: ['E-abcd-2'] }] }));
+  assert.equal(storedChallenge(dir)?.items[0]?.severity, 'too_high');
 });
 
 // Author that answers with one fetched fact.

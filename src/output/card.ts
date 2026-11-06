@@ -23,7 +23,7 @@ function challengeLines(c: ChallengeResult | undefined, item?: ItemVerdict): str
   const head = !finished(c) ? `Not verified: the challenge did not complete (${c.note ?? 'unknown'}).` : c.verdict === 'upheld' ? `Challenge: upheld. ${c.overall}` : `⚠️ Challenge: ESCALATE, needs a human decision. ${c.overall}`;
   return [
     head,
-    ...(item ? [`On this report: ${HOLDS[item.holds]}. ${item.reason}${item.evidence.length ? ` (${item.evidence.join(', ')})` : ''}${item.downgraded ? ` (${item.downgraded})` : ''}`] : []),
+    ...(item ? [`On this report: ${HOLDS[item.holds]}${item.severity && item.severity !== 'right' ? `; severity ${item.severity === 'too_high' ? 'too high' : 'too low'}` : ''}. ${item.reason}${item.evidence.length ? ` (${item.evidence.join(', ')})` : ''}${item.downgraded ? ` (${item.downgraded})` : ''}`] : []),
     ...c.blocking.map((o) => `• Objection: ${o.claim} (if acted on: ${o.failure_scenario}; check: ${o.settling_check}; ${o.evidence.join(', ')})`),
     ...(c.notes.length ? [`${c.notes.length} non-blocking note(s) in the run folder.`] : []),
   ];
@@ -106,9 +106,11 @@ export function reportCard(raw: Report, patrolAt: string, footer: string, challe
       ? { says: 'says this does not hold up', why: [item.reason, ...against.map((o) => o.claim)] }
       : against.length
         ? { says: 'disputes this', why: against.map((o) => o.claim) }
-        : item?.holds === 'partly'
-          ? { says: 'disputes this', why: [item.reason] }
-          : undefined;
+        : item?.severity === 'too_high' // posted anyway: a protected journey
+          ? { says: 'says its severity is too high', why: [item.reason] }
+          : item?.holds === 'partly'
+            ? { says: 'disputes this', why: [item.reason] }
+            : undefined;
   const blocks = [
     { type: 'header', text: { type: 'plain_text', text: clip(head, 150) } },
     { type: 'context', elements: [{ type: 'mrkdwn', text: `${lead ? `${esc(lead)} · ` : ''}*${r.status}* ${esc(`since ${when(r.started_at, patrolAt)} · confidence ${r.cause.confidence}`)}${cc.length ? ` · cc ${cc.join(' ')}` : ''}` }] },
@@ -315,6 +317,15 @@ export function worseCard(rows: Array<{ key: string; now: number; was?: number |
   const text = `${head}: ${lines.length === 1 ? lines[0] : `${lines.length} signals`}`;
   const blocks = [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(`${esc(redact(`${head}\n${lines.map((l) => `• ${l}`).join('\n')}`))}${who}`, 2900) }] }];
   return { text: `${esc(redact(text))}${who}`, blocks, markdown: `**${head}** (On it: ${by}, no AI run)\n${lines.map((l) => `- ${l}`).join('\n')}` };
+}
+
+// ---- rated too low, says the second check -------------------------------------------
+// One line in the issue's thread when the challenger says a report's severity
+// is too low: a note for whoever reads the thread. It changes nothing: the
+// author's rating stands, and the channel isn't told.
+export function tooLowCard(r: Pick<Report, 'title' | 'severity'>, reason: string): Card {
+  const line = `⬆️ A second AI check says ${LEVEL[r.severity]} is too low for “${brief(m(r.title), 80)}”: ${brief(noIds(m(reason)), 200)}`;
+  return { text: esc(line), blocks: [{ type: 'context', elements: [{ type: 'mrkdwn', text: clip(esc(line), 600) }] }], markdown: line };
 }
 
 // ---- notices: the AI paused, sources the patrol can't read ------------------------

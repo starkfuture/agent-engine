@@ -47,8 +47,9 @@ const StoredChallenge = z.object({
   overall: z.string(),
   blocking: z.array(Objection),
   notes: z.array(Objection),
-  // Per report; challenges from before per-report verdicts have none.
-  items: z.array(z.object({ item: z.number(), holds: z.enum(['yes', 'partly', 'no']), reason: z.string(), evidence: z.array(z.string()).default([]), downgraded: z.string().optional() })).default([]),
+  // Per report; challenges from before per-report verdicts have none, and
+  // those from before the severity verdict have no severity.
+  items: z.array(z.object({ item: z.number(), holds: z.enum(['yes', 'partly', 'no']), severity: z.enum(['too_high', 'right', 'too_low']).optional(), reason: z.string(), evidence: z.array(z.string()).default([]), downgraded: z.string().optional() })).default([]),
   cost: z.number(),
   turns: z.number(),
   toolCalls: z.number(),

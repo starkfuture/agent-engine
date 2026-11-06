@@ -947,6 +947,81 @@ test('a protected journey is never hidden: "does not hold up" is posted with the
   assert.ok(w.logs.includes(`report 1 opened ${id} (major); the second check says it does not hold up, posted anyway: a protected journey`));
 });
 
+// ---- the challenger's severity verdict ------------------------------------------
+
+const FLAT = 'One client retrying; 200s flat at 1000.';
+const tooHigh: Judge = ({ mine }) => ({ items: [{ item: 1, holds: 'yes', severity: 'too_high', reason: FLAT, evidence: [mine] }] });
+
+test('severity "too high" on a major: the "does not hold up" path, kept as minor and not posted', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const t = recorder(true);
+  const w = setup(t, linker(), { judge: tooHigh });
+  const r = await w.patrol(tel, 0);
+  for (const prompt of [w.session.seen[0]!.prompt, w.session.challenges[0]!.prompt]) assert.match(prompt, /\/v1\/auth\/login 400: .* \| impact: 2\.9% of route requests, 2xx flat/, 'the author and the challenger see the impact facts');
+  assert.deepEqual(t.sent, [], 'not posted');
+  assert.deepEqual(r.filed, [{ action: 'none' }], 'minor: no issue opened');
+  assert.ok(w.logs.includes('report 1 minor: not posted; was major, the second check says its severity is too high'));
+  assert.ok(w.logs.includes('0 of 1 report(s) go to Slack; 1 held back by the second check'));
+  const md = readFileSync(r.cards.at(-1)!, 'utf8');
+  assert.match(md, /\*\*Severity:\*\* minor/);
+  assert.match(md, new RegExp(`On this report: holds up; severity too high\\. ${FLAT.replaceAll('.', '\\.')}`));
+});
+
+test('severity "too high" never hides a protected journey: posted, with the second check saying so', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const t = recorder(true);
+  const w = setup(t, linker(), { judge: tooHigh });
+  w.rules.noise = new Noise({ never_suppress: [{ section: 'http', route: '/v1/auth/login', status: '4..' }] });
+  const r = await w.patrol(tel, 0);
+  assert.equal(t.sent.length, 2, 'the rows card, then the report');
+  assert.match(t.sent[1]!.text, /^🟠 Major: Sign-in rejects emails/);
+  assert.match(parsed(t.sent[1]!), new RegExp(`⚠️ \\*A second AI check says its severity is too high, a human decides:\\* ${FLAT.replaceAll('.', '\\.')}`));
+  assert.doesNotMatch(parsed(t.sent[1]!), /second check agrees/);
+  assert.equal(r.filed[0]?.action, 'opened');
+  const id = r.filed[0]!.action === 'opened' ? r.filed[0]!.issue.id : '';
+  assert.ok(w.logs.includes(`report 1 opened ${id} (major); the second check says its severity is too high, posted anyway: a protected journey`));
+});
+
+test('severity "too low": one quiet line in the issue thread; the rating stands', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40), '/v1/ownership/transfer': between(2, 40) });
+  const t = recorder(true);
+  const LOW = 'Every transfer since 10:00 failed (E-1234-5), not a few.';
+  const w = setup(t, (s) => ({ issue: s.issues[0]?.id ?? 'new', ...(s.issues.length ? { severity: 'minor' as const } : {}) }), {
+    judge: () => ({ items: [{ item: 1, holds: 'yes', severity: 'too_low', reason: LOW }] }),
+  });
+  const first = await w.patrol(tel, 0); // opens the issue as a major, posted
+  const id = first.filed[0]!.action === 'opened' ? first.filed[0]!.issue.id : '';
+  assert.equal(t.sent.length, 2, 'the major, then its too-low line in its thread');
+  assert.match(t.sent[0]!.text, /^🟠 Major: Sign-in rejects emails/);
+  assert.equal(t.sent[1]!.thread_ts, '1700000000.000001');
+  assert.ok(!t.sent[1]!.reply_broadcast, 'not shown in the channel');
+  assert.equal(t.sent[1]!.text, '⬆️ A second AI check says Major is too low for “Sign-in rejects emails with a trailing space”: Every transfer since 10:00 failed, not a few.');
+  assert.ok(w.logs.includes(`report 1 opened ${id} (major); the second check says its severity is too low`));
+
+  // The same cause on a protected route (always challenged), rated minor: the
+  // report is not posted, the line still goes to the issue's thread.
+  w.rules.noise = new Noise({ never_suppress: [{ section: 'http', route: '/v1/ownership/transfer', status: '4..' }] });
+  const sibling = await w.patrol(tel, 2);
+  assert.equal(sibling.filed[0]?.action, 'linked');
+  assert.equal(w.issues!.get(id)!.severity, 'major', 'nothing raised');
+  const line = t.sent.at(-1)!;
+  assert.match(line.text, /^⬆️ A second AI check says Minor is too low for “Sign-in rejects emails with a trailing space”: /);
+  assert.equal(line.thread_ts, '1700000000.000001');
+  assert.ok(!line.reply_broadcast);
+  assert.ok(!t.sent.some((m) => /^🟡/.test(m.text)), 'the minor report itself is not posted');
+  assert.ok(w.logs.includes(`report 1 linked to ${id} (minor: not posted); the second check says its severity is too low`));
+  assert.match(readFileSync(sibling.cards.at(-1)!, 'utf8'), /^⬆️ A second AI check says Minor is too low/);
+});
+
+test('severity "too low" with no issue thread: only noted in the run, nothing extra posted', async () => {
+  const tel = schedule({ '/v1/auth/login': between(0, 40) });
+  const t = recorder(true);
+  const w = setup(t, linker(), { issues: false, judge: () => ({ items: [{ item: 1, holds: 'yes', severity: 'too_low', reason: 'Bigger than it says.' }] }) });
+  await w.patrol(tel, 0);
+  assert.equal(t.sent.length, 1, 'the report only');
+  assert.ok(w.logs.includes('report 1 no issue record: posted on its own; the second check says its severity is too low'));
+});
+
 // ---- 11-02/03, simulated --------------------------------------------------------
 
 // 21 h of one cause (an email with a trailing space fails validation) reaching
