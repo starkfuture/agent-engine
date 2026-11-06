@@ -6,6 +6,7 @@ import { parseArgs } from 'node:util';
 import { loadConfig, loadDotEnv, type Config } from './config.js';
 import { DirectTelemetry, GrafanaTelemetry, readToken, RecordingTelemetry, ReplayTelemetry, type Telemetry } from './clients/telemetry.js';
 import { httpQuery } from './patrol/collectors.js';
+import { contextQueries, extraPatrolQueries, recordContext, recordExtras } from './export.js';
 import { Noise } from './patrol/noise.js';
 import { Owners } from './patrol/owners.js';
 import { State } from './patrol/state.js';
@@ -70,7 +71,8 @@ Monitor:
   loop                        patrol every window (default 15 min) until stopped; same flags, plus --metrics-port,
                               and --port <n> for a /healthz-only listener (the pod's probes, monitor-only hosting)
   export --from <ISO> --to <ISO> [--out <dir>] [--step <min>]
-                              record every patrol query in the range (no LLM), for offline replay
+                              record every patrol query in the range (no LLM), for offline replay,
+                              plus trace error counts and raw context at 5-min resolution
   replay --from <ISO> --to <ISO> [--step <min>] [--replay <dir>] [--llm]
                               run the patrol across a past range with one shared state; prints
                               what would have been reported, step by step
@@ -518,22 +520,22 @@ async function main() {
       const state = State.memory();
       const quietSink = new CardSink(join(dir, 'out'));
       const exportCfg = { ...cfg, outDir: join(dir, 'out') };
-      writeFileSync(join(dir, 'export.json'), JSON.stringify({ from, to, stepMinutes: step, windowMinutes: w, sources: cfg.sources, createdAt: new Date() }, null, 1));
+      const context = { perPatrol: extraPatrolQueries(w), ranges: contextQueries(cfg.sources) };
+      writeFileSync(join(dir, 'export.json'), JSON.stringify({ from, to, stepMinutes: step, windowMinutes: w, sources: cfg.sources, context, createdAt: new Date() }, null, 1));
       for (let t = from; t <= to; t = new Date(t.getTime() + step * 60_000)) {
         try {
           await patrolOnce(tel, exportCfg, noise, state, quietSink, t, { llm: false, post: false, log });
         } catch (e) {
           log(`${t.toISOString()} failed: ${(e as Error).message}`);
         }
+        // Queries a later patrol will make (trace error counts), in its exact form.
+        await recordExtras(tel, t, w).catch((e: Error) => log(`${t.toISOString()} extras: ${e.message}`));
       }
       // Raw context beyond the patrol queries, for later analysis once retention drops it:
-      // every family at 5-min resolution, and error log lines per hour (redacted).
+      // the HTTP families, error counters, workloads, rollouts, span error counts and
+      // firing alerts at 5-min resolution, and error log lines per hour (redacted).
       const H = 3600_000;
-      for (let s = from.getTime(); s < to.getTime(); s += 6 * H) {
-        const e = new Date(Math.min(s + 6 * H, to.getTime()));
-        for (const f of cfg.sources.http_families)
-          await tel.promRange(httpQuery(f, 5), new Date(s), e, 300).catch((err) => log(`raw ${f.id}: ${(err as Error).message}`));
-      }
+      await recordContext(tel, cfg.sources, from, to, log);
       if (tel.has.loki)
         for (let s = from.getTime(); s < to.getTime(); s += H)
           await tel
