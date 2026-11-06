@@ -237,6 +237,49 @@ npm run dev -- replay --from 2026-09-29T00:00:00Z --to 2026-10-01T00:00:00Z --re
 
 A recording answers only the queries it recorded, by exact text and time. A query added since is a miss (in the "not in the recording" count): the logs and traces presence checks and an error counter's scrape-target total then read "not checked" on their source, which stays as read. A miss never makes a source blind that the older queries could read. Record again to check them.
 
+### Detector replay
+
+The patrol alone (no AI, no Slack, nothing written but `--json`) over every recording an expect file lists, scored per labelled problem and per day. A PR that changes detection or the gate compares its summary with the baseline's.
+
+```bash
+npm run dev -- replay --expect data/expect.json --json out/detect.json   # exits 1 when a labelled problem is lost
+```
+
+`expect.json` (each `dir` relative to the file):
+
+```json
+{
+  "recordings": [
+    { "dir": "incident-1026", "problems": [
+      { "id": "kc-102", "onset": "2026-10-26T10:22:30Z", "rows": ["/^http\\|keycloak\\|.*\\|5\\d\\d$/"], "urgency": "urgent", "note": "…" }
+    ] },
+    { "dir": "legacy-incident-1006", "sources": "export", "problems": [] },
+    { "dir": "comparison-1029", "warmup_minutes": 360 }
+  ]
+}
+```
+
+- `dir`: a folder of `*.jsonl` (an `export`, or any `RecordingTelemetry` folder). `from`/`to` default to its `export.json`; its window is used, since its queries carry it. The replay patrols once per window, as production does: a recording made at another step is refused. `--from`, `--to`, `--step` and `--replay` are refused with `--expect`, and so is `--llm`.
+- Times (`onset`, `from`, `to`) are ISO with their zone (`Z` or `+02:00`); one without a zone is refused, since it would be read as the machine's local time.
+- `sources`: `config` (default, `SRE_SOURCES_FILE`) or `export` (the sources in its `export.json`, for legacy recordings).
+- `warmup_minutes`: patrols that only build the carried state (an empty state makes chronic rows look new); they are not counted per day. Problems are judged in every patrol.
+- `problems`: `rows` are row keys or `/regex/`, as in `label.json`. `urgency`: `urgent` (the rows card should post it at once) or `normal` (the AI decides). A recording with no problems is a **control day**.
+
+What it reports:
+
+- **Flagged.** A patrol flags a problem when its `summary.send` holds a matching row that is news (fresh or worse): it passed the confirm hold (`PATROL_CONFIRM_PATROLS`) and the noise rules. Waiting, known, reminder and suppressed rows don't flag.
+- **Per problem:** the first patrol at or after onset that flags it, and the **latency** (patrol time − onset; production patrols 30 s later), when a matching row was first urgent, and when one was first in an AI run. **Lost**: never flagged. Labelled urgent but never urgent is shown, not failed. A match before onset is noted: the label may match a chronic row.
+- **Not in recording.** Per source: how many patrols failed because its queries are not in the recording, or read with a check that is not (presence, targets total), plus query misses per backend. Old recordings lack the rollout, Argo, SQS-presence and deploy queries. A problem whose rows can only come from such sources (its section, from a row key or a `/^section\|…/` regex) is "not in recording": neither a pass nor a fail. A regex that isn't anchored on its section, or alternates outside a group (`/^http\|a|^logs\|b/`), names no section: unflagged, its problem is lost.
+- **Per day** (counted patrols): flagged rows (and distinct keys, urgent rows, reminders, waiting rows), and **AI runs** the gate would start, per recording and over the control days. The gate is `patrolOnce`'s with no buttons and no issue record (`gateOf` in `src/detect.ts`); a run's reports cover all of its rows (fewest runs) or none (each row tried twice, then given up: most runs), shown as a range. Caps and deferral are not modelled. The challenger count is the runs challenged whatever the reports say (an urgent row): a lower bound, since a report the channel would see as critical or major is challenged too. Runs per day × the eval's $/run is the representative $/day. Tests in `test/detect.test.ts` record real patrols and require the simulated gate to start the same runs, on as many rows and with the same challenger, when reports cover every row and when they cover none.
+- **Exit code:** 1 on a lost labelled problem.
+- `--json <file>`: the whole result, with the build, the patrol settings, the sources file, and hashes of the expect file, the noise rules and each recording's sources, for comparing with a baseline. Two summaries compare like with like (only the code differs) when those hashes and the patrol settings are equal.
+
+`scripts/gate-sim.mts` prints the same gate per patrol as JSON lines (send, waiting, urgent, pending, run, challenger), for one recording and one cover assumption:
+
+```bash
+SRE_SOURCES_FILE=… node --import tsx scripts/gate-sim.mts <recording dir> <from> <to> <all|none> [step min]
+```
+
 ### Eval from past runs
 
 A monitor run keeps its prompt (`input.md`) and every tool result its model saw (`evidence.jsonl`) for the retention (30 days). Saved as an episode, it runs again with an AI change (prompt, severity rules, model) and no telemetry:

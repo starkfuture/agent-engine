@@ -34,8 +34,9 @@ import { POSTED } from './runner.js';
 // one may expect none: a minor one, say.
 const regexOf = (pattern: string): RegExp | undefined => (pattern.length > 2 && pattern.startsWith('/') && pattern.endsWith('/') ? new RegExp(pattern.slice(1, -1)) : undefined);
 // A pattern that starts with a slash is a regex or a mistake (/x/i, a lone /):
-// as a row key it would match nothing, silently.
-const valid = (pattern: string) => {
+// as a row key it would match nothing, silently. The detector replay's expect
+// file (src/detect.ts) takes the same patterns.
+export const validRowPattern = (pattern: string) => {
   if (!pattern.startsWith('/')) return true;
   try {
     return !!regexOf(pattern);
@@ -46,7 +47,7 @@ const valid = (pattern: string) => {
 export const Problem = z
   .object({
     id: z.string().min(1),
-    rows: z.array(z.string().min(1).refine(valid, 'neither a row key nor a valid /regex/')).min(1),
+    rows: z.array(z.string().min(1).refine(validRowPattern, 'neither a row key nor a valid /regex/')).min(1),
     actionable: z.boolean(),
     severity: ReportShape.severity.optional(),
     expect: z.enum(['post', 'no-post']),
@@ -284,7 +285,7 @@ export function problemsOf(label: Label, taskRows: readonly string[]): Array<Pro
 }
 
 const topOf = (rs: readonly EvalReport[]) => rs.reduce<Severity | undefined>((m, r) => (!m || RANK[r.severity] > RANK[m] ? r.severity : m), undefined);
-function matcher(patterns: readonly string[]): (row: string) => boolean {
+export function rowMatcher(patterns: readonly string[]): (row: string) => boolean {
   const exact = new Set(patterns);
   const res = patterns.map(regexOf).filter((re): re is RegExp => !!re);
   return (row) => exact.has(row) || res.some((re) => re.test(row));
@@ -303,7 +304,7 @@ function matcher(patterns: readonly string[]): (row: string) => boolean {
 //   no-post problem;
 // - duplicate: two or more posted reports on one problem that expects a post.
 export function scoreLabel(label: Label, taskRows: readonly string[], reports: readonly EvalReport[]): Score {
-  const problems = problemsOf(label, taskRows).map((p) => ({ p, on: matcher(p.rows) }));
+  const problems = problemsOf(label, taskRows).map((p) => ({ p, on: rowMatcher(p.rows) }));
   const scored = problems.map(({ p, on }): ProblemScore => {
     const mine = reports.filter((r) => r.rows.some(on));
     const posted = mine.filter((r) => r.posts);
