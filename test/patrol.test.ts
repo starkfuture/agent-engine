@@ -28,6 +28,28 @@ test('incident rows are flagged, steady noise is not', async () => {
   assert.match(renderSummary(s), /password\/reset 400: SPIKE \(fresh, started/);
 });
 
+test('each row shows its impact facts to the author and the challenger: share failing, whether 2xx held, chronic since', async () => {
+  const at = new Date('2026-09-29T12:15:00Z');
+  // A client burst on login: its 400s jump while its 200s stay flat, on a row
+  // the patrol has seen on and off for two days. Reset is the 29 Sep incident.
+  const login = 'http|backend-production|/v1/auth/login|400';
+  const burst = (q: string, when: Date) => [
+    ...world(q, when),
+    ...(q.includes('backend_be_production_http_requests_total')
+      ? [
+          { labels: { route: '/v1/auth/login', status_code: '200' }, value: 1000 },
+          { labels: { route: '/v1/auth/login', status_code: '400' }, value: when.getTime() === at.getTime() ? 60 : 2 },
+        ]
+      : []),
+  ];
+  const state = new State({ rows: { [login]: { firstSeen: '2026-09-27T08:00:00.000Z', lastSeen: '2026-09-29T06:00:00.000Z' } } });
+  const s = await buildSummary(new FakeTelemetry(burst), cfg(), new Noise({}), state, at);
+  const md = renderSummary(s, { forModel: true });
+  assert.match(md, /\/v1\/auth\/login 400: SPIKE \(fresh, .* \| traffic now 1060 \(1d 1002, 7d 1002\) \| impact: 5\.7% of route requests, 2xx flat, chronic since 09-27 08:00Z\n/);
+  assert.match(md, /\/v1\/auth\/password\/reset 400: .* \| impact: 79% of route requests, 2xx down 78% \(20 vs 1d 90, 7d 90\)\n/, 'fresh today: not chronic');
+  assert.equal(md, renderSummary(s), 'the same lines in the patrol file');
+});
+
 test('still visible the next day, and only re-sent when worse or after the reminder interval', async () => {
   const c = cfg();
   const state = State.memory();

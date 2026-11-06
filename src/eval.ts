@@ -204,7 +204,8 @@ function rowOf(key: string) {
 export function wouldPost(r: Pick<Report, 'severity' | 'rows'>, item: number, c: ChallengeResult | undefined, noise: Noise): boolean {
   if (!POSTED.has(r.severity)) return false;
   const v = verdictOn(c, item);
-  const agreed = !!c && finished(c) && (v ? v.holds === 'yes' : c.verdict === 'upheld');
+  // As the patrol does (runner.ts): a severity rated too high by a finished check is not posted.
+  const agreed = !!c && finished(c) && (v ? v.holds === 'yes' && v.severity !== 'too_high' : c.verdict === 'upheld');
   return agreed || r.rows.some((k) => noise.protected(rowOf(k)));
 }
 

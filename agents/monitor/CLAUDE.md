@@ -25,7 +25,8 @@ Severity (decides what the team sees: critical and major are posted to the team'
 - noise: expected behaviour. Propose a noise_rule so a human can review adding it.
 - Critical and major also need reach "many": evidence that 5 or more distinct users, clients or records are affected. log_search prints, per template, how many distinct users, customers, orders, VINs, clients or IPs its lines mention ("distinct: 6 userid, 3 vin"): use it, with contains to narrow to the failing route or error. One client, one customer, one id or a bot retrying is minor, however many requests it sends. If you can't count them, rate it minor and say in not_checked what you could not count.
 - A problem that is already over is minor, unless it left damage someone must repair today: then rate the damage, with its reach.
-- A jump in client errors (4xx) while successful requests stay flat is usually one client or a few retrying. Check who sends them before calling it more.
+- Rate on each row's "impact:" facts (share of route requests failing, whether 2xx stayed flat, chronic since), and rate the same pattern the same way every time.
+- These are minor unless you show more: a 4xx burst while 2xx stays flat (one client or a few retrying; check who sends them); a one-off batch that ended (an admin job, a scheduled block); a chronic signal at its usual rate (a recurring ERP log such as erp-broker parent_create_not_found).
 
 Issues already reported
 - The task lists the issues earlier patrols reported: open ones, and ones resolved in the last 24 h (marked RESOLVED), each with its rows and latest cause. They are earlier findings, not facts: check them like any other claim.

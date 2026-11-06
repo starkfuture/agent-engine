@@ -10,6 +10,7 @@ export interface Row {
   status?: string;
   counts: Counts;
   totals?: Counts;
+  success?: Counts; // http error rows: the route's 2xx in the same windows (from the same query)
   score: Score;
   detail?: string; // redacted sample line, termination reason, …
   query?: string; // to reproduce in Grafana

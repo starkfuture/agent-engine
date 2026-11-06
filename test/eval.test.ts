@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { loadAgent } from '../src/engine/agent.js';
 import { Evidence, type EvidenceItem } from '../src/engine/evidence.js';
+import type { ChallengeResult } from '../src/engine/challenge.js';
 import type { Engine } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
 import { Store } from '../src/engine/store.js';
@@ -555,4 +556,15 @@ test('representative $/day: the eval\'s mean $/run over runs that started, times
   const r = (cost: number): EvalResult => ({ episode: 'ep', run: { id: 'r', status: 'ok' }, cost, turns: 1, reports: [], hits: { author: 1, challenger: 0 }, misses: [], ambiguous: [], material: [], newTools: [] });
   assert.match(evalTotals([r(0.3), r(0.5)], 0, 96), / · \$0\.80 · \$0\.40\/run × 96 runs\/day = \$38\.40\/day$/);
   assert.doesNotMatch(evalTotals([r(0.3)]), /runs\/day/);
+});
+
+test('wouldPost mirrors the patrol: a major the finished check rates too high is not posted, unless it is a protected journey', () => {
+  const r = { severity: 'major' as const, rows: ['http|auth|/login|500'] };
+  const check = (severity?: 'too_high' | 'right' | 'too_low') =>
+    ({ verdict: 'upheld', blocking: [], notes: [], items: [{ item: 1, holds: 'yes', reason: 'checked', evidence: ['E-1'], ...(severity ? { severity } : {}) }], overall: 'Holds up.', cost: 0, turns: 1, toolCalls: 1 }) as unknown as ChallengeResult;
+  assert.equal(wouldPost(r, 1, check(), new Noise({})), true);
+  assert.equal(wouldPost(r, 1, check('right'), new Noise({})), true);
+  assert.equal(wouldPost(r, 1, check('too_low'), new Noise({})), true);
+  assert.equal(wouldPost(r, 1, check('too_high'), new Noise({})), false);
+  assert.equal(wouldPost(r, 1, check('too_high'), new Noise({ never_suppress: [{ section: 'http', service: 'auth', route: '/login' }] })), true);
 });
