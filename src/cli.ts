@@ -22,6 +22,7 @@ import { runAgent, stopAllRuns, type Engine } from './engine/run.js';
 import { sdkSession } from './engine/session.js';
 import { patrolLoop, patrolOnce, type MonitorAgent } from './runner.js';
 import { evalEpisode, evalExitCode, evalLine, evalTotals, problemLines, type EvalResult } from './eval.js';
+import { detect, detectExitCode, detectJson, detectLines, loadExpect } from './detect.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { buildServer, shutdown, slackNotifier, startHttp, type McpContext } from './mcp/server.js';
 import { loadRepos } from './mcp/repos.js';
@@ -74,6 +75,10 @@ Monitor:
   replay --from <ISO> --to <ISO> [--step <min>] [--replay <dir>] [--llm]
                               run the patrol across a past range with one shared state; prints
                               what would have been reported, step by step
+  replay --expect <file> [--json <file>]
+                              detector replay (no AI, no Slack): every recording the expect file lists,
+                              scored per problem (detection latency, lost) and per day (flagged rows,
+                              AI runs the gate would start); exits 1 on a lost problem. --json writes the summary
   eval <episode-dir>...       run past monitor runs again (real model calls, local only): each folder holds a
                               run's input.md and evidence.jsonl (export_run over MCP), optionally output.json
                               and label.json; the AI's tools answer from the recorded results. Writes
@@ -90,6 +95,8 @@ const { positionals, values: a } = parseArgs({
     step: { type: 'string' },
     out: { type: 'string' },
     replay: { type: 'string' },
+    expect: { type: 'string' },
+    json: { type: 'string' },
     task: { type: 'string' },
     path: { type: 'string' },
     ref: { type: 'string' },
@@ -544,6 +551,22 @@ async function main() {
     }
 
     case 'replay': {
+      if (a.expect) {
+        // The detector alone, over the recordings the expect file lists; --from, --to and --replay come from it.
+        if (a.llm) throw new Error('replay --expect never runs the AI: drop --llm');
+        const ignored = (['from', 'to', 'step', 'replay'] as const).filter((k) => a[k] !== undefined);
+        if (ignored.length) throw new Error(`replay --expect takes the recordings, their range and step from the expect file: drop ${ignored.map((k) => `--${k}`).join(', ')}`);
+        const file = resolve(a.expect);
+        const r = await detect(loadExpect(file), cfg, noise, log);
+        for (const l of detectLines(r)) console.log(l);
+        if (a.json) {
+          writeFileSync(resolve(a.json), JSON.stringify(detectJson(r, { expect: file, build: engineBuild(cfg), cfg }), null, 1) + '\n');
+          log(`summary: ${resolve(a.json)}`);
+        }
+        // Not a pass: a labelled problem no patrol flagged. "Not in recording" is neither.
+        if (detectExitCode(r)) process.exitCode = 1;
+        return;
+      }
       const from = align(date(a.from, 'from'), w);
       const to = date(a.to, 'to');
       const step = Number(a.step ?? w);
