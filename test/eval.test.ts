@@ -9,7 +9,25 @@ import type { Engine } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
 import { Store } from '../src/engine/store.js';
 import { fence } from '../src/engine/text.js';
-import { evalEpisode, evalLine, evalTotals, promptOf, recordedTools, wouldPost, type Tally } from '../src/eval.js';
+import {
+  classifyMiss,
+  costPerDay,
+  evalEpisode,
+  evalExitCode,
+  evalLine,
+  evalTotals,
+  Label,
+  parseLabel,
+  problemLines,
+  problemsOf,
+  promptOf,
+  recordedTools,
+  scoreLabel,
+  wouldPost,
+  type EvalReport,
+  type EvalResult,
+  type Tally,
+} from '../src/eval.js';
 import { monitorTask, taskRows } from '../src/investigate/prompt.js';
 import type { Report } from '../src/investigate/report.js';
 import { monitorTools } from '../src/investigate/tools.js';
@@ -169,12 +187,18 @@ test('eval: a past run again on its own prompt, tools from its recording, the ch
   assert.deepEqual(res.hits, { author: 1, challenger: 1 });
   assert.deepEqual(res.misses, [{ by: 'author', tool: 'promql', args: { query: 'sum(rate(session_store_errors_total[5m]))' } }]);
   assert.deepEqual(res.ambiguous, []);
+  // The recording never had promql: a new tool, listed, not material.
+  assert.deepEqual(res.newTools, ['promql']);
+  assert.deepEqual(res.material, []);
   assert.deepEqual(res.reports, [{ title: 'Login returns 500 for most users', severity: 'major', rows: [LOGIN], issue: 'new', holds: 'yes', posts: true }]);
   assert.deepEqual(res.prod, { reports: [{ title: 'Login returns 500 for most users', severity: 'major', rows: [LOGIN], issue: 'new', holds: 'yes', posts: true }], challenge: 'upheld' });
   assert.equal(res.inconclusive, undefined);
   assert.equal(res.outcome, 'match');
   assert.deepEqual(JSON.parse(readFileSync(join(dir, 'eval-result.json'), 'utf8')), JSON.parse(JSON.stringify(res)));
-  assert.match(evalLine(res), /: ok · reports major \(posts\) · prod major \(posts\) · 2 hit\(s\), 1 miss\(es\), 0 ambiguous: 1 of 3 call\(s\) unanswered · 5 turns · \$0\.40 · label post major: match$/);
+  assert.match(evalLine(res), /: ok · reports major \(posts\) · prod major \(posts\) · 2 hit\(s\), 1 miss\(es\), 0 ambiguous: 1 of 3 call\(s\) unanswered · new tool, not in recording: promql · 5 turns · \$0\.40 · label post major: match$/);
+  // The old label form: one implicit problem over the task's rows.
+  assert.deepEqual(problemLines(res), ['  label (actionable, post major): 1 report(s), 1 posted, top major · ok']);
+  assert.equal(evalExitCode([res]), 0);
   assert.equal(e.store.get(res.run.id)!.trigger, 'eval');
 
   // Without the challenger, a major report is not posted; the challenge was due, so it says nothing either way.
@@ -183,6 +207,7 @@ test('eval: a past run again on its own prompt, tools from its recording, the ch
   assert.equal(quick.reports[0]!.posts, false);
   assert.equal(quick.inconclusive, 'a challenge was due and was skipped');
   assert.equal(quick.outcome, 'inconclusive');
+  assert.equal(evalExitCode([res, quick]), 1);
   // ...unless one of its rows is a protected journey, which posts regardless.
   assert.equal(wouldPost(quick.reports[0]!, 1, undefined, new Noise({ never_suppress: [{ section: 'http', service: 'auth', route: '/login' }] })), true);
 
@@ -195,7 +220,7 @@ test('eval: a past run again on its own prompt, tools from its recording, the ch
   assert.equal(stopped.requests.length, 0);
   assert.equal(held.outcome, 'inconclusive'); // never ran: judged neither way
   assert.match(evalLine(held), /label post major: inconclusive · inconclusive: the run ended skipped \(kill switch is on/);
-  assert.equal(evalTotals([res, quick, held]), '3 episode(s) · labels: 1 match, 0 mismatch, 2 inconclusive · 3 hit(s), 2 miss(es), 0 ambiguous: 2 of 5 call(s) unanswered · $0.70');
+  assert.equal(evalTotals([res, quick, held]), '3 episode(s) · labels: 1 match, 0 mismatch, 2 inconclusive · problems: 1 judged, all as labelled · 3 hit(s), 2 miss(es), 0 ambiguous: 2 of 5 call(s) unanswered · $0.70');
 });
 
 // ---------- what an eval can't judge, and the patrol's challenge gate ----------
@@ -275,4 +300,259 @@ test('eval: the challenger runs on what the patrol would challenge, as far as ro
   assert.equal(plain.sessions, 1);
   assert.equal(plain.r.challenge, undefined);
   assert.equal(plain.r.outcome, 'match');
+});
+
+// ---------- label v2: problems, scored one by one ----------
+
+const PAY = 'http|payments|/charge|502';
+const CRAWLER = 'logs|crawler|bot hit on /sitemap|';
+const OTHER = 'http|search|/query|504';
+const R = (severity: Report['severity'], rows: string[], posts: boolean, title = `${severity} on ${rows.join(', ')}`): EvalReport => ({ title, severity, rows, posts });
+
+test('label: v2 lists problems (row keys or /regexes/); the old {expect, severity, note} form still parses, as one implicit problem; contradictions are refused', () => {
+  const v1 = parseLabel({ expect: 'post', severity: 'major', note: 'real outage' });
+  assert.deepEqual(v1, { expect: 'post', severity: 'major', note: 'real outage' });
+  assert.deepEqual(Label.parse({ expect: 'no-post' }), { expect: 'no-post' });
+  assert.deepEqual(problemsOf(v1, [LOGIN, CRAWLER]), [{ id: 'label', rows: [LOGIN, CRAWLER], actionable: true, expect: 'post', severity: 'major', implicit: true }]);
+  assert.deepEqual(problemsOf(parseLabel({ expect: 'no-post' }), [LOGIN]), [{ id: 'label', rows: [LOGIN], actionable: false, expect: 'no-post', implicit: true }]);
+
+  const v2 = { problems: [{ id: 'payments', rows: [PAY, '/^http\\|payments\\|/'], actionable: true, severity: 'critical', expect: 'post' }], note: 'checkout down' };
+  assert.deepEqual(parseLabel(v2), v2);
+  assert.deepEqual(Label.parse(v2), v2);
+  const bad = (problem: object) => ({ problems: [{ id: 'p', rows: [LOGIN], actionable: true, expect: 'post', ...problem }] });
+  assert.throws(() => parseLabel(bad({ actionable: false })), /not actionable cannot expect a post/);
+  assert.throws(() => parseLabel(bad({ rows: ['/(unclosed/'] })), /neither a row key nor a valid \/regex\//);
+  // A pattern starting with a slash that is no /regex/ would match nothing as a row key (they start with their section): refused.
+  for (const rows of [['/^http\\|auth\\|/i'], ['/'], ['//'], ['/http|auth|/login|500']]) assert.throws(() => parseLabel(bad({ rows })), /neither a row key nor a valid \/regex\//, rows[0]);
+  // A v1 expect or severity beside problems would say nothing any more: refused, not dropped.
+  assert.throws(() => parseLabel({ ...bad({}), severity: 'critical' }), /with problems, expect and severity go on each problem/);
+  assert.throws(() => parseLabel({ ...bad({}), expect: 'no-post' }), /with problems, expect and severity go on each problem/);
+  assert.throws(() => Label.parse({ ...bad({}), expect: 'no-post' }));
+  assert.throws(() => parseLabel(bad({ rows: [] })));
+  assert.throws(() => parseLabel({ problems: [bad({}).problems[0], bad({}).problems[0]] }), /problem ids must be unique/);
+  // A v2 label never falls back to the v1 form, even with v1 keys beside it.
+  assert.throws(() => parseLabel({ expect: 'post', ...bad({ actionable: false }) }), /not actionable/);
+  assert.throws(() => Label.parse({ expect: 'post', ...bad({ actionable: false }) }));
+  assert.throws(() => parseLabel({ problems: [] }));
+});
+
+test('score: a missed problem, a false post, a duplicate and a severity miss are each a mismatch; regex rows match', () => {
+  const label = parseLabel({
+    problems: [
+      { id: 'login', rows: [LOGIN], actionable: true, severity: 'major', expect: 'post' },
+      { id: 'payments', rows: ['/^http\\|payments\\|/'], actionable: true, severity: 'critical', expect: 'post' },
+      { id: 'crawler', rows: [CRAWLER], actionable: false, severity: 'noise', expect: 'no-post' },
+    ],
+  });
+  const rows = [LOGIN, PAY, CRAWLER, OTHER];
+  const score = (reports: EvalReport[]) => scoreLabel(label, rows, reports);
+  const counts = (s: ReturnType<typeof score>) => ({ missed: s.missed, severity: s.severity, falsePosts: s.falsePosts, duplicates: s.duplicates, match: s.match });
+
+  // As labelled: both actionable problems posted once at their severity, the crawler filed as noise.
+  const good = score([R('major', [LOGIN], true), R('critical', [PAY], true), R('noise', [CRAWLER], false)]);
+  assert.deepEqual(counts(good), { missed: 0, severity: 0, falsePosts: 0, duplicates: 0, match: true });
+  assert.deepEqual(good.problems.map((p) => [p.id, p.reports, p.posted, p.top]), [['login', 1, 1, 'major'], ['payments', 1, 1, 'critical'], ['crawler', 1, 0, 'noise']]);
+  assert.deepEqual(good.unlabelled, []);
+  assert.deepEqual(good.notInRun, []);
+
+  // Missed: login filed major but not posted (the challenger disagreed); its severity is not judged on top.
+  const missed = score([R('major', [LOGIN], false), R('critical', [PAY], true), R('noise', [CRAWLER], false)]);
+  assert.deepEqual(counts(missed), { missed: 1, severity: 0, falsePosts: 0, duplicates: 0, match: false });
+  assert.equal(missed.problems[0]!.missed, true);
+  assert.equal(missed.problems[0]!.severityMiss, undefined);
+
+  // False posts: one on the no-post crawler problem, one on rows no problem has.
+  const falsePost = score([R('major', [LOGIN], true), R('critical', [PAY], true), R('major', [CRAWLER], true), R('major', [OTHER], true, 'Search times out')]);
+  assert.deepEqual(counts(falsePost), { missed: 0, severity: 0, falsePosts: 2, duplicates: 0, match: false });
+  assert.equal(falsePost.problems[2]!.falsePosts, 1);
+  assert.equal(falsePost.problems[2]!.severityMiss, undefined); // already a false post
+  assert.deepEqual(falsePost.unlabelled, [4]);
+  // A posted report that bundles a no-post problem's row with a real one: the real one is caught, the post is still false.
+  const bundled = score([R('major', [LOGIN, CRAWLER], true), R('critical', [PAY], true)]);
+  assert.deepEqual(counts(bundled), { missed: 0, severity: 0, falsePosts: 1, duplicates: 0, match: false });
+
+  // Duplicate: two posted reports on login.
+  const dup = score([R('major', [LOGIN], true), R('major', [LOGIN], true), R('critical', [PAY], true), R('noise', [CRAWLER], false)]);
+  assert.deepEqual(counts(dup), { missed: 0, severity: 0, falsePosts: 0, duplicates: 1, match: false });
+  assert.equal(dup.problems[0]!.duplicate, true);
+
+  // Severity miss: payments posted as major, labelled critical; an unposted critical on it does not count over the post.
+  const sev = score([R('major', [LOGIN], true), R('major', [PAY], true), R('critical', [PAY], false), R('noise', [CRAWLER], false)]);
+  assert.deepEqual(counts(sev), { missed: 0, severity: 1, falsePosts: 0, duplicates: 0, match: false });
+  assert.deepEqual([sev.problems[1]!.top, sev.problems[1]!.severityMiss], ['major', true]);
+  // A no-post problem labelled noise wants a noise report: a minor one, or none, misses its severity.
+  assert.equal(score([R('major', [LOGIN], true), R('critical', [PAY], true), R('minor', [CRAWLER], false)]).severity, 1);
+  assert.equal(score([R('major', [LOGIN], true), R('critical', [PAY], true)]).problems[2]!.severityMiss, true);
+
+  // Lines per problem, and the posts on no problem.
+  const r = { score: falsePost, reports: [R('major', [LOGIN], true), R('critical', [PAY], true), R('major', [CRAWLER], true), R('major', [OTHER], true, 'Search times out')] } as EvalResult;
+  assert.deepEqual(problemLines(r), [
+    '  login (actionable, post major): 1 report(s), 1 posted, top major · ok',
+    '  payments (actionable, post critical): 1 report(s), 1 posted, top critical · ok',
+    '  crawler (not actionable, no-post noise): 1 report(s), 1 posted, top major · FALSE POST ×1',
+    '  on no problem: major "Search times out" · FALSE POST ×1',
+  ]);
+  assert.deepEqual(problemLines({ ...r, score: dup }).slice(0, 1), ['  login (actionable, post major): 2 report(s), 2 posted, top major · DUPLICATE ×2']);
+  assert.deepEqual(problemLines({ ...r, score: sev })[1], '  payments (actionable, post critical): 2 report(s), 1 posted, top major · SEVERITY major, label critical');
+  assert.deepEqual(problemLines({ ...r, score: missed })[0], '  login (actionable, post major): 1 report(s), 0 posted, top major · MISSED');
+
+  // A problem to post that no row of the task is: the label is wrong (inconclusive), not a miss to count.
+  const elsewhere = scoreLabel(label, [LOGIN, CRAWLER], [R('major', [LOGIN], true), R('noise', [CRAWLER], false)]);
+  assert.deepEqual(elsewhere.notInRun, ['payments']);
+  assert.equal(elsewhere.problems[1]!.missed, undefined);
+  assert.deepEqual(counts(elsewhere), { missed: 0, severity: 0, falsePosts: 0, duplicates: 0, match: false });
+  assert.match(problemLines({ ...r, score: elsewhere })[1]!, /payments .*: no row of it in this run · LABEL ERROR/);
+
+  // A row under both a problem to post and one not to (a broad no-post regex over a real problem's row): no report on it
+  // can be right, so the label is wrong, not the run.
+  const broad = parseLabel({
+    problems: [
+      { id: 'login', rows: [LOGIN], actionable: true, expect: 'post' },
+      { id: 'other-http', rows: ['/^http\\|/'], actionable: false, expect: 'no-post' },
+    ],
+  });
+  const clash = scoreLabel(broad, [LOGIN, OTHER, CRAWLER], [R('major', [LOGIN], true)]);
+  assert.deepEqual(clash.conflicts, [LOGIN]);
+  assert.equal(clash.match, false);
+  assert.deepEqual(problemLines({ ...r, reports: [R('major', [LOGIN], true)], score: clash }).at(-1), `  under a problem to post and one not to: ${LOGIN} · LABEL ERROR (inconclusive)`);
+  assert.deepEqual(good.conflicts, []);
+
+  // The v1 form as before: one problem over the whole run, so two posts are no duplicate; a post on "no-post" is false.
+  assert.equal(scoreLabel(parseLabel({ expect: 'post' }), rows, [R('major', [LOGIN], true), R('critical', [PAY], true)]).match, true);
+  assert.deepEqual(counts(scoreLabel(parseLabel({ expect: 'no-post' }), rows, [R('major', [OTHER], true)])), { missed: 0, severity: 0, falsePosts: 1, duplicates: 0, match: false });
+  assert.equal(scoreLabel(parseLabel({ expect: 'no-post', severity: 'minor' }), rows, [R('minor', [OTHER], false)]).match, true);
+});
+
+test('material misses: an author miss on a recorded tool or any ambiguous call is material; a new tool is not', () => {
+  const recorded = new Set(['service_overview', 'log_search']);
+  const call = (by: 'author' | 'challenger', tool: string) => ({ by, tool, args: {} });
+  assert.equal(classifyMiss(call('author', 'service_overview'), 'miss', recorded), 'material');
+  assert.equal(classifyMiss(call('challenger', 'service_overview'), 'miss', recorded), 'not material');
+  assert.equal(classifyMiss(call('author', 'firing_alerts'), 'miss', recorded), 'new tool, not in recording');
+  assert.equal(classifyMiss(call('challenger', 'pod_status'), 'miss', recorded), 'new tool, not in recording');
+  assert.equal(classifyMiss(call('author', 'log_search'), 'ambiguous', recorded), 'material');
+  assert.equal(classifyMiss(call('challenger', 'log_search'), 'ambiguous', recorded), 'material');
+});
+
+test('eval: an author miss on a tool the recording had, or an ambiguous call, makes the episode inconclusive; a new tool does not', async () => {
+  const post = { expect: 'post', severity: 'major' };
+  // The author asks service_overview for another window than the recorded run did.
+  const elsewhere: Script = async function* (sim) {
+    await sim.mcp('service_overview', { service: 'auth', minutes: 120 });
+    yield* reporting('major', [LOGIN])(sim);
+  };
+  const a = await evalEpisode(engine(fakeSession(elsewhere, upholds)), monitor(), testConfig(), new Noise({}), episode([LOGIN], [OVERVIEW], post));
+  assert.equal(a.run.status, 'ok');
+  assert.deepEqual(a.material, [{ by: 'author', tool: 'service_overview', args: { service: 'auth', minutes: 120 }, how: 'miss' }]);
+  assert.equal(a.inconclusive, '1 material unanswered call(s): missed service_overview (author)');
+  assert.equal(a.outcome, 'inconclusive');
+  assert.equal(a.score?.match, true); // what it would have scored, kept for a look
+  assert.equal(evalExitCode([a]), 1);
+
+  // The recorded run made the call twice with different results: ambiguous, material, whoever asked.
+  const recording: EvidenceItem[] = [OVERVIEW, { ...OVERVIEW, id: 'E-0c0c-2', text: 'route status | now\n/login 500 | 3' }, { ...OVERVIEW, id: 'E-0c0c-3', args: { service: 'auth', minutes: 30 } }];
+  const ambiguousFirst: Script = async function* (sim) {
+    await sim.mcp('service_overview', { service: 'auth', minutes: 60 });
+    const r = await sim.mcp('service_overview', { service: 'auth', minutes: 30 });
+    await sim.mcp('submit_report', report({ rows: [LOGIN], evidence: [{ id: lastId(r.text), quote: '/login 500 | 420', claim: '420 logins failed' }] }));
+    yield ok(0.2, 3);
+  };
+  const upholds30: Script = async function* (sim) {
+    const r = await sim.mcp('service_overview', { service: 'auth', minutes: 30 });
+    await sim.mcp('submit_challenge', { objections: [], items: [{ item: 1, holds: 'yes', reason: 'The counts match.', evidence: [lastId(r.text)] }], overall: 'Holds up.' });
+    yield ok(0.1, 2);
+  };
+  const b = await evalEpisode(engine(fakeSession(ambiguousFirst, upholds30)), monitor(), testConfig(), new Noise({}), episode([LOGIN], recording, post));
+  assert.equal(b.run.status, 'ok');
+  assert.deepEqual(b.hits, { author: 1, challenger: 1 });
+  assert.deepEqual(b.material, [{ by: 'author', tool: 'service_overview', args: { service: 'auth', minutes: 60 }, how: 'ambiguous' }]);
+  assert.equal(b.inconclusive, '1 material unanswered call(s): ambiguous service_overview (author)');
+  assert.equal(b.outcome, 'inconclusive');
+  assert.match(evalLine(b), /label post major: inconclusive · inconclusive: 1 material unanswered call\(s\)/);
+
+  // A tool the recording never had (one added since): listed, not material, the episode judged.
+  const newTool: Script = async function* (sim) {
+    await sim.mcp('promql', { query: 'sum(up{job="auth"})' });
+    yield* reporting('major', [LOGIN])(sim);
+  };
+  const d = await evalEpisode(engine(fakeSession(newTool, upholds)), monitor(), testConfig(), new Noise({}), episode([LOGIN], [OVERVIEW], post));
+  assert.deepEqual(d.newTools, ['promql']);
+  assert.deepEqual(d.material, []);
+  assert.equal(d.inconclusive, undefined);
+  assert.equal(d.outcome, 'match');
+  assert.equal(evalExitCode([d]), 0);
+});
+
+test('eval: a v2 label end to end: a post on the no-post problem is a false post, a mismatch, and the CLI exits 1', async () => {
+  const rows = [LOGIN, CRAWLER];
+  const label = {
+    problems: [
+      { id: 'login', rows: [LOGIN], actionable: true, severity: 'major', expect: 'post' },
+      { id: 'crawler', rows: ['/^logs\\|crawler\\|/'], actionable: false, expect: 'no-post' },
+    ],
+  };
+  const two: Script = async function* (sim) {
+    const r = await sim.mcp('service_overview', { service: 'auth', minutes: 60 });
+    const ev = [{ id: lastId(r.text), quote: '/login 500 | 420', claim: '420 logins failed' }];
+    await sim.mcp('submit_report', report({ rows: [LOGIN], evidence: ev }));
+    await sim.mcp('submit_report', report({ title: 'Crawler floods the sitemap', rows: [CRAWLER], evidence: ev }));
+    yield ok(0.2, 3);
+  };
+  const both: Script = async function* (sim) {
+    const r = await sim.mcp('service_overview', { service: 'auth' });
+    const yes = (item: number) => ({ item, holds: 'yes', reason: 'The counts match.', evidence: [lastId(r.text)] });
+    await sim.mcp('submit_challenge', { objections: [], items: [yes(1), yes(2)], overall: 'Holds up.' });
+    yield ok(0.1, 2);
+  };
+  const res = await evalEpisode(engine(fakeSession(two, both)), monitor(), testConfig(), new Noise({}), episode(rows, [OVERVIEW], label));
+  assert.deepEqual(res.reports.map((r) => [r.rows[0], r.posts]), [[LOGIN, true], [CRAWLER, true]]);
+  assert.equal(res.inconclusive, undefined);
+  assert.equal(res.outcome, 'mismatch');
+  assert.deepEqual([res.score?.missed, res.score?.falsePosts, res.score?.duplicates, res.score?.severity], [0, 1, 0, 0]);
+  assert.match(evalLine(res), /label 2 problem\(s\): MISMATCH \(1 false post\(s\)\)$/);
+  assert.deepEqual(problemLines(res), [
+    '  login (actionable, post major): 1 report(s), 1 posted, top major · ok',
+    '  crawler (not actionable, no-post): 1 report(s), 1 posted, top major · FALSE POST ×1',
+  ]);
+  assert.equal(evalExitCode([res]), 1);
+  assert.equal(evalTotals([res]), '1 episode(s) · labels: 0 match, 1 mismatch, 0 inconclusive · problems: 2 judged, 1 false post(s) · 2 hit(s), 0 miss(es), 0 ambiguous: 0 of 2 call(s) unanswered · $0.30');
+
+  // The same run against a label that puts login under a no-post regex too: the label is wrong, not the run.
+  const broad = { problems: [label.problems[0], { id: 'crawler', rows: ['/^(logs|http)\\|/'], actionable: false, expect: 'no-post' }] };
+  const wrong = await evalEpisode(engine(fakeSession(two, both)), monitor(), testConfig(), new Noise({}), episode(rows, [OVERVIEW], broad));
+  assert.equal(wrong.inconclusive, `the label puts row(s) ${LOGIN} under both a problem to post and one not to`);
+  assert.equal(wrong.outcome, 'inconclusive');
+  assert.equal(evalExitCode([wrong]), 1);
+  // A problem to post with no row in the task: inconclusive too, and not counted as missed.
+  const absent = { problems: [...label.problems, { id: 'payments', rows: [PAY], actionable: true, expect: 'post' }] };
+  const off = await evalEpisode(engine(fakeSession(two, both)), monitor(), testConfig(), new Noise({}), episode(rows, [OVERVIEW], absent));
+  assert.equal(off.inconclusive, "the label's problem(s) to post payments match no row of the task");
+  assert.equal(off.score?.missed, 0);
+  assert.equal(evalTotals([res, wrong, off]), '3 episode(s) · labels: 0 match, 1 mismatch, 2 inconclusive · problems: 2 judged, 1 false post(s) · 6 hit(s), 0 miss(es), 0 ambiguous: 0 of 6 call(s) unanswered · $0.90');
+  assert.equal(evalTotals([wrong]), '1 episode(s) · labels: 0 match, 0 mismatch, 1 inconclusive · problems: 0 judged · 2 hit(s), 0 miss(es), 0 ambiguous: 0 of 2 call(s) unanswered · $0.30');
+});
+
+test('eval exit code: 1 on any mismatch, inconclusive episode or failed episode; 0 when all match or are unlabelled', () => {
+  const base: EvalResult = { episode: 'ep', run: { id: 'r', status: 'ok' }, cost: 0.3, turns: 3, reports: [], hits: { author: 1, challenger: 0 }, misses: [], ambiguous: [], material: [], newTools: [] };
+  assert.equal(evalExitCode([base]), 0);
+  assert.equal(evalExitCode([base, { ...base, outcome: 'match' }]), 0);
+  assert.equal(evalExitCode([base, { ...base, outcome: 'mismatch' }]), 1);
+  assert.equal(evalExitCode([base, { ...base, inconclusive: 'the author got no recorded result', outcome: 'inconclusive' }]), 1);
+  assert.equal(evalExitCode([{ ...base, inconclusive: 'the run ended error' }]), 1); // unlabelled, still says nothing
+  // ...and the totals say so, or a run that exits 1 would show nothing wrong in its last line.
+  assert.equal(evalTotals([{ ...base, outcome: 'match', label: { expect: 'post' } }, { ...base, inconclusive: 'the run ended error' }]), '2 episode(s) · labels: 1 match, 0 mismatch, 0 inconclusive · unlabelled: 1 inconclusive · 2 hit(s), 0 miss(es), 0 ambiguous: 0 of 2 call(s) unanswered · $0.60');
+  assert.doesNotMatch(evalTotals([base]), /unlabelled/);
+  assert.equal(evalExitCode([base], 1), 1);
+});
+
+test('representative $/day: the eval\'s mean $/run over runs that started, times the runs per day a detector replay counts', () => {
+  const at = (cost: number, status = 'ok') => ({ cost, run: { id: 'r', status } });
+  const d = costPerDay([at(0.3), at(0.5, 'no_output'), at(0, 'skipped')], 96);
+  assert.deepEqual({ ...d!, perDay: Number(d!.perDay.toFixed(6)) }, { runs: 2, perRun: 0.4, runsPerDay: 96, perDay: 38.4 });
+  assert.equal(costPerDay([at(0, 'skipped')], 96), undefined);
+  assert.throws(() => costPerDay([at(0.3)], -1), /runs per day/);
+  assert.throws(() => costPerDay([at(0.3)], Number.NaN), /runs per day/);
+  const r = (cost: number): EvalResult => ({ episode: 'ep', run: { id: 'r', status: 'ok' }, cost, turns: 1, reports: [], hits: { author: 1, challenger: 0 }, misses: [], ambiguous: [], material: [], newTools: [] });
+  assert.match(evalTotals([r(0.3), r(0.5)], 0, 96), / · \$0\.80 · \$0\.40\/run × 96 runs\/day = \$38\.40\/day$/);
+  assert.doesNotMatch(evalTotals([r(0.3)]), /runs\/day/);
 });

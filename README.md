@@ -243,13 +243,50 @@ A monitor run keeps its prompt (`input.md`) and every tool result its model saw 
 
 ```bash
 # An admin saves a run's files over MCP (export_run, part by part) into one folder per episode,
-# optionally with label.json: {"expect": "post" | "no-post", "severity": "major", "note": "…"}
+# optionally with label.json (below)
 npm run dev -- eval data/episodes/*   # real model calls: same caps and STOP file; --no-challenge skips the challenger
 ```
 
 - The AI's tools keep their names and schemas but answer from the recording: the same tool with the same arguments (redacted, as stored) gets the recorded result. Any other call is an error for the model and a counted miss; so is a call recorded twice with different results (two emails, say, redact the same), counted as ambiguous.
 - The challenger runs as the patrol decides it, as far as row keys tell: rollout rows, protected journeys, or a report that would post. A big jump alone isn't seen (it needs the row's counts).
-- Each episode gets `eval-result.json`: the reports and whether each would post (the patrol's rule with no issue record: critical or major, and the challenger agrees, or a protected journey), hits, misses and ambiguous calls, cost and turns, prod's reports under the same rule, and the outcome against `label.json`: match, mismatch, or inconclusive when the author got no recorded result, a due challenge didn't finish, or the run didn't.
+
+`label.json` lists the problems among the run's rows and what the run should do with each:
+
+```json
+{
+  "problems": [
+    { "id": "login-500", "rows": ["http|auth|/login|500"], "actionable": true, "severity": "major", "expect": "post" },
+    { "id": "crawler", "rows": ["/^logs\\|crawler\\|/"], "actionable": false, "expect": "no-post" }
+  ],
+  "note": "…"
+}
+```
+
+- `rows`: exact row keys, or JavaScript regexes between slashes (unanchored, no flags). Row keys never start with a slash, so a pattern that does and is no valid `/regex/` is refused. A report is on a problem when one of its rows is.
+- `expect` decides the posting checks. A problem that is not `actionable` can't expect a post; an actionable one may expect none (a minor one, say).
+- The old form, `{"expect": "post" | "no-post", "severity": "major", "note": "…"}`, still works: one problem over all of the run's rows, which counts no duplicates. A top-level `expect` or `severity` beside `problems` is refused.
+
+What is scored, per problem, against the reports that would post (the patrol's rule with no issue record: critical or major, and the challenger agrees, or a protected journey). Each is a **mismatch**:
+
+- **Missed**: a problem that expects a post has no posted report on it.
+- **Severity**: the run's top severity on a problem (its top posted report's, else its top report's) is not the label's. Not judged on a problem already missed or falsely posted.
+- **False post**: a posted report on no problem that expects a post, or on any `no-post` problem.
+- **Duplicate**: two or more posted reports on one problem that expects a post.
+
+An episode is **inconclusive**, neither a pass nor a fail, when:
+
+- the run didn't finish;
+- the author got no recorded result;
+- a due challenge didn't finish;
+- a call went unanswered in a way that matters: any ambiguous call, or an author miss on a tool the recorded run also called. A miss on a tool the recording never had is listed as "new tool, not in recording" and doesn't matter. `classifyMiss` in `src/eval.ts` is the one place to change this rule;
+- or the label is wrong: a problem that expects a post has no row in the run (not counted as missed), or a row of the run is under both a problem that expects a post and one that doesn't.
+
+Output and exit code:
+
+- One line per episode, one line per problem under it, then totals. Totals count problems in judged episodes only, and unlabelled episodes that are inconclusive.
+- `eval` exits 1 on any mismatch, any inconclusive episode, or an episode that failed to load or run.
+- Each episode gets `eval-result.json`: the reports and whether each would post, hits, misses, ambiguous and material calls, new tools, cost and turns, prod's reports under the same rule, the per-problem score and the outcome.
+- **Representative $/day** (`costPerDay`, and `evalTotals` with runs per day): the mean eval cost per run that started × the monitor runs per day from a detector replay.
 
 ### Tests
 

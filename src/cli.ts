@@ -21,7 +21,7 @@ import { writeAnswer } from './engine/answer.js';
 import { runAgent, stopAllRuns, type Engine } from './engine/run.js';
 import { sdkSession } from './engine/session.js';
 import { patrolLoop, patrolOnce, type MonitorAgent } from './runner.js';
-import { evalEpisode, evalLine, evalTotals, type EvalResult } from './eval.js';
+import { evalEpisode, evalExitCode, evalLine, evalTotals, problemLines, type EvalResult } from './eval.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { buildServer, shutdown, slackNotifier, startHttp, type McpContext } from './mcp/server.js';
 import { loadRepos } from './mcp/repos.js';
@@ -587,13 +587,15 @@ async function main() {
           const r = await evalEpisode(engine, agent, cfg, noise, dir, { challenge: !a['no-challenge'] });
           results.push(r);
           console.log(evalLine(r));
+          for (const l of problemLines(r)) console.log(l);
         } catch (e) {
           failed++;
           console.log(`${dir}: error: ${(e as Error).message}`);
         }
       }
       console.log(evalTotals(results, failed));
-      if (failed) process.exitCode = 1;
+      // Not a pass: any mismatch, any inconclusive episode, any that failed.
+      if (evalExitCode(results, failed)) process.exitCode = 1;
       return;
     }
 
