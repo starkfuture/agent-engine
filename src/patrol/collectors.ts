@@ -1,6 +1,6 @@
 import type { ErrorCounter, HttpFamily, Sources } from '../config.js';
-import type { Sample, Telemetry } from '../clients/telemetry.js';
-import { DEFAULT_THRESHOLDS, isErrorStatus, scoreErrors, scoreTraffic, type Counts, type Thresholds } from './score.js';
+import { NotInRecording, type Sample, type Telemetry } from '../clients/telemetry.js';
+import { DEFAULT_THRESHOLDS, isErrorStatus, scoreErrors, scoreTraffic, type Counts, type Score, type Thresholds } from './score.js';
 import { redact, templateOf, truncate } from '../engine/text.js';
 import { rowKey, type Row } from './types.js';
 
@@ -50,7 +50,7 @@ export async function requireSeries(tel: Telemetry, selector: string, at: Date, 
 // not an outage: the source stays ok, and recovery doesn't look at it, unless
 // it says whether the source reads at all is unknown (presence).
 type Note = string | { note: string; unknown: true } | undefined;
-type Collected = Row[] & { notes?: string[]; unknown?: true };
+type Collected = Row[] & { notes?: string[]; unknown?: true; spans?: SpanErrors };
 function withNotes(rows: Row[], ...notes: Note[]): Row[] {
   const n = notes.filter((x): x is NonNullable<Note> => !!x);
   return n.length ? Object.assign(rows, { notes: n.map((x) => (typeof x === 'string' ? x : x.note)), ...(n.some((x) => typeof x !== 'string') ? { unknown: true } : {}) }) : rows;
@@ -355,13 +355,46 @@ export const spanErrorsQuery = (windowMin: number) =>
   `sum by (service, span_name, span_kind) (increase(traces_spanmetrics_calls_total{status_code="STATUS_CODE_ERROR"}[${windowMin}m]))`;
 export const spanErrorsKey = (s: Sample) => `${s.labels.service ?? '?'}\u0000${s.labels.span_name ?? '?'}\u0000${s.labels.span_kind ?? '?'}`;
 
+// While the search is capped, a trace row missing from the sample may still
+// fire. Its error spans' count decides whether it is back (summary.ts):
+// - counts: per trace row key, scored as the row is (scoreErrors);
+// - notChecked: a recording made before the query existed (a miss) proves
+//   nothing either way: the row recovers as before, and says so;
+// - unreadable: the read failed, or found no error span at all now while the
+//   search was capped (span metrics missing, not a quiet system): no trace
+//   row recovers on it.
+// A row is a root (service, name); its count is that service's error spans with
+// that span_name, every kind summed. The search doesn't say the root's kind. In
+// prod the roots that map are CONSUMER and CLIENT (jobs): an HTTP root's 4xx
+// leaves its SERVER span unset, and the error is on a child span that no label
+// ties to its root. No (service, span_name) has error spans of two kinds, so the
+// sum is the root's own kind (mapping check, 2026-11-06). A pair with no series
+// in any slot is unmapped.
+export type SpanErrors = { counts: Map<string, Score> } | { notChecked: string } | { unreadable: string };
+export const spanErrorsOf = (rows: Row[]): SpanErrors | undefined => (rows as Collected).spans;
+
+function spanErrors(read: Map<string, { counts: Counts }> | Error, t: Thresholds): SpanErrors {
+  if (read instanceof NotInRecording) return { notChecked: `trace error counts not checked (${read.message})` };
+  if (read instanceof Error) return { unreadable: `trace error counts not read (${read.message}): no trace row recovers while the search is capped` };
+  const pairs = new Map<string, Counts>();
+  for (const [k, { counts }] of read) {
+    const [service = '?', subject = '?'] = k.split('\u0000');
+    const key = rowKey({ section: 'traces', service, subject });
+    const acc = pairs.get(key) ?? zero();
+    for (const s of SLOTS) acc[s] += counts[s];
+    pairs.set(key, acc);
+  }
+  if (![...pairs.values()].some((c) => c.now > 0)) return { unreadable: 'no trace error counts at all now, though the search was capped (missing data, not a quiet system): no trace row recovers on it' };
+  return { counts: new Map([...pairs].map(([k, c]) => [k, scoreErrors(c, undefined, t)])) };
+}
+
 // ---- Traces: error traces grouped by root service + operation ---------------
 // A search returns at most `limit` traces. A slot at the limit is a sample, not
 // a count (in production all four slots returned 300 of 300): its rows are
 // lower bounds, and the source says so even when no row is flagged.
 export async function collectTraces(tel: Telemetry, src: Sources['traces'], at: Date, windowMin: number, t: Thresholds = DEFAULT_THRESHOLDS): Promise<Row[]> {
   const w = windowMin * 60_000;
-  const [results, seen] = await Promise.all([
+  const [results, seen, spanRead] = await Promise.all([
     Promise.all(
       SLOTS.map((s) => {
         const end = shift(at, s);
@@ -370,6 +403,8 @@ export async function collectTraces(tel: Telemetry, src: Sources['traces'], at: 
     ),
     // Presence: any trace at all in the "now" window; one is enough.
     probe(async () => (await tel.tempoSearch('{}', new Date(at.getTime() - w), at, 1)).length),
+    // Uncapped error counts, used only when the search is capped (never rejects).
+    fourWay(tel, spanErrorsQuery(windowMin), at, spanErrorsKey).catch((e: Error) => e),
   ]);
   const present = presence('trace', `no traces at all ({}) in the last ${windowMin} min`, seen, results[SLOTS.indexOf('now')]?.length ?? 0);
   const capped = SLOTS.filter((_, i) => (results[i]?.length ?? 0) >= src.limit);
@@ -390,5 +425,8 @@ export async function collectTraces(tel: Telemetry, src: Sources['traces'], at: 
     const [service, subject] = k.split('\u0000') as [string, string];
     rows.push({ key: rowKey({ section: 'traces', service, subject }), section: 'traces', service, subject, counts, score, detail: example, query: src.traceql, ...(capped.length ? { truncated: true } : {}) });
   }
-  return withNotes(rows, present, cappedNote(`search limit (${src.limit})`, capped, 'trace'));
+  if (!capped.length) return withNotes(rows, present);
+  const spans = spanErrors(spanRead, t);
+  const spanNote = 'notChecked' in spans ? spans.notChecked : 'unreadable' in spans ? spans.unreadable : undefined;
+  return Object.assign(withNotes(rows, present, cappedNote(`search limit (${src.limit})`, capped, 'trace'), spanNote), { spans });
 }

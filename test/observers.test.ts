@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { DirectTelemetry, RecordingTelemetry, ReplayTelemetry, type LogLine, type Sample, type Series, type Telemetry, type TraceHit } from '../src/clients/telemetry.js';
 import { Evidence } from '../src/engine/evidence.js';
 import { monitorTools } from '../src/investigate/tools.js';
+import { spanErrorsQuery } from '../src/patrol/collectors.js';
 import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
 import { buildSummary, renderSummary } from '../src/patrol/summary.js';
@@ -307,6 +308,120 @@ test('a recording without the new queries replays: every source as read before, 
     ],
   );
   assert.equal(replay.misses, 3, 'and they count as misses, as any query the recording lacks');
+});
+
+// ---- 6. trace rows on a capped search recover on their error counts -------------
+
+const SPANS = spanErrorsQuery(15);
+const PAY = 'traces|checkout|POST /pay|';
+const later = (min: number) => new Date(AT.getTime() + min * MIN);
+// Capped in every slot. checkout POST /pay is in the "now" sample at AT only;
+// afterwards the sample is all catalog traces, as many as a day and a week before.
+const cappedTraces = (q: string, _s: Date, end: Date, limit: number) =>
+  q === '{}' ? [hit('any', 'any', 0)] : end.getTime() === AT.getTime() ? hits(limit, 'checkout', 'POST /pay') : hits(limit, 'catalog', 'GET /products');
+const span = (service: string, span_name: string, value: number, span_kind = 'SPAN_KIND_SERVER'): Sample => ({ labels: { service, span_name, span_kind }, value });
+// Span error counts: catalog's steady, checkout's as `pay` says at each query time.
+const spanWorld = (pay: (at: Date) => Sample[] | Error) => (q: string, at: Date) => {
+  if (q !== SPANS) return world(q, at);
+  const p = pay(at);
+  if (p instanceof Error) throw p;
+  return [span('catalog', 'GET /products', 3, 'SPAN_KIND_CLIENT'), ...p];
+};
+const highSince = (from: number) => (at: Date) => [span('checkout', 'POST /pay', at.getTime() >= from ? 400 : 1)];
+async function reportPay(tel: Telemetry, c: ReturnType<typeof cfg>, state: State) {
+  const first = await buildSummary(tel, c, new Noise({}), state, AT);
+  assert.ok(first.send.some((r) => r.key === PAY), 'flagged from the sample');
+  for (const r of first.send) state.reported(r, AT);
+}
+
+test('capped traces: a row gone from the sample whose error count is still high keeps firing; once steady, it recovers after the hold', async () => {
+  const c = { ...cfg(), recoverAfterMinutes: 60 };
+  let high = true;
+  const tel = new Observed({ traces: cappedTraces, prom: spanWorld((at) => (high ? highSince(AT.getTime() - 30 * MIN)(at) : [span('checkout', 'POST /pay', 1)])) });
+  const state = State.memory();
+  await reportPay(tel, c, state);
+  for (const min of [15, 30, 45, 60, 75, 90]) {
+    const s = await buildSummary(tel, c, new Noise({}), state, later(min));
+    assert.ok(![...s.send, ...s.known, ...s.waiting].some((r) => r.key === PAY), 'absent from the sample');
+    assert.deepEqual(s.recovered, [], `${min} min: the count still fires`);
+  }
+  assert.equal(state.data.rows[PAY]!.lastFiredAt, later(90).toISOString(), 'fired, as a row a noise rule hides does');
+  high = false;
+  for (const min of [105, 120, 135]) assert.deepEqual((await buildSummary(tel, c, new Noise({}), state, later(min))).recovered, [], `${min} min: within the hold`);
+  const back = await buildSummary(tel, c, new Noise({}), state, later(150));
+  assert.deepEqual(back.recovered, [PAY], 'an hour after the count last fired');
+  assert.equal(back.recoveryNotes, undefined, 'back on its count: no note');
+});
+
+test('capped traces: an error count that cannot be read, or reads nothing at all, claims no recovery', async () => {
+  const c = { ...cfg(), recoverAfterMinutes: 60 };
+  const steady = [span('catalog', 'GET /products', 3), span('checkout', 'POST /pay', 1)];
+  let spans: Sample[] | Error = steady;
+  const tel = new Observed({
+    traces: cappedTraces,
+    prom: (q, at) => {
+      if (q !== SPANS) return world(q, at);
+      if (spans instanceof Error) throw spans;
+      return spans;
+    },
+  });
+  const state = State.memory();
+  await reportPay(tel, c, state);
+
+  spans = new Error('prometheus: HTTP 503');
+  const failed = await buildSummary(tel, c, new Noise({}), state, later(75));
+  assert.deepEqual(failed.recovered, []);
+  assert.equal(sourceOf(failed, 'traces')!.ok, true, 'the search itself was read');
+  assert.match(sourceOf(failed, 'traces')!.note ?? '', /^capped: .*; trace error counts not read \(prometheus: HTTP 503\): no trace row recovers while the search is capped$/);
+
+  // No error span anywhere while the search is capped: span metrics are missing, not quiet.
+  spans = [];
+  const empty = await buildSummary(tel, c, new Noise({}), state, later(80));
+  assert.deepEqual(empty.recovered, []);
+  assert.match(sourceOf(empty, 'traces')!.note ?? '', /; no trace error counts at all now, though the search was capped \(missing data, not a quiet system\): no trace row recovers on it$/);
+
+  spans = steady;
+  assert.deepEqual((await buildSummary(tel, c, new Noise({}), state, later(90))).recovered, [PAY], 'read, and steady: back');
+});
+
+test('capped traces: a row with no span-metric series recovers as before, and says it had no count', async () => {
+  const c = { ...cfg(), recoverAfterMinutes: 60 };
+  const tel = new Observed({ traces: cappedTraces, prom: spanWorld(() => []) });
+  const state = State.memory();
+  await reportPay(tel, c, state);
+  assert.deepEqual((await buildSummary(tel, c, new Noise({}), state, later(45))).recovered, [], 'within the hold');
+  const back = await buildSummary(tel, c, new Noise({}), state, later(60));
+  assert.deepEqual(back.recovered, [PAY]);
+  assert.deepEqual(back.recoveryNotes, { [PAY]: 'recovered on a capped sample, no count' });
+  assert.match(renderSummary(back), /## Recovered since last patrol \(1\)\n- traces\|checkout\|POST \/pay\| \(recovered on a capped sample, no count\)\n/);
+  assert.doesNotMatch(sourceOf(back, 'traces')!.note ?? '', /trace error counts/, 'the counts were read: nothing to say on the source');
+});
+
+test('capped traces replayed from a recording without the count query: "not checked", and the row recovers as before, with a note', async () => {
+  const c = { ...cfg(), recoverAfterMinutes: 60 };
+  const dir = mkdtempSync(join(tmpdir(), 'sre-rec-'));
+  // Still firing by its count: with the query recorded, the row stays open.
+  const rec = new RecordingTelemetry(new Observed({ traces: cappedTraces, prom: spanWorld(highSince(AT.getTime() - 30 * MIN)) }), dir);
+  for (const at of [AT, later(60)]) await buildSummary(rec, c, new Noise({}), State.memory(), at);
+  const full = new ReplayTelemetry(dir);
+  const withCounts = State.memory();
+  await reportPay(full, c, withCounts);
+  assert.deepEqual((await buildSummary(full, c, new Noise({}), withCounts, later(60))).recovered, [], 'recorded count: still firing');
+
+  // An older recording: no count query at all.
+  const file = join(dir, 'responses.jsonl');
+  const all = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  const isSpans = (l: string) => (JSON.parse(l) as { c: { a: unknown[] } }).c.a[0] === SPANS;
+  assert.equal(all.filter(isSpans).length, 8, 'four instants per patrol');
+  writeFileSync(file, all.filter((l) => !isSpans(l)).join('\n') + '\n');
+  const replay = new ReplayTelemetry(dir);
+  const state = State.memory();
+  await reportPay(replay, c, state);
+  const back = await buildSummary(replay, c, new Noise({}), state, later(60));
+  assert.deepEqual(back.recovered, [PAY], 'a miss is not an unreadable count');
+  assert.deepEqual(back.recoveryNotes, { [PAY]: 'recovered on a capped sample, count not checked' });
+  assert.match(sourceOf(back, 'traces')!.note ?? '', /; trace error counts not checked \(prometheus: not in recording\)$/);
+  assert.equal(replay.misses, 8);
 });
 
 // ---- the client --------------------------------------------------------------------
