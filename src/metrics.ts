@@ -4,7 +4,11 @@ import { freeBytes } from './engine/retention.js';
 import type { Engine } from './engine/run.js';
 import type { SyncState } from './mcp/reposync.js';
 import { prometheusBlind } from './output/notices.js';
+import type { SlackOutbox } from './output/slack.js';
 import type { PatrolResult } from './runner.js';
+
+// What a post in the Slack outbox can be (output/slack.ts).
+const OUTBOX_STATUSES = ['pending', 'pending_update', 'sent', 'skipped', 'superseded', 'failed', 'gave_up'];
 
 // Prometheus metrics for the heartbeat alert: is the engine up, is the patrol
 // running and succeeding, which sources it can't see, and spend against caps.
@@ -15,10 +19,16 @@ export class Metrics {
   private lastOk?: Date;
   private sources: Array<{ source: string; ok: boolean }> = [];
   private repos?: Map<string, SyncState>;
+  private outbox?: Pick<SlackOutbox, 'status' | 'oldestPendingAt'>;
 
   // The codebase agent's synced repos: how fresh each clone is.
   repoSync(state: Map<string, SyncState>): void {
     this.repos = state;
+  }
+
+  // The Slack outbox the patrol posts through: proof that posts reach Slack.
+  slackOutbox(outbox: Pick<SlackOutbox, 'status' | 'oldestPendingAt'>): void {
+    this.outbox = outbox;
   }
 
   // A patrol that read nothing from Prometheus (every source but logs and
@@ -54,6 +64,14 @@ export class Metrics {
       gauge('engine_repo_sync_ok', '0 when the last sync of this repo failed.', rows.map(([repo, s]) => [{ repo }, s.lastError ? 0 : 1]));
     }
     gauge('engine_runs_today', 'Runs started today (UTC), by agent and status.', engine.store.counts(day).map((c) => [{ agent: c.agent, status: c.status }, c.n]));
+    if (this.outbox) {
+      // Every status the outbox writes, 0 when none, so a rise shows from 0.
+      const by = new Map<string, number>(OUTBOX_STATUSES.map((s) => [s, 0]));
+      for (const r of this.outbox.status()) by.set(r.status, r.n);
+      gauge('engine_slack_outbox', 'Slack posts in the outbox by status: pending not taken by Slack yet, failed and gave_up never delivered.', [...by].map(([status, n]) => [{ status }, n]));
+      const oldest = this.outbox.oldestPendingAt();
+      gauge('engine_slack_outbox_oldest_pending_age_seconds', 'Age of the oldest Slack post still waiting to be delivered; 0 when none waits.', [[{}, oldest ? Math.max(0, Math.floor((now.getTime() - Date.parse(oldest)) / 1000)) : 0]]);
+    }
     // Per agent too (agent label), after the totals, which stay as they were:
     // every agent that ran this month, and every agent with a monthly share.
     const month = day.slice(0, 7);

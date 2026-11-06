@@ -10,13 +10,27 @@
 #   /regex/               anchored, case-insensitive, like noise.yaml
 # An exact name beats a prefix, a prefix beats a regex; regexes go in file order.
 #
-# Values are Slack mentions, and only these two forms are accepted:
+# A value is a Slack mention, or an owner with a backup and a runbook:
 #   '<@U…>'               a person (Slack member id, from their profile: ⋮ → Copy member ID)
 #   '<!subteam^S…>'       a user group
-# Anything else (<!channel>, <!here>, links) stops the engine at startup.
+#   { primary: '<@U…>', backup: '<@U…>', runbook: 'https://…' }
+#                         primary is mentioned on cards (as a bare mention is);
+#                         backup only when escalation asks for one (below);
+#                         runbook is linked on cards. backup and runbook are optional.
+# Mentions accept only those two forms. Anything else (<!channel>, <!here>,
+# links) stops the engine at startup.
 #
-# mentions: false turns every mention off (the card still lists the lines).
-# SRE_OWNERS_FILE points the engine at another file.
+# A runbook must be a plain https link on a host listed in runbook_hosts
+# (exact host, case-insensitive); any other runbook stops the engine at startup.
+#
+# escalation: an open critical or major issue (of `severities`) the channel was
+# shown, that nobody clicked On it or Not an issue on within `after_minutes` of
+# reaching that severity, gets one reply in its thread mentioning the backups of
+# its services. Once per episode (a reopened issue can be escalated again).
+# Needs the buttons (SLACK_APP_TOKEN with the bot). Absent: off.
+#
+# mentions: false turns every mention off (the card still lists the lines),
+# escalation too. SRE_OWNERS_FILE points the engine at another file.
 
 mentions: true
 
@@ -24,3 +38,11 @@ owners: {}
 #  keycloak-production: '<@U0000000000>'
 #  frontend-next-*: '<!subteam^S0000000000>'
 #  '/(ecom|product-catalog)-service-production/': '<!subteam^S0000000001>'
+#  ecom-service-production: { primary: '<!subteam^S0000000001>', backup: '<@U0000000001>', runbook: 'https://wiki.example.com/runbooks/ecom' }
+
+runbook_hosts: []
+#  - wiki.example.com
+
+# escalation:
+#   after_minutes: 30
+#   severities: [critical, major]

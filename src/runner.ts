@@ -8,14 +8,14 @@ import { runAgent, type Engine, type RunResult } from './engine/run.js';
 import { monitorTask } from './investigate/prompt.js';
 import { reportOutput, type Report } from './investigate/report.js';
 import { monitorTools } from './investigate/tools.js';
-import { patrolCard, pauseText, recoveredCard, reportCard, worseCard, type Card, type IssueRef } from './output/card.js';
+import { escalationCard, patrolCard, pauseText, recoveredCard, reportCard, worseCard, type Card, type IssueRef } from './output/card.js';
 import type { CardSink, EmitSlack } from './output/sink.js';
 import { announceBlind, announcePause, announceResume, heldNow, type Say } from './output/notices.js';
 import { recentDeploys } from './patrol/deploys.js';
 import { bucketOf } from './patrol/digest.js';
 import { MUTE_DAYS, RANK, type Disposition, type Issue, type Issues, type Severity } from './patrol/issues.js';
 import type { Noise } from './patrol/noise.js';
-import type { Owners } from './patrol/owners.js';
+import type { Owner, Owners } from './patrol/owners.js';
 import { ATTEMPTS, type State } from './patrol/state.js';
 import { buildSummary, renderSummary, urgent, type FlaggedRow, type Summary } from './patrol/summary.js';
 import { redact, safeJson } from './engine/text.js';
@@ -210,6 +210,21 @@ export function claimedRows(issues: Issues | undefined, rows: FlaggedRow[], nois
   return claims;
 }
 
+// Escalation (owners.yaml, off unless configured): an open issue at one of its
+// severities, that the channel was shown and nobody clicked On it or Not an
+// issue on within after_minutes of it standing there, gets one line in its
+// thread asking the backups of its rows' services, once per episode. None
+// without a backup. The caller checks that the buttons are on (a way to say
+// On it) and that Slack threads (somewhere to ask). The backups, when due.
+export function escalationDue(issues: Issues, owners: Owners, i: Issue, at: Date, reached: (issue: string) => boolean): string[] {
+  const e = owners.escalation;
+  if (!e || i.status !== 'open' || !e.severities.has(i.severity)) return [];
+  const since = issues.escalationSince(i.id, e.severities);
+  if (!since || at.getTime() - Date.parse(since) < e.afterMinutes * 60_000) return [];
+  if (issues.disposition(i.id, at) || !reached(i.id)) return [];
+  return [...new Set(i.rows.map((k) => owners.ownerOf(k.split('|')[1] ?? '')?.backup).filter((x): x is string => !!x))];
+}
+
 export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, state: State, sink: CardSink, at: Date, o: PatrolOptions, monitor?: MonitorAgent): Promise<PatrolResult> {
   const log = o.log ?? (() => {});
   const summary = await buildSummary(tel, cfg, noise, state, at);
@@ -288,6 +303,17 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
         emit(recoveredCard(i.rows, summary.at, i.id, cfg.recoverAfterMinutes), `${stamp(summary.at)}-resolved-${i.id}`, sink.outbox?.threads ? { kind: 'recovered', keys: i.rows, broadcast: false, issue: i.id } : undefined);
         if (o.post) sink.outbox?.updateRoot(i.id); // its message says resolved, without buttons
       }
+      // Nobody on it in time: its backups are asked in its thread (escalationDue).
+      const esc = o.owners?.escalation;
+      if (esc && o.post && o.buttons && sink.outbox?.threads)
+        for (const i of open) {
+          if (result.resolved.includes(i.id)) continue;
+          const backups = record(`checking ${i.id} for escalation`, () => escalationDue(issues, o.owners!, i, at, (id) => sink.outbox!.reached(id)), []);
+          if (!backups.length) continue;
+          emit(escalationCard(i.id, esc.afterMinutes, backups), `${stamp(summary.at)}-escalated-${i.id}`, { kind: 'rows', keys: [], broadcast: false, issue: i.id, repeat: true });
+          record(`noting the escalation of ${i.id}`, () => issues.escalated(i.id, at, { to: backups, after_minutes: esc.afterMinutes }), undefined);
+          log(`${i.id}: nobody on it after ${esc.afterMinutes} min: its backup is asked in its thread`);
+        }
     }
     if (o.post && sink.outbox?.threads && loose.length)
       for (const keys of sink.outbox.groupByThread(loose)) sink.emit(recoveredCard(keys, summary.at, undefined, cfg.recoverAfterMinutes), `${stamp(summary.at)}-recovered-${keys.length}`, { kind: 'recovered', keys, broadcast: false });
@@ -435,7 +461,8 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     const ch = inv.challenge;
     log(`investigation ${inv.status}: ${inv.outputs.length} report(s), ${inv.evidence.items.size} tool call(s), ${inv.turns} turn(s), $${inv.cost.toFixed(3)}${ch ? `, challenge ${ch.verdict} ($${ch.cost.toFixed(3)}${ch.note ? `, ${ch.note}` : ''})` : ''}${inv.note ? ` (${inv.note})` : ''}`);
     const footer = `${monitor.agent.spec.model} · ${inv.evidence.items.size} tool calls · $${inv.cost.toFixed(2)} · run ${inv.runId}`;
-    const ownersOf = (rep: Report) => [...new Set(rep.rows.map((k) => byKey.get(k) && o.owners?.ownerOf(byKey.get(k)!.service)).filter((x): x is string => !!x))];
+    const ownersOf = (rep: Report) => rep.rows.map((k) => byKey.get(k) && o.owners?.ownerOf(byKey.get(k)!.service)).filter((x): x is Owner => !!x);
+    const runbooksOf = (rep: Report) => [...new Set(ownersOf(rep).map((w) => w.runbook).filter((x): x is string => !!x))];
     const answer: string[] = [];
     let toSlack = 0;
     let quiet = 0;
@@ -458,7 +485,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       const why = item?.holds === 'no' ? 'the second check says it does not hold up' : !inv.challenge || !finished(inv.challenge) ? 'the second check did not finish' : `the second check did not agree (${item?.holds ?? inv.challenge.verdict})`;
       const f: Filing = o.issues ? record(`filing report ${i + 1}`, () => fileReport(o.issues!, r, at, inv.runId, filed), { action: 'none' }) : { action: 'none' };
       result.filed.push(f);
-      const cc = [...new Set([...(cfg.slackOncall && pagesOncall(f, r) ? [cfg.slackOncall] : []), ...ownersOf(r)])];
+      const cc = [...new Set([...(cfg.slackOncall && pagesOncall(f, r) ? [cfg.slackOncall] : []), ...ownersOf(r).map((w) => w.primary)])];
       const post = postFor(f, r);
       // What the channel sees of it: a new message or a broadcast reply, or a
       // repeat about an issue that never reached Slack (its first post). The
@@ -466,7 +493,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       // a post of its own). Shown with no challenge, it is marked not verified.
       const visible = !!post && (post.broadcast || (!!post.issue && o.post && !record('reading the outbox', () => sink.outbox?.reached(post.issue!) ?? true, false)));
       const unchecked = visible && !inv.challenge;
-      const card = reportCard(r, summary.at, footer, unchecked ? notRun('it became news after the check was decided') : inv.challenge, cc, issueRef(f), recentDeploys(summary.deploys), item);
+      const card = reportCard(r, summary.at, footer, unchecked ? notRun('it became news after the check was decided') : inv.challenge, cc, issueRef(f), recentDeploys(summary.deploys), item, runbooksOf(r));
       emit(card, `${stamp(summary.at)}-${i + 1}`, post);
       // Back from resolved, or Not an issue ended: its buttons are back. Back
       // while Not an issue lasts: its message shows the mute again, with Undo.

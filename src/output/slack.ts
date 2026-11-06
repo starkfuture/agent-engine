@@ -513,4 +513,9 @@ export class SlackOutbox {
   status(): Array<{ status: string; n: number }> {
     return (this.db.prepare(`SELECT status, COUNT(*) AS n FROM slack_outbox GROUP BY status ORDER BY status`).all() as Array<{ status: string; n: number }>).map((r) => ({ status: r.status, n: Number(r.n) }));
   }
+
+  // For the metrics: when the oldest post Slack has not taken yet was queued.
+  oldestPendingAt(): string | undefined {
+    return (this.db.prepare(`SELECT MIN(created_at) AS at FROM slack_outbox WHERE status = 'pending'`).get() as { at: string | null }).at ?? undefined;
+  }
 }

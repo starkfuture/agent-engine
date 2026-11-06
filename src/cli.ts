@@ -189,6 +189,7 @@ const align = (d: Date, min: number) => new Date(Math.floor(d.getTime() / (min *
 
 // The patrol every window until the process ends; each pass lands in metrics.
 async function patrolEvery(cfg: Config, noise: Noise, owners: Owners, sink: CardSink, w: number, metrics?: Metrics): Promise<void> {
+  if (a.post && sink.outbox) metrics?.slackOutbox(sink.outbox); // delivery proof, from the process that posts
   await patrolLoop({
     tel: telemetry(cfg),
     cfg,

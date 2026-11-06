@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { patrolCard, type Card } from '../src/output/card.js';
+import { escalationCard, patrolCard, reportCard, type Card } from '../src/output/card.js';
+import type { Report } from '../src/investigate/report.js';
 import { digest, groupLines, shortSubject, tier } from '../src/patrol/digest.js';
 import { Noise } from '../src/patrol/noise.js';
 import { Owners } from '../src/patrol/owners.js';
@@ -171,11 +172,11 @@ test('owners: exact beats prefix beats regex; unknown services get no one; menti
       'ecom-service-production': '<@U0EXACT1>',
     },
   });
-  assert.equal(o.ownerOf('ecom-service-production'), '<@U0EXACT1>');
-  assert.equal(o.ownerOf('ECOM-SERVICE-production'), '<@U0EXACT1>');
-  assert.equal(o.ownerOf('ecom-service-staging'), '<@U0PREFIX2>', 'the longest prefix wins');
-  assert.equal(o.ownerOf('ecom-worker'), '<!subteam^S0PREFIX1>');
-  assert.equal(o.ownerOf('stock-sync'), '<!subteam^S0REGEX1>');
+  assert.equal(o.ownerOf('ecom-service-production')?.primary, '<@U0EXACT1>');
+  assert.equal(o.ownerOf('ECOM-SERVICE-production')?.primary, '<@U0EXACT1>');
+  assert.equal(o.ownerOf('ecom-service-staging')?.primary, '<@U0PREFIX2>', 'the longest prefix wins');
+  assert.equal(o.ownerOf('ecom-worker')?.primary, '<!subteam^S0PREFIX1>');
+  assert.equal(o.ownerOf('stock-sync')?.primary, '<!subteam^S0REGEX1>');
   assert.equal(o.ownerOf('xstock-sync'), undefined, 'regexes are anchored');
   assert.equal(o.ownerOf('backend-production'), undefined);
   assert.equal(new Owners({ mentions: false, owners: { x: '<@U0EXACT1>' } }).ownerOf('x'), undefined);
@@ -315,4 +316,102 @@ test('the 14:00Z card: summary first, one line to look at, repeats collapsed, no
   assert.match(quiet!, /`Vehicle not found` \(4\).*`Ride with id … not found` \(4\).*`__unmatched__ 404` \(8\)/);
   assert.equal(footer, 'not investigated: LLM disabled for this run');
   assert.ok(JSON.stringify(c.blocks).length < 3000);
+});
+
+// ---- owners v2: a backup and a runbook --------------------------------------------
+
+test('owners: a bare mention and { primary, backup, runbook } both parse; ownerOf gives the owner', () => {
+  const o = new Owners({
+    owners: {
+      'kc-*': '<@U0KC1>',
+      web: { primary: '<!subteam^S0WEB1>', backup: '<@U0WEBBACK1>', runbook: 'https://Wiki.example.com/runbooks/web?a=1&b=2' },
+      api: { primary: '<@U0API1>' },
+    },
+    runbook_hosts: ['wiki.example.com'],
+  });
+  assert.deepEqual(o.ownerOf('kc-production'), { primary: '<@U0KC1>' });
+  assert.deepEqual(o.ownerOf('web'), { primary: '<!subteam^S0WEB1>', backup: '<@U0WEBBACK1>', runbook: 'https://Wiki.example.com/runbooks/web?a=1&b=2' });
+  assert.deepEqual(o.ownerOf('api'), { primary: '<@U0API1>' });
+  assert.equal(o.escalation, undefined, 'no escalation unless configured');
+  assert.equal(Owners.load(new URL('../config/owners.yaml', import.meta.url).pathname).escalation, undefined, 'the shipped file escalates nothing');
+  const e = new Owners({ escalation: { after_minutes: 30, severities: ['critical', 'major'] } }).escalation!;
+  assert.equal(e.afterMinutes, 30);
+  assert.deepEqual([...e.severities], ['critical', 'major']);
+});
+
+test('owners: a bad mention in any field, a runbook off the allowlist, or a bad escalation stops startup', () => {
+  for (const bad of ['<!channel>', '<https://evil.test|x>', '@ana']) {
+    assert.throws(() => new Owners({ owners: { svc: { primary: bad } } }), /must be <@U…>/, `primary ${bad}`);
+    assert.throws(() => new Owners({ owners: { svc: { primary: '<@U0OK1>', backup: bad } } }), /must be <@U…>/, `backup ${bad}`);
+  }
+  assert.throws(() => new Owners({ owners: { svc: { primary: '<@U0OK1>', oncall: '<@U0OK2>' } } }), /oncall/, 'unknown fields are refused');
+  const hosts = ['wiki.example.com'];
+  for (const bad of [
+    'https://evil.test/runbook', // not listed
+    'http://wiki.example.com/x', // not https
+    'https://wiki.example.com.evil.test/x',
+    'https://user:pw@wiki.example.com/x',
+    'https://wiki.example.com/x|click here',
+    'https://wiki.example.com/x> <!channel',
+    'https://wiki.example.com/a b',
+    'wiki.example.com/x',
+    'javascript:alert(1)',
+  ])
+    assert.throws(() => new Owners({ owners: { svc: { primary: '<@U0OK1>', runbook: bad } }, runbook_hosts: hosts }), /runbook .* is not allowed: it must be a plain https link on a host listed in runbook_hosts/, bad);
+  assert.throws(() => new Owners({ owners: { svc: { primary: '<@U0OK1>', runbook: 'https://wiki.example.com/x' } } }), /runbook_hosts \(none listed\)/, 'the allowlist is empty by default');
+  assert.throws(() => new Owners({ escalation: { after_minutes: 0, severities: ['major'] } }), /after_minutes/);
+  assert.throws(() => new Owners({ escalation: { after_minutes: 30, severities: ['minor'] } }), /severities/);
+  assert.throws(() => new Owners({ escalation: { after_minutes: 30 } }), /severities/);
+});
+
+test('cards: cc shows the primary, the runbook line renders; a bare mention gives the same card as before', () => {
+  const rows = [row('logs', 'kc-production', 'LOGIN_ERROR burst', 40), row('http', 'web', '/v3/cart', 30, { status: '404' }), row('http', 'web-2', '/v3/x', 30, { status: '404' })];
+  const v2 = new Owners({
+    owners: { 'kc-*': '<@U0KC1>', web: { primary: '<!subteam^S0WEB1>', backup: '<@U0WEBBACK1>', runbook: 'https://wiki.example.com/rb/web?a=1&b=2' }, 'web-2': { primary: '<@U0WEB2>', runbook: 'https://wiki.example.com/rb/web2' } },
+    runbook_hosts: ['wiki.example.com'],
+  });
+  const c = patrolCard(summary(rows), 'x', { owners: v2 });
+  const [title, look, runbooks] = mrkdwn(c);
+  assert.match(title!, /· cc <@U0KC1> <!subteam\^S0WEB1> <@U0WEB2>$/);
+  assert.match(look!, /`\/v3\/cart 404` — .* <!subteam\^S0WEB1>$/m);
+  assert.equal(runbooks, 'Runbooks: <https://wiki.example.com/rb/web?a=1&amp;b=2> · <https://wiki.example.com/rb/web2>');
+  assert.ok(!slackText(c).includes('U0WEBBACK1'), 'the backup is not on the card');
+  assert.match(c.markdown, /\n\n\*\*Runbooks:\*\* https:\/\/wiki\.example\.com\/rb\/web\?a=1&b=2 · https:\/\/wiki\.example\.com\/rb\/web2\n/);
+
+  // No runbook: the card is exactly what the string form gave.
+  const bare = new Owners({ owners: { 'kc-*': '<@U0KC1>', web: '<!subteam^S0WEB1>' } });
+  const obj = new Owners({ owners: { 'kc-*': { primary: '<@U0KC1>', backup: '<@U0KCBACK1>' }, web: { primary: '<!subteam^S0WEB1>' } } });
+  assert.deepEqual(patrolCard(summary(rows), 'x', { owners: obj }), patrolCard(summary(rows), 'x', { owners: bare }));
+});
+
+const report = (over: Partial<Report> = {}): Report => ({
+  title: 'Sign-in rejects emails with a trailing space',
+  severity: 'major',
+  status: 'active',
+  started_at: AT,
+  what_broke: 'POST /v1/auth/login returns 400',
+  impact: '30 failed sign-ins',
+  reach: 'many',
+  cause: { hypothesis: 'email validation rejects a trailing space', confidence: 'medium' },
+  evidence: [{ id: 'E-abcd-1', quote: 'x', claim: 'the route returns 400' }],
+  suggested_fix: 'trim the email',
+  not_checked: [],
+  rows: ['http|web|/v1/auth/login|400'],
+  issue: 'new',
+  ...over,
+});
+
+test('report card: cc shows the primary, a runbook line under the fix; none without runbooks', () => {
+  const c = reportCard(report(), AT, 'run r-1', undefined, ['<!subteam^S0WEB1>'], undefined, undefined, undefined, ['https://wiki.example.com/rb/web']);
+  assert.match(mrkdwn(c)[1]!, /· cc <!subteam\^S0WEB1>$/);
+  assert.equal(mrkdwn(c)[4], 'Runbook: <https://wiki.example.com/rb/web>');
+  assert.match(c.markdown, /\*\*Suggested fix:\*\* trim the email\n\n\*\*Runbook:\*\* https:\/\/wiki\.example\.com\/rb\/web\n\n\*\*Evidence\*\*/);
+  assert.deepEqual(reportCard(report(), AT, 'run r-1', undefined, ['<@U0X1>'], undefined, undefined, undefined, []), reportCard(report(), AT, 'run r-1', undefined, ['<@U0X1>']));
+});
+
+test('escalation line: one short line in the thread, only the backups are raw', () => {
+  const c = escalationCard('I-7f3a', 30, ['<@U0BACK1>', '<!subteam^S0BACK2>']);
+  assert.equal(c.text, '⏰ Nobody is on I-7f3a after 30 min: <@U0BACK1> <!subteam^S0BACK2>, can you take a look?');
+  assert.deepEqual(mrkdwn(c), [c.text]);
+  assert.equal(escalationCard('I-7f3a', 90, ['<@U0BACK1>']).text, '⏰ Nobody is on I-7f3a after 1 h 30 min: <@U0BACK1>, can you take a look?');
 });

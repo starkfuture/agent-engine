@@ -39,7 +39,9 @@ export type IssueEventType =
   | 'dismissed'
   | 'undone'
   | 'mute_lifted'
-  | 'worse_noted';
+  | 'worse_noted'
+  // Nobody clicked On it in time: the backup was asked in its thread (owners.yaml escalation).
+  | 'escalated';
 export interface IssueEvent {
   id: number;
   issue_id: string;
@@ -365,6 +367,32 @@ export class Issues {
   // instead of an AI run.
   noteWorse(id: string, at: Date, rows: string[]): void {
     this.event(id, 'worse_noted', at, { rows });
+  }
+
+  // The escalation clock (owners.yaml, see runner): when this episode of the
+  // issue first stood at one of these severities (opened or reopened at one,
+  // or raised to one). None when it never did, or once its backup was asked
+  // in this episode: that happens once per episode.
+  escalationSince(id: string, severities: ReadonlySet<Severity>): string | undefined {
+    const events = this.db
+      .prepare(
+        `SELECT type, at, data FROM issue_events WHERE issue_id = ? AND type IN ('opened', 'reopened', 'severity_raised', 'escalated')
+         AND id >= (SELECT MAX(id) FROM issue_events WHERE issue_id = ? AND type IN ('opened', 'reopened')) ORDER BY id`,
+      )
+      .all(id, id) as Array<{ type: IssueEventType; at: string; data: string }>;
+    let since: string | undefined;
+    for (const e of events) {
+      if (e.type === 'escalated') return undefined;
+      const d = JSON.parse(e.data) as { severity?: Severity; to?: Severity };
+      const severity = e.type === 'severity_raised' ? d.to : d.severity;
+      if (!since && severity && severities.has(severity)) since = e.at;
+    }
+    return since;
+  }
+
+  // Nobody clicked On it in time: code asked the backups in the issue's thread.
+  escalated(id: string, at: Date, data: { to: string[]; after_minutes: number }): void {
+    this.event(id, 'escalated', at, data);
   }
 
   // Of these rows, those that belong only to open issues someone clicked, with
