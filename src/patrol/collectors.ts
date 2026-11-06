@@ -173,8 +173,10 @@ export async function collectHttp(tel: Telemetry, f: HttpFamily, at: Date, windo
 }
 
 // ---- Error counters (SQS consumer errors, …) --------------------------------
+export const counterQuery = (c: ErrorCounter, windowMin: number) => `sum by (${c.group_by.join(', ')}) (increase(${c.selector}[${windowMin}m]))`;
+
 export async function collectCounter(tel: Telemetry, c: ErrorCounter, at: Date, windowMin: number, t: Thresholds = DEFAULT_THRESHOLDS): Promise<Row[]> {
-  const query = `sum by (${c.group_by.join(', ')}) (increase(${c.selector}[${windowMin}m]))`;
+  const query = counterQuery(c, windowMin);
   const [cells, coverage] = await Promise.all([
     fourWay(tel, query, at, (s) => c.group_by.map((g) => s.labels[g] ?? '?').join('\u0000')),
     c.presence ? targetsUp(tel, c.presence, at) : undefined,
@@ -203,15 +205,21 @@ export function workloadOf(pod: string): string {
   return pod;
 }
 
+export function workloadQueries(nsRegex: string, windowMin: number) {
+  const ns = `namespace=~"${nsRegex}"`;
+  return {
+    restartsQ: `sum by (namespace, pod, container) (increase(kube_pod_container_status_restarts_total{${ns}}[${windowMin}m]))`,
+    reasonsQ: `max by (namespace, pod, container, reason) (kube_pod_container_status_last_terminated_reason{${ns}})`,
+    waitingQ: `max by (namespace, pod, container, reason) (kube_pod_container_status_waiting_reason{${ns},reason!~"ContainerCreating|PodInitializing"}) > 0`,
+    unavailQ: `sum by (namespace, deployment) (kube_deployment_status_replicas_unavailable{${ns}})`,
+  };
+}
+
 export async function collectWorkloads(tel: Telemetry, nsRegex: string, at: Date, windowMin: number, t: Thresholds = DEFAULT_THRESHOLDS): Promise<Row[]> {
   const ns = `namespace=~"${nsRegex}"`;
   const one = { ...t, minCount: 1 };
   const rows: Row[] = [];
-
-  const restartsQ = `sum by (namespace, pod, container) (increase(kube_pod_container_status_restarts_total{${ns}}[${windowMin}m]))`;
-  const reasonsQ = `max by (namespace, pod, container, reason) (kube_pod_container_status_last_terminated_reason{${ns}})`;
-  const waitingQ = `max by (namespace, pod, container, reason) (kube_pod_container_status_waiting_reason{${ns},reason!~"ContainerCreating|PodInitializing"}) > 0`;
-  const unavailQ = `sum by (namespace, deployment) (kube_deployment_status_replicas_unavailable{${ns}})`;
+  const { restartsQ, reasonsQ, waitingQ, unavailQ } = workloadQueries(nsRegex, windowMin);
 
   const [restarts, reasons, waiting, unavail] = await Promise.all([
     fourWay(tel, restartsQ, at, (s) => `${s.labels.namespace}/${workloadOf(s.labels.pod ?? '?')}/${s.labels.container}`),
@@ -333,6 +341,19 @@ export async function collectLogs(tel: Telemetry, src: Sources['logs'], at: Date
   }
   return withNotes(rows, present, cappedNote(`line limit (${src.max_lines})`, SLOTS.filter((s) => truncatedSlots.has(s)), 'error log'));
 }
+
+// ---- Traces: error span counts (span metrics) -------------------------------
+// Tempo's search returns a capped sample (prod hits the limit in every slot).
+// The metrics generator's span metrics count every span, uncapped. TraceQL
+// metrics are not an option in prod: its local-blocks processor is off.
+// span_kind stays in the grouping, so which kinds count for a trace row is a
+// choice made in code: a recording answers only the exact query text it holds,
+// so a kind filter in the text would make older recordings useless.
+// At the default 15-minute window the text is:
+//   sum by (service, span_name, span_kind) (increase(traces_spanmetrics_calls_total{status_code="STATUS_CODE_ERROR"}[15m]))
+export const spanErrorsQuery = (windowMin: number) =>
+  `sum by (service, span_name, span_kind) (increase(traces_spanmetrics_calls_total{status_code="STATUS_CODE_ERROR"}[${windowMin}m]))`;
+export const spanErrorsKey = (s: Sample) => `${s.labels.service ?? '?'}\u0000${s.labels.span_name ?? '?'}\u0000${s.labels.span_kind ?? '?'}`;
 
 // ---- Traces: error traces grouped by root service + operation ---------------
 // A search returns at most `limit` traces. A slot at the limit is a sample, not
