@@ -1,16 +1,31 @@
 import type { Issue } from '../patrol/issues.js';
 import { fence, redact } from '../engine/text.js';
 
+const ROWS_HEAD = 'Row keys to cover (copy exactly into reports):';
+
 // The monitor's system prompt lives in agents/monitor/CLAUDE.md. This is the
 // per-run task; the patrol summary goes alongside it as fenced data.
 export function monitorTask(rowKeys: string[], issues?: { issues: Issue[]; more: number }): string {
   return [
     'Explain the rows this patrol flagged. The patrol summary below was computed by code (values are counts in the window).',
     '',
-    'Row keys to cover (copy exactly into reports):',
+    ROWS_HEAD,
     ...rowKeys.map((k) => `- ${k}`),
     ...(issues ? ['', ...issueList(issues.issues, issues.more)] : []),
   ].join('\n');
+}
+
+// A past run's task read back (the eval): the row keys it asked about and the
+// issue ids it listed, which its reports were checked against.
+export function taskRows(task: string): { rows: string[]; issues: string[] } {
+  const lines = task.split('\n');
+  const start = lines.indexOf(ROWS_HEAD);
+  const rows: string[] = [];
+  for (const l of start < 0 ? [] : lines.slice(start + 1)) {
+    if (!l.startsWith('- ')) break;
+    rows.push(l.slice(2));
+  }
+  return { rows, issues: [...task.matchAll(/^- (I-[0-9a-f]{4,6}) · /gm)].map((m) => m[1]!) };
 }
 
 const ROWS_SHOWN = 12;

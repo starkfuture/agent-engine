@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { OutputSpec } from '../engine/run.js';
 
 // The monitor's only way to answer. Bedrock has no forced tool choice or
 // structured output for these models, so the schema is enforced in code, and
@@ -58,4 +59,15 @@ export function checkReport(r: Report, knownRows: Set<string>, issues: ReadonlyS
   if ((r.severity === 'critical' || r.severity === 'major') && r.reach !== 'many')
     problems.push(`${r.severity} needs reach "many": evidence of 5 or more distinct users, clients or records affected. Count them, or rate it minor (reach ${r.reach ?? 'not set'})`);
   return problems;
+}
+
+// The monitor's answer tool: the same for a patrol and for an eval of a past one.
+export function reportOutput(rowKeys: Set<string>, issueIds: ReadonlySet<string>): OutputSpec<Report> {
+  return {
+    tool: 'submit_report',
+    description: 'Submit one report per distinct problem. Call it once for every problem you found (several calls are fine). Invalid reports come back with the reason; fix and resubmit.',
+    shape: ReportShape,
+    evidenceOf: (r) => r.evidence,
+    check: (r) => checkReport(r, rowKeys, issueIds),
+  };
 }

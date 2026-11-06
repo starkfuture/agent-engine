@@ -21,6 +21,7 @@ import { writeAnswer } from './engine/answer.js';
 import { runAgent, stopAllRuns, type Engine } from './engine/run.js';
 import { sdkSession } from './engine/session.js';
 import { patrolLoop, patrolOnce, type MonitorAgent } from './runner.js';
+import { evalEpisode, evalLine, evalTotals, type EvalResult } from './eval.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { buildServer, shutdown, slackNotifier, startHttp, type McpContext } from './mcp/server.js';
 import { loadRepos } from './mcp/repos.js';
@@ -73,6 +74,11 @@ Monitor:
   replay --from <ISO> --to <ISO> [--step <min>] [--replay <dir>] [--llm]
                               run the patrol across a past range with one shared state; prints
                               what would have been reported, step by step
+  eval <episode-dir>...       run past monitor runs again (real model calls, local only): each folder holds a
+                              run's input.md and evidence.jsonl (export_run over MCP), optionally output.json
+                              and label.json; the AI's tools answer from the recorded results. Writes
+                              eval-result.json into each folder and prints one line per episode
+      --no-challenge          without the challenger
 `;
 
 const { positionals, values: a } = parseArgs({
@@ -97,6 +103,7 @@ const { positionals, values: a } = parseArgs({
     days: { type: 'string' },
     email: { type: 'string' },
     challenge: { type: 'boolean', default: false },
+    'no-challenge': { type: 'boolean', default: false },
     llm: { type: 'boolean', default: false },
     post: { type: 'boolean', default: false },
     fresh: { type: 'boolean', default: false },
@@ -282,8 +289,8 @@ async function main() {
   const noise = Noise.load(cfg.noiseFile);
   const owners = Owners.load(cfg.ownersFile);
   // The bot when configured (threads, one message per issue), else the webhook.
-  // A replay never posts and writes only under SRE_OUT_DIR, so it ignores Slack settings.
-  const slackOn = cmd !== 'replay';
+  // A replay never posts and writes only under SRE_OUT_DIR, so it ignores Slack settings; so does an eval.
+  const slackOn = cmd !== 'replay' && cmd !== 'eval';
   const bot = slackOn && cfg.slackBotToken ? botTransport(cfg.slackBotToken, cfg.slackChannel!) : undefined;
   const transport = bot ?? (slackOn && cfg.slackWebhookUrl ? webhookTransport(cfg.slackWebhookUrl) : undefined);
   // The buttons (On it, Not an issue): Socket Mode (SLACK_APP_TOKEN) and the
@@ -563,6 +570,30 @@ async function main() {
       console.log(timeline.join('\n'));
       log(`timeline: ${join(outDir, 'timeline.md')}`);
       if (tel instanceof ReplayTelemetry && tel.misses) log(`${tel.misses} query(ies) were not in the recording`);
+      return;
+    }
+
+    case 'eval': {
+      const dirs = positionals.slice(1).map((d) => resolve(d));
+      if (!dirs.length) throw new Error('usage: eval <episode-dir>...');
+      // No telemetry and no Slack: the tools answer from each episode. The
+      // model calls are real, so the store, caps and STOP file are everyone's.
+      const engine = makeEngine(cfg);
+      const agent = loadAgent(join(cfg.agentsDir, 'monitor'), cfg.memoryDir);
+      const results: EvalResult[] = [];
+      let failed = 0;
+      for (const dir of dirs) {
+        try {
+          const r = await evalEpisode(engine, agent, cfg, noise, dir, { challenge: !a['no-challenge'] });
+          results.push(r);
+          console.log(evalLine(r));
+        } catch (e) {
+          failed++;
+          console.log(`${dir}: error: ${(e as Error).message}`);
+        }
+      }
+      console.log(evalTotals(results, failed));
+      if (failed) process.exitCode = 1;
       return;
     }
 

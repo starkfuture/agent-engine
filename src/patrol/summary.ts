@@ -14,7 +14,13 @@ import type { Row, SourceHealth } from './types.js';
 // clientErrors (PATROL_URGENT_CLIENT_ERRORS) says a 4xx jump is urgent too.
 export function urgent(r: Row, noise: Noise, clientErrors = false): boolean {
   const clientError = r.section === 'http' && /^4\d\d$/.test(r.status ?? '');
-  return r.section === 'rollout' || noise.protected(r) || ((clientErrors || !clientError) && r.counts.now >= 50 && r.counts.now >= 5 * Math.max(1, r.score.expected));
+  return urgentKind(r, noise) || ((clientErrors || !clientError) && r.counts.now >= 50 && r.counts.now >= 5 * Math.max(1, r.score.expected));
+}
+
+// Urgent whatever the counts: a rollout row or a protected journey. A row key
+// tells these (the eval reads them back from one).
+export function urgentKind(r: Pick<Row, 'section' | 'service' | 'subject' | 'status'>, noise: Noise): boolean {
+  return r.section === 'rollout' || noise.protected(r);
 }
 
 export interface FlaggedRow extends Row {
