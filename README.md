@@ -340,6 +340,18 @@ for short runs), `get_run`, `get_evidence`, `list_runs`, `cancel_run`, `spend`,
 for one service or all); admins add `approve_lesson`, `stop_all`, `resume`,
 `export_run` (a run's files, for the eval).
 
+The investigator's telemetry tools, called directly (`tel_*`; no AI run, no cost;
+the same redacted, capped, evidence-stamped results the model gets), are off
+until configured: `ENGINE_MCP_TELEMETRY` = `off` | `admins` | `members` offers
+the aggregates (`tel_service_overview`, `tel_route_timeline`, `tel_workload_state`,
+and `tel_pod_status` and `tel_firing_alerts` once the investigator has them), and
+`ENGINE_MCP_TELEMETRY_RAW` the same way `tel_log_search`, `tel_trace_search` and
+`tel_promql` (raw log lines, traces, any PromQL). Per person: 20 calls a minute
+and 300 a day (`ENGINE_MCP_TELEMETRY_PER_MINUTE`, `_PER_DAY`), `tel_trace_search`
+5 and 50 (`ENGINE_MCP_TRACE_SEARCH_PER_MINUTE`, `_PER_DAY`). STOP refuses them,
+admin-level ones re-check the caller's role, and every call logs one line
+(`telemetry call user=… tool=… result=… size=… args=<redacted>`).
+
 - Who can read a run: the requester and admins, unless the agent has `visibility: everyone` in agent.yaml (monitor, research and codebase do). Someone else's private run answers like a missing one. Agents that read customer data keep the default.
 - Requests with a browser `Origin` header are refused unless listed in `ENGINE_ALLOWED_ORIGINS`.
 - The task is redacted before the model sees it. Answers keep links (research cites sources) but lose images, which load by themselves.

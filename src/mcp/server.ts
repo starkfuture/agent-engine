@@ -18,6 +18,7 @@ import { deployLines, deploysHeading, listDeploys, workloadFor } from '../patrol
 import { METADATA_PATH, Refused, serverName, type Login } from './login.js';
 import { expiresAt, type User, type Users } from './users.js';
 import type { Issues } from '../patrol/issues.js';
+import { registerTelemetryTools } from './telemetry-tools.js';
 
 // The engine over MCP, for several developers. One process holds the engine:
 // budgets, run history and the kill switch stay in one place; people connect
@@ -356,6 +357,8 @@ export function buildServer(ctx: McpContext, user: User): McpServer {
         }
       },
     );
+  // The investigator's telemetry tools for people (tel_*): off unless ENGINE_MCP_TELEMETRY(_RAW) says who.
+  registerTelemetryTools(s, ctx, user);
 
   if (admin) {
     // The identity was checked when the request arrived; an admin removed or
