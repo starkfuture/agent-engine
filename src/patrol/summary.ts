@@ -4,7 +4,7 @@ import { collectCounter, collectHttp, collectLogs, collectTraces, collectWorkloa
 import { afterDeploy, collectArgocd, collectRollouts, deployLines, deploysHeading, listDeploys, notRead, type Deploys } from './deploys.js';
 import type { Noise, NoiseRule } from './noise.js';
 import type { Novelty, State } from './state.js';
-import type { Row, SourceHealth } from './types.js';
+import { sourceState, type Row, type SourceHealth, type SourceState } from './types.js';
 
 // Rows the AI must never be able to hide: protected journeys (never_suppress),
 // big jumps and rollout rows (a stalled rollout, an Argo CD app degraded or a
@@ -87,6 +87,7 @@ export async function buildSummary(tel: Telemetry, cfg: Config, noise: Noise, st
       for (const row of r.value) rowSources.set(row.key, [...new Set([...(rowSources.get(row.key) ?? []), source])]);
     } else sources.push({ source, ok: false, error: String((r.reason as Error)?.message ?? r.reason).slice(0, 300) });
   });
+  if (!s.deploys.argocd) sources.push({ source: 'argocd', ok: false, error: 'not configured (deploys.argocd: false)', disabled: true });
   if (!tel.has.loki) sources.push({ source: 'logs', ok: false, error: 'not configured (LOKI_DATASOURCE_UID)' });
   if (!tel.has.tempo) sources.push({ source: 'traces', ok: false, error: 'not configured (TEMPO_DATASOURCE_UID)' });
 
@@ -166,9 +167,30 @@ export function renderSummary(s: Summary, o: { forModel?: boolean } = {}): strin
   if (s.waiting?.length && !o.forModel) out.push('', `## Waiting for the next patrol: news once, not investigated yet (${s.waiting.length})`, ...s.waiting.map((r) => `- ${rowLine(r)}`));
   if (s.recovered.length) out.push('', `## Recovered since last patrol (${s.recovered.length})`, ...s.recovered.map((k) => `- ${k}`));
   out.push('', `## ${deploysHeading(s.deploys)}`, ...deployLines(s.deploys));
-  const down = s.sources.filter((x) => !x.ok);
-  const part = s.sources.filter((x) => x.ok && x.note);
-  if (down.length || part.length) out.push('', '## Blind spots (sources that failed this patrol, or were read only in part)', ...down.map((x) => `- ${x.source}: ${x.error}`), ...part.map((x) => `- ${x.source} (read, incomplete): ${x.note}`));
+  if (o.forModel) {
+    // The investigator's input stays as it was (its prompt is unchanged): the
+    // blind spots only, and argocd switched off is not one.
+    const down = s.sources.filter((x) => !x.ok && !x.disabled);
+    const part = s.sources.filter((x) => x.ok && x.note);
+    if (down.length || part.length) out.push('', '## Blind spots (sources that failed this patrol, or were read only in part)', ...down.map((x) => `- ${x.source}: ${x.error}`), ...part.map((x) => `- ${x.source} (read, incomplete): ${x.note}`));
+  } else if (s.sources.length) out.push('', '## Sources', ...sourceLines(s.sources));
   if (s.suppressed.length) out.push('', `## Dropped as known noise (${s.suppressed.length})`, ...s.suppressed.map(({ row, rule }) => `- ${row.key} (rule ${rule.id})`));
   return out.join('\n');
+}
+
+// Every source by state, the ones to read first on top: what failed and why,
+// what was read in part (degraded is a note, not an incident), what was never
+// set up, then the sources read in full on one line.
+const STATE_ORDER: SourceState[] = ['blind', 'unknown', 'degraded', 'off', 'ok'];
+export function sourceLines(sources: SourceHealth[]): string[] {
+  const all = sources.map((x) => ({ x, state: sourceState(x) }));
+  const ok = all.filter((a) => a.state === 'ok').map((a) => a.x.source);
+  const rest = all.filter((a) => a.state !== 'ok').sort((a, b) => STATE_ORDER.indexOf(a.state) - STATE_ORDER.indexOf(b.state));
+  return [
+    ...rest.map(({ x, state }) => {
+      const why = (x.ok ? x.note : x.error)?.replace(/\n/g, ' ');
+      return `- [${state}] ${x.source}${why ? `: ${why}` : ''}`;
+    }),
+    ...(ok.length ? [`- [ok] ${ok.join(', ')}`] : []),
+  ];
 }

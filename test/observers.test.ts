@@ -3,12 +3,13 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { DirectTelemetry, RecordingTelemetry, ReplayTelemetry, type LogLine, type Sample, type Series, type Telemetry, type TraceHit } from '../src/clients/telemetry.js';
+import { DirectTelemetry, RecordingTelemetry, ReplayTelemetry, SourceError, type LogLine, type Sample, type Series, type Telemetry, type TraceHit } from '../src/clients/telemetry.js';
 import { Evidence } from '../src/engine/evidence.js';
 import { monitorTools } from '../src/investigate/tools.js';
 import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
 import { buildSummary, renderSummary } from '../src/patrol/summary.js';
+import { sourceState } from '../src/patrol/types.js';
 import { testConfig as cfg, world } from './fake.js';
 
 // Telemetry with Loki and Tempo, answering each method from the test's world.
@@ -70,7 +71,7 @@ test('error traces at the search limit in every slot are lower bounds: the rows 
   const traces = sourceOf(s, 'traces')!;
   assert.equal(traces.ok, true, 'capped is incomplete, not down');
   assert.match(traces.note ?? '', /^capped: the search limit \(10\) was hit now, 1 h ago, 1 d ago and 7 d ago: trace counts are lower bounds/);
-  assert.match(renderSummary(s), /## Blind spots[^\n]*\n(?:- [^\n]*\n)*- traces \(read, incomplete\): capped: the search limit \(10\)/);
+  assert.match(renderSummary(s), /\n## Sources\n(?:- [^\n]*\n)*- \[degraded\] traces: capped: the search limit \(10\)/);
 });
 
 test('error logs at the line limit: the logs source says which windows were capped', async () => {
@@ -100,7 +101,7 @@ test('43 of 46 scrape targets up: the counter source says so, and stays ok', asy
   const at = new Date('2026-09-28T12:15:00Z');
   const s = await buildSummary(tel(43, 46), c, new Noise({}), State.memory(), at);
   assert.deepEqual(sourceOf(s, 'counter:sqs'), { source: 'counter:sqs', ok: true, note: '43 of 46 targets up for up{job="svc"}: errors on the other 3 are not seen' });
-  assert.match(renderSummary(s), /## Blind spots[^\n]*\n(?:- [^\n]*\n)*- counter:sqs \(read, incomplete\): 43 of 46 targets up/);
+  assert.match(renderSummary(s), /\n## Sources\n(?:- [^\n]*\n)*- \[degraded\] counter:sqs: 43 of 46 targets up/);
 
   // All up: no note. None up: blind, as before.
   assert.deepEqual(sourceOf(await buildSummary(tel(46, 46), c, new Noise({}), State.memory(), at), 'counter:sqs'), { source: 'counter:sqs', ok: true });
@@ -189,6 +190,56 @@ test('a presence query that errors proves nothing either way: the source stays a
     },
   });
   assert.deepEqual(sourceOf(await buildSummary(read, cfg(), new Noise({}), State.memory(), AT), 'logs'), { source: 'logs', ok: true, note: 'log presence not checked (loki: HTTP 400: max query length)' });
+});
+
+test('one state per source, first match wins: off, blind, unknown, degraded, ok', () => {
+  const st = (x: Parameters<typeof sourceState>[0]) => sourceState(x);
+  assert.equal(st({ source: 'logs', ok: false, error: 'not configured (LOKI_DATASOURCE_UID)' }), 'off');
+  assert.equal(st({ source: 'logs', ok: false, error: 'loki: not configured' }), 'off');
+  assert.equal(st({ source: 'argocd', ok: false, error: 'not configured (deploys.argocd: false)', disabled: true }), 'off');
+  assert.equal(st({ source: 'workloads', ok: false, error: 'prometheus: HTTP 502: bad gateway' }), 'blind');
+  assert.equal(st({ source: 'workloads', ok: false }), 'blind');
+  assert.equal(st({ source: 'logs', ok: true, note: 'log presence not checked (loki: HTTP 503)', unknown: true }), 'unknown', 'unknown is also ok with a note: it wins');
+  assert.equal(st({ source: 'traces', ok: true, note: 'capped: the search limit (300) was hit now' }), 'degraded');
+  assert.equal(st({ source: 'http:v3', ok: true }), 'ok');
+});
+
+test('a note is degraded, an unknown read is unknown, a failure is blind and argocd switched off is off; the card lists them by state, the investigator sees blind spots as before', async () => {
+  const c = cfg(); // argocd: false
+  c.sources.traces.limit = 10;
+  const tel = new Observed({
+    prom: (q, at) => {
+      if (q.includes('kube_pod')) throw new SourceError('prometheus', 'HTTP 502: bad gateway');
+      return world(q, at);
+    },
+    // The search reads nothing and the presence check fails: unknown.
+    logCounts: () => {
+      throw new Error('loki: HTTP 400: max query length');
+    },
+    // At the search limit in every slot: capped, read in part.
+    traces: (q, _s, _e, limit) => (q === '{}' ? [hit('any', 'any', 0)] : hits(limit, 'checkout', 'POST /pay')),
+  });
+  const s = await buildSummary(tel, c, new Noise({}), State.memory(), AT);
+  assert.deepEqual(Object.fromEntries(s.sources.map((x) => [x.source, sourceState(x)])), {
+    'http:legacy-v1': 'ok',
+    workloads: 'blind',
+    rollouts: 'ok',
+    logs: 'unknown',
+    traces: 'degraded',
+    argocd: 'off',
+  });
+  const card = renderSummary(s);
+  assert.match(
+    card,
+    /\n## Sources\n- \[blind\] workloads: prometheus: HTTP 502: bad gateway\n- \[unknown\] logs: log presence not checked \(loki: HTTP 400: max query length\)\n- \[degraded\] traces: capped: the search limit \(10\) [^\n]*\n- \[off\] argocd: not configured \(deploys\.argocd: false\)\n- \[ok\] http:legacy-v1, rollouts$/,
+  );
+  assert.doesNotMatch(card, /Blind spots/);
+  const model = renderSummary(s, { forModel: true });
+  assert.match(
+    model,
+    /\n## Blind spots \(sources that failed this patrol, or were read only in part\)\n- workloads: prometheus: HTTP 502: bad gateway\n- logs \(read, incomplete\): log presence not checked \(loki: HTTP 400: max query length\)\n- traces \(read, incomplete\): capped: [^\n]*$/,
+  );
+  assert.doesNotMatch(model, /argocd|## Sources|\[ok\]/, 'argocd switched off is no blind spot for the investigator either');
 });
 
 test('a row does not recover on a patrol whose read is unknown, only on one that shows the source read', async () => {
@@ -297,7 +348,7 @@ test('a recording without the new queries replays: every source as read before, 
 
   const replay = new ReplayTelemetry(dir);
   const s = await buildSummary(replay, c, new Noise({}), State.memory(), AT);
-  assert.ok(s.sources.every((x) => x.ok), JSON.stringify(s.sources));
+  assert.ok(s.sources.every((x) => x.ok || x.disabled), JSON.stringify(s.sources));
   assert.deepEqual(
     s.sources.filter((x) => x.note).map((x) => [x.source, x.note]),
     [

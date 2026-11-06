@@ -11,6 +11,7 @@ import { Noise } from '../src/patrol/noise.js';
 import { Owners } from '../src/patrol/owners.js';
 import { State } from '../src/patrol/state.js';
 import { buildSummary, renderSummary } from '../src/patrol/summary.js';
+import { sourceState } from '../src/patrol/types.js';
 import { loadAgent } from '../src/engine/agent.js';
 import { Store } from '../src/engine/store.js';
 import type { Engine } from '../src/engine/run.js';
@@ -24,7 +25,7 @@ test('incident rows are flagged, steady noise is not', async () => {
   const s = await buildSummary(new FakeTelemetry(world), cfg(), new Noise({}), State.memory(), new Date('2026-09-29T12:15:00Z'));
   const keys = s.send.map((r) => r.key).sort();
   assert.deepEqual(keys, ['http|backend-production|/v1/auth/password/reset|400', 'http|backend-production|/v1/auth/signup|400']);
-  assert.ok(s.sources.every((x) => x.ok || x.source === 'logs' || x.source === 'traces'));
+  assert.ok(s.sources.every((x) => sourceState(x) !== 'blind'));
   assert.match(renderSummary(s), /password\/reset 400: SPIKE \(fresh, started/);
 });
 

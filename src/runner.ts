@@ -18,6 +18,7 @@ import type { Noise } from './patrol/noise.js';
 import type { Owners } from './patrol/owners.js';
 import { ATTEMPTS, type State } from './patrol/state.js';
 import { buildSummary, renderSummary, urgent, type FlaggedRow, type Summary } from './patrol/summary.js';
+import { sourceState } from './patrol/types.js';
 import { redact, safeJson } from './engine/text.js';
 
 export interface PatrolOptions {
@@ -216,8 +217,9 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
   const dir = join(cfg.outDir, 'patrols');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, `${stamp(summary.at)}.md`), redact(renderSummary(summary)) + '\n');
-  writeFileSync(join(dir, `${stamp(summary.at)}.json`), safeJson(summary, 1));
-  log(`patrol ${summary.at}: ${summary.send.length} to send, ${summary.waiting.length} waiting, ${summary.known.length} known, ${summary.suppressed.length} noise, ${summary.recovered.length} recovered, sources down: ${summary.sources.filter((s) => !s.ok).map((s) => s.source).join(', ') || 'none'}`);
+  // Each source with its state (off, blind, unknown, degraded or ok) for readers of the file.
+  writeFileSync(join(dir, `${stamp(summary.at)}.json`), safeJson({ ...summary, sources: summary.sources.map((s) => ({ ...s, state: sourceState(s) })) }, 1));
+  log(`patrol ${summary.at}: ${summary.send.length} to send, ${summary.waiting.length} waiting, ${summary.known.length} known, ${summary.suppressed.length} noise, ${summary.recovered.length} recovered, sources down: ${summary.sources.filter((s) => !s.ok && !s.disabled).map((s) => s.source).join(', ') || 'none'}`);
 
   const result: PatrolResult = { summary, cards: [], slack: [], filed: [], resolved: [] };
   // The issue record must never stop a patrol: on a database error the reports

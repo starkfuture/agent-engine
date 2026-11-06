@@ -14,6 +14,7 @@ import { CardSink } from '../src/output/sink.js';
 import { SlackOutbox } from '../src/output/slack.js';
 import { Noise } from '../src/patrol/noise.js';
 import { State } from '../src/patrol/state.js';
+import { sourceState, type SourceHealth } from '../src/patrol/types.js';
 import { patrolOnce, type MonitorAgent, type PatrolResult } from '../src/runner.js';
 import { fakeSession, ok, type Script } from './fake-session.js';
 import { FakeTelemetry, testConfig as cfg, world } from './fake.js';
@@ -342,6 +343,97 @@ test('a patrol in which every Prometheus source failed is not a successful patro
   assert.match(text, /^engine_patrol_source_up\{source="workloads"\} 0$/m);
   m.patrol(t('2026-11-02T05:30:00Z'), result([{ source: 'http:v3', ok: false }, { source: 'workloads', ok: true }, { source: 'logs', ok: false }]));
   assert.match(m.render(engine), /^engine_patrol_last_success_timestamp_seconds 1793597400$/m, 'partly blind still counts');
+  rmSync(runsDir, { recursive: true, force: true });
+});
+
+test('each source shows its state in the metrics, right after source_up, which stays as it was; a crashed pass shows no state and last_pass_ok 0', () => {
+  const runsDir = mkdtempSync(join(tmpdir(), 'runs-'));
+  const engine: Engine = { store: new Store(':memory:'), runsDir, stopFile: join(runsDir, 'STOP'), session: () => (async function* () {})(), dailyCapUsd: 30, llmAvailable: true };
+  const result = (sources: SourceHealth[]) => ({ summary: { sources }, cards: [] }) as unknown as PatrolResult;
+  const lines = (text: string, name: string) => text.split('\n').filter((l) => l.startsWith(`${name}{`) || l.startsWith(`${name} `));
+  const m = new Metrics();
+  assert.doesNotMatch(m.render(engine), /engine_patrol_last_pass_ok|engine_patrol_source_state/, 'no pass yet');
+
+  m.patrol(
+    new Date('2026-11-02T05:00:00Z'),
+    result([
+      { source: 'http:v3', ok: true },
+      { source: 'counter:sqs', ok: true, note: '43 of 46 targets up for up{job="svc"}: errors on the other 3 are not seen' },
+      { source: 'workloads', ok: false, error: 'prometheus: HTTP 502: bad gateway' },
+      { source: 'logs', ok: true, note: 'log presence not checked (loki: HTTP 503)', unknown: true },
+      { source: 'argocd', ok: false, error: 'not configured (deploys.argocd: false)', disabled: true },
+      { source: 'traces', ok: false, error: 'not configured (TEMPO_DATASOURCE_UID)' },
+    ]),
+  );
+  const text = m.render(engine);
+  assert.deepEqual(lines(text, 'engine_patrol_source_state'), [
+    'engine_patrol_source_state{source="http:v3",state="ok"} 1',
+    'engine_patrol_source_state{source="counter:sqs",state="degraded"} 1',
+    'engine_patrol_source_state{source="workloads",state="blind"} 1',
+    'engine_patrol_source_state{source="logs",state="unknown"} 1',
+    'engine_patrol_source_state{source="argocd",state="off"} 1',
+    'engine_patrol_source_state{source="traces",state="off"} 1',
+  ]);
+  // source_up as before states: argocd switched off was never in it, and a 0
+  // would fire AgentEngineBlindSpot. Traces with no datasource uid still are.
+  assert.deepEqual(lines(text, 'engine_patrol_source_up'), [
+    'engine_patrol_source_up{source="http:v3"} 1',
+    'engine_patrol_source_up{source="counter:sqs"} 1',
+    'engine_patrol_source_up{source="workloads"} 0',
+    'engine_patrol_source_up{source="logs"} 1',
+    'engine_patrol_source_up{source="traces"} 0',
+  ]);
+  assert.match(text, /^engine_patrol_source_up\{source="traces"\} 0\n# HELP engine_patrol_source_state .+\n# TYPE engine_patrol_source_state gauge\n/m, 'right after source_up');
+  assert.deepEqual(lines(text, 'engine_patrol_last_pass_ok'), ['engine_patrol_last_pass_ok 1']);
+  for (const line of text.trim().split('\n')) assert.match(line, /^(# (HELP|TYPE) \w+ .+|\w+(\{[^}]*\})? -?[\d.e+]+)$/, line);
+
+  // 05:15Z: the pass crashed. No source looks ok from 05:00; source_up and the
+  // last success stay as they were (AgentEnginePatrolStale and BlindSpot read them).
+  m.patrol(new Date('2026-11-02T05:15:00Z'));
+  const crashed = m.render(engine);
+  assert.deepEqual(lines(crashed, 'engine_patrol_last_pass_ok'), ['engine_patrol_last_pass_ok 0']);
+  assert.doesNotMatch(crashed, /engine_patrol_source_state/);
+  assert.deepEqual(lines(crashed, 'engine_patrol_source_up'), lines(text, 'engine_patrol_source_up'));
+  assert.match(crashed, /^engine_patrol_last_success_timestamp_seconds 1793595600$/m);
+  assert.match(crashed, /^engine_patrol_last_run_timestamp_seconds 1793596500$/m);
+
+  m.patrol(new Date('2026-11-02T05:30:00Z'), result([{ source: 'http:v3', ok: true }]));
+  const back = m.render(engine);
+  assert.deepEqual(lines(back, 'engine_patrol_last_pass_ok'), ['engine_patrol_last_pass_ok 1']);
+  assert.deepEqual(lines(back, 'engine_patrol_source_state'), ['engine_patrol_source_state{source="http:v3",state="ok"} 1']);
+  rmSync(runsDir, { recursive: true, force: true });
+});
+
+test('argocd switched off, and logs and traces with no datasource uid, are off and never blind: in the patrol file, the card, the metrics and the channel', async () => {
+  const c = cfg(); // argocd: false, no Loki or Tempo uid
+  const { box, sent } = webhook();
+  const at = '2026-09-28T12:15:00Z';
+  const r = await patrolOnce(new FakeTelemetry(world), c, new Noise({}), State.memory(), new CardSink(c.outDir, box), new Date(at), { llm: false, post: true });
+  const states = [
+    ['http:legacy-v1', 'ok'],
+    ['workloads', 'ok'],
+    ['rollouts', 'ok'],
+    ['argocd', 'off'],
+    ['logs', 'off'],
+    ['traces', 'off'],
+  ];
+  assert.deepEqual(r.summary.sources.map((x) => [x.source, sourceState(x)]), states);
+  // The patrol file saves each source with its state.
+  const saved = JSON.parse(readFileSync(join(c.outDir, 'patrols', '2026-09-28T1215Z.json'), 'utf8')) as { sources: Array<SourceHealth & { state: string }> };
+  assert.deepEqual(saved.sources.map((x) => [x.source, x.state]), states);
+  assert.deepEqual(saved.sources[3], { source: 'argocd', ok: false, error: 'not configured (deploys.argocd: false)', disabled: true, state: 'off' });
+  const md = readFileSync(join(c.outDir, 'patrols', '2026-09-28T1215Z.md'), 'utf8');
+  assert.match(md, /\n## Sources\n- \[off\] argocd: not configured \(deploys\.argocd: false\)\n- \[off\] logs: not configured \(LOKI_DATASOURCE_UID\)\n- \[off\] traces: not configured \(TEMPO_DATASOURCE_UID\)\n- \[ok\] http:legacy-v1, workloads, rollouts\n/);
+  assert.ok(sent.every((x) => !/Blind|argocd/.test(x.all)), 'no blind notice, and argocd in no blind spots');
+
+  const m = new Metrics();
+  m.patrol(new Date(at), r);
+  const runsDir = mkdtempSync(join(tmpdir(), 'runs-'));
+  const text = m.render({ store: new Store(':memory:'), runsDir, stopFile: join(runsDir, 'STOP'), session: () => (async function* () {})(), dailyCapUsd: 30, llmAvailable: true });
+  assert.match(text, /^engine_patrol_source_state\{source="argocd",state="off"\} 1$/m);
+  assert.match(text, /^engine_patrol_source_state\{source="logs",state="off"\} 1$/m);
+  assert.doesNotMatch(text, /state="blind"/);
+  assert.doesNotMatch(text, /engine_patrol_source_up\{source="argocd"\}/);
   rmSync(runsDir, { recursive: true, force: true });
 });
 

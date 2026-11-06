@@ -238,7 +238,7 @@ export function patrolCard(s: Summary, why: string, o: PatrolCardOptions = {}): 
   const cc = uniq([...(o.oncall ? [o.oncall] : []), ...mentions(d.look)]);
   const n = d.counts;
   const title = `Patrol ${minute(s.at)}: ${[n.look ? `${n.look} to look at` : 'nothing new to look at', n.ongoing ? `${n.ongoing} still ongoing` : '', n.quiet ? `${n.quiet} quiet` : ''].filter(Boolean).join(' · ')}`;
-  const down = s.sources.filter((x) => !x.ok).map((x) => x.source);
+  const down = s.sources.filter((x) => !x.ok && !x.disabled).map((x) => x.source);
   const footer = (f: Fmt, cut: boolean) => [f.t(why), down.length ? `blind spots: ${f.t(down.join(', '))}` : '', cut && o.ref ? `full list: ${f.t(o.ref)}` : ''].filter(Boolean).join(' · ');
   const deploys = recentDeploys(s.deploys);
   const ongoingHead = 'Still ongoing (reported before, not worse)';

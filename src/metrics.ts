@@ -4,6 +4,7 @@ import { freeBytes } from './engine/retention.js';
 import type { Engine } from './engine/run.js';
 import type { SyncState } from './mcp/reposync.js';
 import { prometheusBlind } from './output/notices.js';
+import { sourceState, type SourceState } from './patrol/types.js';
 import type { PatrolResult } from './runner.js';
 
 // Prometheus metrics for the heartbeat alert: is the engine up, is the patrol
@@ -13,7 +14,9 @@ import type { PatrolResult } from './runner.js';
 export class Metrics {
   private lastRun?: Date;
   private lastOk?: Date;
+  private lastPassOk?: boolean;
   private sources: Array<{ source: string; ok: boolean }> = [];
+  private states: Array<{ source: string; state: SourceState }> = [];
   private repos?: Map<string, SyncState>;
 
   // The codebase agent's synced repos: how fresh each clone is.
@@ -22,11 +25,19 @@ export class Metrics {
   }
 
   // A patrol that read nothing from Prometheus (every source but logs and
-  // traces failed) ran, but saw next to nothing: not a success.
+  // traces failed) ran, but saw next to nothing: not a success. A pass that
+  // crashed keeps the last source_up as before, but shows no source state: an
+  // older pass's would look ok.
   patrol(at: Date, r?: PatrolResult): void {
     this.lastRun = at;
-    if (!r) return;
-    this.sources = r.summary.sources.map((s) => ({ source: s.source, ok: s.ok }));
+    this.lastPassOk = Boolean(r);
+    if (!r) {
+      this.states = [];
+      return;
+    }
+    // A source switched off in the config isn't listed in source_up: a 0 there is a blind spot.
+    this.sources = r.summary.sources.filter((s) => !s.disabled).map((s) => ({ source: s.source, ok: s.ok }));
+    this.states = r.summary.sources.map((s) => ({ source: s.source, state: sourceState(s) }));
     if (!prometheusBlind(r.summary.sources)) this.lastOk = at;
   }
 
@@ -47,7 +58,9 @@ export class Metrics {
     gauge('engine_stop_switch', '1 while the kill switch is set (new runs are skipped).', [[{}, existsSync(engine.stopFile) ? 1 : 0]]);
     if (this.lastRun) gauge('engine_patrol_last_run_timestamp_seconds', 'When the patrol last ran.', [[{}, Math.floor(this.lastRun.getTime() / 1000)]]);
     if (this.lastOk) gauge('engine_patrol_last_success_timestamp_seconds', 'When the patrol last finished without failing.', [[{}, Math.floor(this.lastOk.getTime() / 1000)]]);
+    if (this.lastPassOk !== undefined) gauge('engine_patrol_last_pass_ok', '1 when the last patrol pass returned a result, 0 when it crashed.', [[{}, this.lastPassOk ? 1 : 0]]);
     if (this.sources.length) gauge('engine_patrol_source_up', '0 when the last patrol could not read this source (a blind spot).', this.sources.map((s) => [{ source: s.source }, s.ok ? 1 : 0]));
+    if (this.states.length) gauge('engine_patrol_source_state', "1 for each source's state in the last patrol: ok, degraded (read in part), unknown (not known whether it reads), blind (not read) or off (not configured). None after a crashed pass.", this.states.map((s) => [{ source: s.source, state: s.state }, 1]));
     if (this.repos?.size) {
       const rows = [...this.repos];
       gauge('engine_repo_last_fetch_timestamp_seconds', 'When each synced repo was last cloned or fetched (absent: never).', rows.filter(([, s]) => s.lastFetch).map(([repo, s]) => [{ repo }, Math.floor(s.lastFetch!.getTime() / 1000)]));

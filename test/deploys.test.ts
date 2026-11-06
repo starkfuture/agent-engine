@@ -322,7 +322,7 @@ test('Argo CD: off reads nothing and reports no blind spot; on, a degraded app a
   const off = cluster([]);
   const s = await buildSummary(off, cfg(), new Noise({}), State.memory(), AT);
   assert.ok(!off.calls.some((q) => q.includes('argocd')));
-  assert.ok(!s.sources.some((x) => x.source === 'argocd'));
+  assert.deepEqual(s.sources.find((x) => x.source === 'argocd'), { source: 'argocd', ok: false, error: 'not configured (deploys.argocd: false)', disabled: true }, 'listed as off');
 
   const c = cfg();
   c.sources.deploys.argocd = true;
