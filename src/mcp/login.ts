@@ -1,4 +1,5 @@
 import { createPublicKey, verify, type JsonWebKey, type KeyObject } from 'node:crypto';
+import { nameFromEmail } from './users.js';
 
 // Sign-in through Keycloak, the company login, as the MCP authorization spec
 // describes it: the engine is a plain OAuth resource server. Claude Code finds
@@ -106,6 +107,14 @@ const MAX_TOKEN = 16_384;
 // "special access" session) must never use the engine as that person.
 const IMPERSONATION = ['adminUser', 'specialAccess', 'impersonator', 'act'];
 export const METADATA_PATH = '/.well-known/oauth-protected-resource/mcp';
+// RFC 6749 3.3 scope-token: no space, quote or backslash, so it sits in a
+// quoted-string as is. config.ts already refuses anything else at startup.
+const SCOPE_TOKEN = /^[\x21\x23-\x5b\x5d-\x7e]+$/;
+// Sign-ins remembered for the offline_access log line (person and answer).
+// Past this, the earliest logged is forgotten and logs again on its next request.
+export const OFFLINE_LOG_MAX = 500;
+// The serve log's format (cli.ts), for the one line the sign-in writes itself.
+const stderrLog = (s: string) => console.error(`[${new Date().toISOString().slice(11, 19)}] ${s}`);
 
 // The MCP server name people add, after the deployment's host
 // (agent-engine, agent-engine-web), so adding both doesn't collide.
@@ -127,14 +136,19 @@ const part = (s: string): Record<string, unknown> => {
 export class Login {
   private readonly base: string;
   private readonly issuer: string;
+  private readonly wwwAuthenticate: string;
+  private readonly logged = new Set<string>();
 
   constructor(
     private readonly cfg: LoginConfig,
     private readonly keys: SigningKeys = new JwksKeys(cfg.jwksUrl),
     private readonly now: () => number = Date.now,
+    private readonly log: (s: string) => void = stderrLog,
   ) {
     this.base = cfg.publicUrl.replace(/\/+$/, '');
     this.issuer = cfg.issuer.replace(/\/+$/, '');
+    const scopes = (cfg.scopes ?? []).filter((s) => SCOPE_TOKEN.test(s));
+    this.wwwAuthenticate = `Bearer resource_metadata="${this.base}${METADATA_PATH}"${scopes.length ? `, scope="${scopes.join(' ')}"` : ''}`;
   }
 
   // RFC 9728: where Claude Code learns which authorization server to use.
@@ -142,8 +156,27 @@ export class Login {
     return { resource: `${this.base}/mcp`, authorization_servers: [this.issuer], bearer_methods_supported: ['header'], resource_name: 'agent-engine', ...(this.cfg.scopes?.length ? { scopes_supported: this.cfg.scopes } : {}) };
   }
 
+  // The 401's WWW-Authenticate. With scopes configured it also names them
+  // (RFC 6750 section 3): the MCP authorization spec has clients ask for the
+  // challenge's scope before the document's scopes_supported. Without any, it
+  // is the bare resource_metadata challenge.
   challenge(): string {
-    return `Bearer resource_metadata="${this.base}${METADATA_PATH}"`;
+    return this.wwwAuthenticate;
+  }
+
+  // Once per person and answer, per process (while remembered, OFFLINE_LOG_MAX):
+  // whether their access token came with offline_access, so the logs show which
+  // clients asked for the offline session. The user name and a yes/no only,
+  // never the token or its claims.
+  private noteOffline(email: string, offline: boolean): void {
+    const key = `${email} ${offline}`;
+    if (this.logged.has(key)) return;
+    if (this.logged.size >= OFFLINE_LOG_MAX) {
+      const [oldest] = this.logged;
+      if (oldest !== undefined) this.logged.delete(oldest);
+    }
+    this.logged.add(key);
+    this.log(`sign-in: ${nameFromEmail(email)} · offline_access ${offline ? 'yes' : 'no'}`);
   }
 
   // The company email the token was issued to, or Refused.
@@ -177,6 +210,7 @@ export class Login {
     // address is only a claim; the invite list alone is not enough.
     const email = typeof c.email === 'string' ? c.email.toLowerCase() : '';
     if (c.email_verified !== true || !email.endsWith(`@${this.cfg.domain}`)) throw new Refused(403, `sign in with your verified @${this.cfg.domain} account`);
+    this.noteOffline(email, typeof c.scope === 'string' && c.scope.split(' ').includes('offline_access'));
     return email;
   }
 }
