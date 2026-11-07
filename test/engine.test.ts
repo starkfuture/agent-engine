@@ -73,7 +73,7 @@ const commit = (root: string, msg = 'c') => execFileSync('git', ['-C', root, '-c
 
 test('all shipped agents load, and the Rule of Two is enforced at load time and at run time', async () => {
   const names = listAgents(join(import.meta.dirname, '..', 'agents')).map((a) => a.spec.name);
-  assert.deepEqual(names, ['codebase', 'monitor', 'prod', 'research']);
+  assert.deepEqual(names, ['codebase', 'monitor', 'prod', 'prod-quick', 'research']);
   assert.throws(() => loadAgent(agentDir('builtin_tools: [Read, WebFetch]')), /cannot have both/);
   assert.throws(() => loadAgent(agentDir('sensitive_tools: true\nbuiltin_tools: [WebSearch]')), /cannot have both/);
   // A production-data tool pack is a sensitive read: it can't be declared without saying so, nor next to web tools.
