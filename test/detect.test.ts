@@ -251,6 +251,54 @@ test('the gate simulation starts the same runs as the patrol with production set
   );
 });
 
+test('the gate simulation defers to the hourly pass exactly as the patrol does: when every report covers its rows, and when none does', async () => {
+  // Production settings. Minor rows (12 client errors on routes of no likely-major family) wait for the hourly pass;
+  // a checkout row is likely major; a 503 burst is urgent. Rides from 0 h; rewards from 0.25 h; profile for one patrol
+  // at 0.75 h (a blip); warnings from 1.25 h (it stops at 2 h, before its pass); checkout from 1.75 h; status 503 at 2.5 h.
+  const strict: Partial<Config> = { confirmPatrols: 2, urgentClientErrors: false, recoverAfterMinutes: 60 };
+  const live = schedule({
+    '/v1/vehicles/rides': between(0, 6, 12),
+    '/v1/referral/rewards': between(0.25, 6, 12),
+    '/v1/user/profile': between(0.75, 1, 12),
+    '/v1/vehicles/warning-types': between(1.25, 2, 12),
+    '/v1/checkout/cart': between(1.75, 6, 12),
+    '/v1/vehicles/status 503': between(2.5, 2.75, 300),
+  });
+  const hours = Array.from({ length: 17 }, (_, i) => i / 4); // 0 h to 4 h
+  const story = async (cover: Cover) => {
+    const dir = mkdtempSync(join(tmpdir(), 'sre-gate-'));
+    const rec = new RecordingTelemetry(live, dir);
+    const failing: Session = (req) =>
+      fakeSession(async function* () {
+        yield fail('error_max_budget_usd', 0.01);
+      })(req);
+    const w = setup(bot(), linker(), { cfg: strict, ...(cover === 'none' ? { engine: { session: failing } } : {}) });
+    const patrolled: string[] = [];
+    for (const h of hours) {
+      const n = w.logs.length;
+      await w.patrol(rec, h);
+      const l = w.logs.slice(n);
+      const started = l.find((x) => x.startsWith('investigating '));
+      patrolled.push(started ? `${h} h: ${/^investigating (\d+) row/.exec(started)![1]} row(s)` : l.some((x) => x.includes('wait for the hourly pass')) ? `${h} h: waits` : '');
+    }
+    const simulated: string[] = [];
+    for await (const p of simulate(new ReplayTelemetry(dir), w.c, new Noise({}), at(0), at(4), 15, cover)) {
+      const h = (p.at.getTime() - at(0).getTime()) / H;
+      const g = p.gate as typeof p.gate & { deferred: boolean }; // gateOf returns aiGate's whole result
+      simulated.push(p.gate.run ? `${h} h: ${p.gate.pending.length} row(s)` : g.deferred ? `${h} h: waits` : '');
+    }
+    assert.deepEqual(simulated, patrolled, `cover ${cover}`);
+    return patrolled.filter(Boolean);
+  };
+  // Rides is confirmed at 0.25 h and runs (no run before it). Rewards (0.5 h) waits; profile is a blip and never
+  // is news; the hourly pass at 1.25 h takes rewards. Warnings (1.5 h) waits and stops firing at 2 h: it drops
+  // out. Checkout is confirmed at 2 h and runs at once, 45 min after the last run. The 503 is urgent at 2.5 h: at once.
+  assert.deepEqual(await story('all'), ['0.25 h: 1 row(s)', '0.5 h: waits', '0.75 h: waits', '1 h: waits', '1.25 h: 1 row(s)', '1.5 h: waits', '1.75 h: waits', '2 h: 1 row(s)', '2.5 h: 1 row(s)']);
+  // No report ever covers a row: a minor row's retry waits for the hourly pass too (rides at 1.25 h, rewards with
+  // checkout at 2 h), a likely-major row's comes the next patrol (checkout at 2.25 h). Two attempts each, as before.
+  assert.deepEqual(await story('none'), ['0.25 h: 1 row(s)', '0.5 h: waits', '0.75 h: waits', '1 h: waits', '1.25 h: 2 row(s)', '1.5 h: waits', '1.75 h: waits', '2 h: 2 row(s)', '2.25 h: 1 row(s)', '2.5 h: 1 row(s)']);
+});
+
 test('replay --expect on the command line: exit 1 on a lost problem and 0 without; --json keeps the summary; --llm and the range flags are refused', async () => {
   const cfg = { ...testConfig(), confirmPatrols: 2 };
   const dir = await record(new FakeTelemetry(incident), cfg, '2026-09-29T11:00:00.000Z', '2026-09-29T12:30:00.000Z');

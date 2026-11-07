@@ -44,6 +44,10 @@ export interface StateData {
   // skipped run that recorded it. Ends with the next run that is admitted.
   held?: { reason: string; since: string; runId: string };
   notices?: Notices; // what was said about pauses and blind sources (output/notices.ts)
+  // The patrol time of the last AI run that started (was admitted). Rows that
+  // aren't likely major wait for an hour after it (runner.ts aiGate). Absent in
+  // older state files: no run is that recent.
+  lastRunAt?: string;
 }
 
 const H = 3600_000;
@@ -140,6 +144,11 @@ export class State {
 
   needsInvestigation(key: string): boolean {
     return this.data.rows[key]?.investigation?.status === 'pending';
+  }
+
+  // An AI run started at this patrol (it was admitted): the hourly pass counts from here.
+  runStarted(at: Date): void {
+    this.data.lastRunAt = at.toISOString();
   }
 
   // After a run over these rows: the ones a report covers are done; the rest
