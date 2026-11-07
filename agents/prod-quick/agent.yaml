@@ -1,0 +1,15 @@
+name: prod-quick
+description: Answers one focused question about production right now, fast (read-only, a few tool calls, cites evidence, says what it did not check). For a full investigation or a challenged answer, ask prod.
+visibility: requester # answers are built from production data; only the asker (and admins) see them
+model: claude-sonnet-5-5
+concurrency: 2
+sensitive_tools: true # read-only Prometheus/Loki/Tempo
+tool_pack: telemetry
+builtin_tools: [] # no shell, no files, no web
+limits:
+  max_turns: 8 # CLAUDE.md names this number: change both together
+  usd_per_run: 0.4
+  usd_per_day: 5
+  deadline_min: 3
+challenge:
+  when: never # a quick answer is not challenged; ask prod for that
