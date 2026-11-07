@@ -16,7 +16,7 @@ import { Store } from '../src/engine/store.js';
 import type { Engine } from '../src/engine/run.js';
 import type { Session } from '../src/engine/session.js';
 import type { FlaggedRow } from '../src/patrol/summary.js';
-import { needsChallenge, patrolOnce, type MonitorAgent, patrolLoop } from '../src/runner.js';
+import { HOURLY_PASS_MINUTES, LIKELY_MAJOR, aiGate, likelyMajor, needsChallenge, patrolOnce, type MonitorAgent, patrolLoop } from '../src/runner.js';
 import { fail, fakeSession, ok, say, type Script } from './fake-session.js';
 import { DAY, FakeTelemetry, H, INCIDENT_START, testConfig as cfg, world } from './fake.js';
 
@@ -208,6 +208,84 @@ test('challenge gate is deterministic: an unprotected modest spike is not challe
   assert.equal(needsChallenge([{ ...row, counts: { ...row.counts, now: 60 } }], new Noise({})), false, 'a big jump in client errors is not urgent by itself');
   assert.equal(needsChallenge([{ ...row, counts: { ...row.counts, now: 60 } }], new Noise({}), true), true, 'unless PATROL_URGENT_CLIENT_ERRORS says so');
   assert.equal(needsChallenge([row], new Noise({ never_suppress: [{ section: 'http', route: '/v1/products' }] })), true);
+});
+
+// A modest 404 on a product route: worth a look, not likely major.
+const plain = (over: Partial<FlaggedRow> = {}): FlaggedRow =>
+  ({ key: 'http|product-catalog-service-production|/v3/product-catalog/products/:slug|404', section: 'http', service: 'product-catalog-service-production', subject: '/v3/product-catalog/products/:slug', status: '404', counts: { now: 15, h1: 10, d1: 10, d7: 10 }, totals: { now: 1000, h1: 1000, d1: 1000, d7: 1000 }, score: { verdict: 'spike', expected: 10, z: 1.5, trend: 'ongoing' }, novelty: 'fresh', firstSeen: '2026-11-02T08:00:00.000Z', ...over }) as FlaggedRow;
+
+test('likely major: urgent rows, checkout/payment/auth/order routes, a large 5xx share, a smaller jump, a deploy in the 2 h before; nothing else', () => {
+  const noise = new Noise({ never_suppress: [{ section: 'http', route: '.*(checkout|order).*', status: '5..' }] });
+  const prod = { urgentClientErrors: false };
+  const l = LIKELY_MAJOR;
+  const counts = (now: number, expected: number) => ({ counts: { now, h1: 0, d1: expected, d7: expected }, score: { verdict: 'spike' as const, expected, z: 9, trend: 'started' as const } });
+  assert.equal(likelyMajor(plain(), noise, prod), false, 'a modest 404 on a product route');
+  // Urgent: a rollout row, a protected journey at any size, a big jump in server errors.
+  assert.equal(likelyMajor(plain({ section: 'rollout', service: 'keycloak', subject: 'stalled', status: undefined }), noise, prod), true);
+  assert.equal(likelyMajor(plain({ subject: '/v3/ecom/basket/:id', status: '502', ...counts(1, 0), totals: undefined }), new Noise({ never_suppress: [{ route: '/v3/ecom/basket.*' }] }), prod), true, 'protected');
+  assert.equal(likelyMajor(plain({ status: '500', ...counts(60, 2), totals: undefined }), noise, prod), true, 'a big jump');
+  // The route families, at any status, on route-shaped rows only.
+  for (const [section, subject, status] of [
+    ['http', '/v3/ecom/checkout/:cartId/complete', '409'],
+    ['http', '/v3/ecom/orders', '401'],
+    ['http', '/v3/ecom/admin/orders/search', '404'],
+    ['http', '/v3/payment/engine/subscription/billing/subscription/:subscriptionId', '404'],
+    ['http', '/v3/auth/login', '400'],
+    ['drop', '/v3/auth/internal/legacy-v1/:operation', undefined],
+    ['traces', 'POST /v3/auth/refresh', undefined],
+  ] as const)
+    assert.equal(likelyMajor(plain({ section, subject, status, totals: undefined }), noise, prod), true, `${section} ${subject}`);
+  for (const [section, subject] of [
+    ['logs', 'Error: MISSING_MESSAGE: checkout_seo_page_image (de-DE)'],
+    ['logs', 'JWT Strategy validation error: UnauthorizedException: Token revoked or user inactive'],
+    ['http', '/v3/ecom/orderbook'],
+    ['http', '/v1/user/sign-in'],
+    ['http', '/realms/{realm}/protocol/{protocol}/token'],
+  ] as const)
+    assert.equal(likelyMajor(plain({ section, subject, totals: undefined }), noise, prod), false, `not a family: ${section} ${subject}`);
+  // A 5xx row failing a large share of its route's requests; only HTTP rows carry the totals.
+  const share = (now: number) => plain({ status: '503', counts: { now, h1: 0, d1: 1, d7: 1 }, totals: { now: 100, h1: 100, d1: 100, d7: 100 }, score: { verdict: 'spike', expected: 1, z: 3, trend: 'started' } });
+  assert.equal(likelyMajor(share(Math.ceil(100 * l.share5xx)), noise, prod), true, `${l.share5xx} of the requests`);
+  assert.equal(likelyMajor(share(Math.ceil(100 * l.share5xx) - 1), noise, prod), false, 'a smaller share');
+  assert.equal(likelyMajor({ ...share(Math.ceil(100 * l.share5xx)), status: '404' }, noise, prod), false, 'client errors are not a 5xx share');
+  // A jump: at least jumpMin events and jumpFactor times the expected count (urgent: 50 and 5×).
+  const logs = (now: number, expected: number) => plain({ section: 'logs', service: 'ecom-service-production', subject: '[StockService] reservation failed', status: undefined, totals: undefined, ...counts(now, expected) });
+  assert.equal(likelyMajor(logs(l.jumpMin, 0), noise, prod), true);
+  assert.equal(likelyMajor(logs(l.jumpMin - 1, 0), noise, prod), false, 'too few');
+  assert.equal(likelyMajor(logs(l.jumpMin, l.jumpMin / l.jumpFactor + 1), noise, prod), false, 'not enough above its expected count');
+  assert.ok(l.jumpMin < 50 && l.jumpFactor < 5, 'below urgent');
+  // A jump in client errors only where urgent() counts one.
+  const clientJump = plain({ ...counts(l.jumpMin, 0) });
+  assert.equal(likelyMajor(clientJump, noise, prod), false);
+  assert.equal(likelyMajor(clientJump, noise, { urgentClientErrors: true }), true, 'PATROL_URGENT_CLIENT_ERRORS');
+  // First flagged within 2 h after a deploy of its service (summary.ts afterDeploy).
+  assert.equal(likelyMajor(plain({ afterDeploy: 'first flagged 12 min after deploy product-catalog-service-production v1.2.3 (07:48Z)' }), noise, prod), true);
+});
+
+test('the AI gate: a row worth a look runs when no run started in the last hour, or at once when likely major; otherwise it waits, owed', () => {
+  const noise = new Noise({});
+  const c = { attentionFloor: 10, urgentClientErrors: false };
+  const t0 = new Date('2026-11-02T09:00:00Z');
+  const minutes = (m: number) => new Date(t0.getTime() + m * 60_000);
+  const state = State.memory();
+  const minor = plain();
+  const major = plain({ key: 'http|ecom-service-production|/v3/ecom/checkout/:cartId/complete|409', service: 'ecom-service-production', subject: '/v3/ecom/checkout/:cartId/complete', status: '409' });
+  for (const r of [minor, major]) state.seen(r, t0, ['http:v3']);
+  const summary = (rows: FlaggedRow[]) => ({ at: t0.toISOString(), windowMinutes: 15, send: rows, known: [], waiting: [], suppressed: [], recovered: [], deploys: { at: t0.toISOString(), hours: 6, deploys: [], notes: [] }, sources: [] }) as unknown as Parameters<typeof aiGate>[0];
+  const gate = (rows: FlaggedRow[], at = t0) => aiGate(summary(rows), state, noise, c, at);
+  assert.deepEqual([gate([minor]).run, gate([minor]).deferred], [true, false], 'no run on record');
+  state.runStarted(minutes(-HOURLY_PASS_MINUTES + 15));
+  const waits = gate([minor]);
+  assert.deepEqual([waits.run, waits.deferred, waits.nextPass, waits.likely], [false, true, '2026-11-02T09:15:00.000Z', []]);
+  assert.deepEqual([gate([minor], minutes(15)).run, gate([minor], minutes(15)).deferred], [true, false], 'an hour after the last run');
+  const both = gate([minor, major]);
+  assert.deepEqual([both.run, both.deferred, both.likely.map((r) => r.subject), both.pending.length], [true, false, ['/v3/ecom/checkout/:cartId/complete'], 2], 'the likely-major row runs now and takes the minor one along');
+  state.runStarted(minutes(30)); // a last run after this patrol: a replay over an older range
+  assert.equal(gate([minor]).run, true);
+  // Below the floor: no run, and no deferral either.
+  const small = plain({ counts: { now: 5, h1: 0, d1: 0, d7: 0 } });
+  state.seen(small, t0, ['http:v3']);
+  assert.deepEqual([gate([small]).run, gate([small]).deferred], [false, false]);
 });
 
 const report = (over: Partial<Report> = {}): Report => ({

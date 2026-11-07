@@ -5,12 +5,11 @@ import { z } from 'zod';
 import type { Config, Sources } from './config.js';
 import { ReplayTelemetry, SourceError, type Telemetry } from './clients/telemetry.js';
 import { rowMatcher, validRowPattern } from './eval.js';
-import { bucketOf } from './patrol/digest.js';
 import type { Noise } from './patrol/noise.js';
 import { State } from './patrol/state.js';
-import { buildSummary, urgent, type FlaggedRow, type Summary } from './patrol/summary.js';
+import { buildSummary, type FlaggedRow, type Summary } from './patrol/summary.js';
 import type { Section, SourceHealth } from './patrol/types.js';
-import { needsChallenge } from './runner.js';
+import { aiGate } from './runner.js';
 
 // Detector replay (plan 1.2 d): the patrol over recordings, with no AI and no
 // Slack, scored against an expect file. It answers three questions a change to
@@ -99,11 +98,11 @@ function exportSources(meta: ExportMeta, dir: string): Sources {
 
 // ---- the gate (gate-sim) ----------------------------------------------------------
 
-// The AI-run gate of patrolOnce (src/runner.ts: owedKnown 306, urgentRows 328,
-// pending 333, worthALook 336, the challenger 387) with no buttons and no
-// issue record, so no row is claimed. Keep it in step with the runner: the
-// test "the gate simulation starts a run exactly when the patrol does"
-// (test/detect.test.ts) compares the two.
+// The AI-run gate of patrolOnce: the same aiGate (src/runner.ts) with no
+// buttons and no issue record, so no row is claimed. A run it starts is
+// recorded as started, as the patrol does once its run is admitted, so the
+// hourly pass is modelled too. The tests "the gate simulation starts a run
+// exactly when the patrol does" (test/detect.test.ts) compare the two.
 export interface Gate {
   urgentRows: FlaggedRow[]; // the rows card goes to Slack at once
   owedKnown: FlaggedRow[]; // known rows an earlier run left uncovered
@@ -113,12 +112,9 @@ export interface Gate {
   challenger: boolean; // challenged whatever the reports say (needsChallenge): urgent rows
 }
 export function gateOf(s: Summary, state: State, noise: Noise, cfg: Pick<Config, 'attentionFloor' | 'urgentClientErrors'>): Gate {
-  const owedKnown = s.known.filter((r) => state.needsInvestigation(r.key));
-  const urgentRows = s.send.filter((r) => r.novelty !== 'reminder' && urgent(r, noise, cfg.urgentClientErrors));
-  const pending = [...s.send, ...owedKnown].filter((r) => state.needsInvestigation(r.key));
-  const look = pending.filter((r) => urgent(r, noise, cfg.urgentClientErrors) || bucketOf({ ...r, novelty: 'fresh' }, cfg.attentionFloor, noise.protected(r)) === 'look');
-  const run = look.length > 0;
-  return { urgentRows, owedKnown, pending, look, run, challenger: run && needsChallenge(pending, noise, cfg.urgentClientErrors) };
+  const g = aiGate(s, state, noise, cfg, new Date(s.at));
+  if (g.run) state.runStarted(new Date(s.at));
+  return g;
 }
 
 // Which rows a run's reports cover, in place of the model: all (the fewest

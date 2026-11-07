@@ -58,6 +58,86 @@ export function needsChallenge(rows: FlaggedRow[], noise: Noise, clientErrors = 
   return rows.some((r) => urgent(r, noise, clientErrors));
 }
 
+// ---- the AI gate: likely-major rows at once, the rest in an hourly pass -------
+
+// What makes a row likely major (likelyMajor). Tuned on the detector replay
+// (replay --expect) of the labelled incidents, the comparison days and report
+// week W: every labelled problem keeps its first AI run, and the fewest runs.
+export const LIKELY_MAJOR = {
+  // Checkout, payment, auth and order routes, at any status. Matched as a path
+  // segment on route-shaped rows only (HTTP, traffic drops, trace roots): a log
+  // line that merely says "checkout" or "token" is not one of them.
+  routes: /\/(checkout|payments?|orders?|auth)(\/|$)/i,
+  share5xx: 0.05, // a 5xx row failing at least this share of its route's requests
+  jumpFactor: 3, // a row at least this many times its expected count…
+  jumpMin: 30, // …with at least this many events (urgent: 5× and 50)
+};
+// Rows that aren't likely major get at most one AI run per this many minutes:
+// the hourly pass, which takes every pending row.
+export const HOURLY_PASS_MINUTES = 60;
+
+const ROUTE_SHAPED = new Set<FlaggedRow['section']>(['http', 'drop', 'traces']);
+
+// Likely major: worth an AI run at once rather than in the hourly pass. Urgent
+// rows (rollouts, protected journeys, big jumps), checkout, payment, auth and
+// order routes, a 5xx row failing a large share of its route's requests, a
+// smaller jump than urgent's, or a row first flagged within 2 h after a deploy
+// of its service. A jump in client errors (4xx) counts only where urgent()
+// counts one (PATROL_URGENT_CLIENT_ERRORS).
+export function likelyMajor(r: FlaggedRow, noise: Noise, cfg: Pick<Config, 'urgentClientErrors'>): boolean {
+  const l = LIKELY_MAJOR;
+  if (urgent(r, noise, cfg.urgentClientErrors) || r.afterDeploy) return true;
+  if (ROUTE_SHAPED.has(r.section) && l.routes.test(r.subject)) return true;
+  const serverError = r.section === 'http' && /^5\d\d$/.test(r.status ?? '');
+  if (serverError && r.totals && r.totals.now > 0 && r.counts.now / r.totals.now >= l.share5xx) return true;
+  const clientError = r.section === 'http' && /^4\d\d$/.test(r.status ?? '');
+  return (cfg.urgentClientErrors || !clientError) && r.counts.now >= l.jumpMin && r.counts.now >= l.jumpFactor * Math.max(1, r.score.expected);
+}
+
+export interface AiGate {
+  send: FlaggedRow[]; // summary.send but the rows someone clicked On it or Not an issue on
+  urgentRows: FlaggedRow[]; // new or worse and urgent: the rows card goes to Slack at once
+  owedKnown: FlaggedRow[]; // known rows still owed an answer: left uncovered, or deferred
+  pending: FlaggedRow[]; // what a run would be asked to cover
+  look: FlaggedRow[]; // the pending rows worth a run
+  likely: FlaggedRow[]; // the look rows likely major: a run now, whenever the last one was
+  run: boolean; // an AI run starts this patrol
+  deferred: boolean; // worth a run, none likely major, and a run started in the last hour
+  nextPass?: string; // deferred: when the hourly pass is due
+  challenger: boolean; // challenged whatever the reports say (needsChallenge): urgent rows
+}
+
+// The AI-run gate, decided by code before any run. patrolOnce runs it, and so
+// does the detector replay (detect.ts gateOf), so the two can't drift. A run
+// needs a row worth a look (new or worse, or left owed, and above the attention
+// floor). A likely-major one starts it at once. Otherwise it starts only if no
+// run started in the last HOURLY_PASS_MINUTES; if one did, the rows stay owed
+// (owedKnown next patrol) for the hourly pass, which takes them all in one run.
+// A deferral is not an attempt. A row that stops firing meanwhile drops out.
+// claimed: rows of an issue someone clicked On it or Not an issue on (claimedRows).
+export function aiGate(s: Summary, state: State, noise: Noise, cfg: Pick<Config, 'attentionFloor' | 'urgentClientErrors'>, at: Date, claimed: { has(key: string): boolean } = new Set()): AiGate {
+  const owedKnown = s.known.filter((r) => state.needsInvestigation(r.key));
+  const send = s.send.filter((r) => !claimed.has(r.key));
+  // New or worse only: a 6-hour reminder of something already posted isn't news.
+  const urgentRows = send.filter((r) => r.novelty !== 'reminder' && urgent(r, noise, cfg.urgentClientErrors));
+  // The rows the investigator still owes an answer: new or worse, or left
+  // uncovered by an earlier run. A reminder of a row it already explained is
+  // not one: it would only be reported again. A row held back by a click isn't
+  // in the run, so its record is left as it is: neither an attempt nor a deferral.
+  const pending = [...send, ...owedKnown.filter((r) => !claimed.has(r.key))].filter((r) => state.needsInvestigation(r.key));
+  // A run only for a row big enough to read (the card's "to look at", sized as
+  // if new): small rows on their own don't spend one.
+  const look = pending.filter((r) => urgent(r, noise, cfg.urgentClientErrors) || bucketOf({ ...r, novelty: 'fresh' }, cfg.attentionFloor, noise.protected(r)) === 'look');
+  const likely = look.filter((r) => likelyMajor(r, noise, cfg));
+  // A last run "later" than this patrol (a replay over an older range) holds nothing back.
+  const last = Date.parse(state.data.lastRunAt ?? '');
+  const next = last + HOURLY_PASS_MINUTES * 60_000;
+  const waits = last <= at.getTime() && at.getTime() < next;
+  const run = look.length > 0 && (likely.length > 0 || !waits);
+  const deferred = look.length > 0 && !run;
+  return { send, urgentRows, owedKnown, pending, look, likely, run, deferred, ...(deferred ? { nextPass: new Date(next).toISOString() } : {}), challenger: run && needsChallenge(pending, noise, cfg.urgentClientErrors) };
+}
+
 // Everything else reaches Slack only as an AI report rated one of these. Minor
 // and noise reports stay in the run folder, where the MCP answers from them.
 export const POSTED: ReadonlySet<Report['severity']> = new Set(['critical', 'major']);
@@ -301,13 +381,15 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
       if (o.post) sink.outbox?.updateRoot(id);
     }
 
-  // Rows still owed an answer from an earlier patrol (see below) are held back
-  // by a click too. A big one breaks through Not an issue, as a new one does.
+  // Rows still owed an answer from an earlier patrol (aiGate's owedKnown) are
+  // held back by a click too. A big one breaks through Not an issue, as a new one does.
   const owedKnown = summary.known.filter((r) => state.needsInvestigation(r.key));
   // The buttons: rows of an issue someone is on, or said is not an issue, are
   // left out of the AI run and of the rows card (see claimedRows).
   const claims = record('reading the buttons', () => claimedRows(o.buttons ? o.issues : undefined, [...summary.send, ...owedKnown], noise, at, cfg.urgentClientErrors), new Map());
-  const send = claims.size ? summary.send.filter((r) => !claims.has(r.key)) : summary.send;
+  // Who gets an AI run, and when: urgent and other likely-major rows at once, the rest in the hourly pass.
+  const gate = aiGate(summary, state, noise, cfg, at, claims);
+  const { send, urgentRows, pending } = gate;
   const shown = claims.size ? { ...summary, send } : summary; // for the rows card and the investigator
   const byIssue = new Map<string, FlaggedRow[]>();
   for (const r of summary.send) {
@@ -324,22 +406,16 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
     record(`noting worse rows on ${id}`, () => o.issues!.noteWorse(id, at, worse.map((r) => r.key)), undefined);
   }
 
-  // New or worse only: a 6-hour reminder of something already posted isn't news.
-  const urgentRows = send.filter((r) => r.novelty !== 'reminder' && urgent(r, noise, cfg.urgentClientErrors));
-  // The rows the investigator still owes an answer: new or worse, or left
-  // uncovered by an earlier run. A reminder of a row it already explained is
-  // not one: it would only be reported again. A row held back by a click isn't
-  // in the run, so its record is left as it is: neither an attempt nor a deferral.
-  const pending = [...send, ...owedKnown.filter((r) => !claims.has(r.key))].filter((r) => state.needsInvestigation(r.key));
-  // A run only for a row big enough to read (the card's "to look at", sized as
-  // if new): small rows on their own don't spend one.
-  const worthALook = pending.some((r) => urgent(r, noise, cfg.urgentClientErrors) || bucketOf({ ...r, novelty: 'fresh' }, cfg.attentionFloor, noise.protected(r)) === 'look');
-
   let skip: string | undefined;
   if (!o.llm) skip = 'LLM disabled for this run';
   else if (!monitor) skip = 'no monitor agent loaded';
   else if (!monitor.engine.llmAvailable) skip = 'no LLM credentials configured';
-  else if (!worthALook) skip = send.length ? 'nothing new above the attention floor' : 'every row belongs to an issue someone clicked On it or Not an issue on';
+  else if (!gate.look.length) skip = send.length ? 'nothing new above the attention floor' : 'every row belongs to an issue someone clicked On it or Not an issue on';
+  else if (gate.deferred) {
+    // The rows stay owed, with no attempt spent: neither the state nor a hold notice changes.
+    skip = `no likely-major row; the hourly pass covers it by ${gate.nextPass!.slice(11, 16)}Z`;
+    log(`${pending.length} row(s) wait for the hourly pass, due ${gate.nextPass!.slice(11, 16)}Z: none likely major, a run started at ${state.data.lastRunAt!.slice(11, 16)}Z`);
+  }
   // Quiet patrol: no LLM call, no card, $0. Rows owed an answer from an
   // earlier patrol make it a patrol only when they can be investigated now.
   if (!summary.send.length && skip) return finish();
@@ -411,6 +487,7 @@ export async function patrolOnce(tel: Telemetry, cfg: Config, noise: Noise, stat
         heldBy,
         onAdmitted: () => {
           admitted = true;
+          state.runStarted(at); // the hourly pass counts from here
         },
       });
     } catch (e) {
