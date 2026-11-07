@@ -5,8 +5,9 @@ import { existsSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { extractWWWAuthenticateParams } from '@modelcontextprotocol/sdk/client/auth.js';
 import { loadConfig } from '../src/config.js';
-import { JwksKeys, Login, Refused, serverName } from '../src/mcp/login.js';
+import { JwksKeys, Login, OFFLINE_LOG_MAX, Refused, serverName } from '../src/mcp/login.js';
 import { LOCK_WAIT_MS, nameFromEmail, Users } from '../src/mcp/users.js';
 import { fakeKeycloak } from './fake-keycloak.js';
 
@@ -19,10 +20,11 @@ const refusal = async (p: Promise<unknown>): Promise<number> => {
     return e.status;
   }
 };
+const quiet = () => {}; // the sign-in's offline_access log line, unwanted in test output
 
 test('a Keycloak access token for the engine client yields the verified company email', async () => {
   const kc = fakeKeycloak();
-  const login = new Login(kc.cfg, kc.keys);
+  const login = new Login(kc.cfg, kc.keys, Date.now, quiet);
   assert.equal(await login.verify(kc.token({ email: 'Ana@StarkFuture.com' })), 'ana@starkfuture.com');
   assert.equal(await login.verify(kc.token({ aud: ['account', 'agent-engine'] })), 'ana@starkfuture.com', 'aud may be a list');
   assert.equal(await login.verify(kc.token({ exp: Math.floor(Date.now() / 1000) - 2 })), 'ana@starkfuture.com', 'a few seconds of clock skew');
@@ -64,7 +66,59 @@ test('the protected-resource document points Claude Code at Keycloak', () => {
   const kc = fakeKeycloak('https://agent-engine.starkfuture.com/');
   const login = new Login({ ...kc.cfg, issuer: `${kc.cfg.issuer}/` }, kc.keys);
   assert.deepEqual(login.metadata(), { resource: 'https://agent-engine.starkfuture.com/mcp', authorization_servers: ['https://keycloak.test/auth/realms/stark'], bearer_methods_supported: ['header'], resource_name: 'agent-engine' });
-  assert.equal(login.challenge(), 'Bearer resource_metadata="https://agent-engine.starkfuture.com/.well-known/oauth-protected-resource/mcp"');
+  assert.equal(login.challenge(), 'Bearer resource_metadata="https://agent-engine.starkfuture.com/.well-known/oauth-protected-resource/mcp"', 'no scopes configured: the challenge is unchanged');
+  assert.equal(new Login({ ...kc.cfg, scopes: [] }, kc.keys).challenge(), login.challenge(), 'an empty KEYCLOAK_SCOPES is no scopes');
+});
+
+test('the 401 challenge names the configured scopes, so clients ask for an offline session', () => {
+  const kc = fakeKeycloak('https://agent-engine.starkfuture.com');
+  const bare = 'Bearer resource_metadata="https://agent-engine.starkfuture.com/.well-known/oauth-protected-resource/mcp"';
+  const env = { KEYCLOAK_ISSUER: 'https://keycloak.starkfuture.com/auth/realms/stark', ENGINE_PUBLIC_URL: 'https://agent-engine.starkfuture.com', KEYCLOAK_SCOPES: 'offline_access' };
+  const challenge = new Login({ ...kc.cfg, scopes: loadConfig(env).mcp.login!.scopes }, kc.keys).challenge();
+  assert.equal(challenge, `${bare}, scope="offline_access"`, 'RFC 6750 section 3: quoted, after resource_metadata');
+  assert.equal(new Login({ ...kc.cfg, scopes: ['offline_access', 'api://engine/read'] }, kc.keys).challenge(), `${bare}, scope="offline_access api://engine/read"`, 'several: space-separated');
+
+  // What an MCP SDK client reads from it (SEP-835: the challenge's scope comes first).
+  const read = extractWWWAuthenticateParams(new Response(null, { status: 401, headers: { 'www-authenticate': challenge } }));
+  assert.equal(read.scope, 'offline_access');
+  assert.equal(read.resourceMetadataUrl?.href, 'https://agent-engine.starkfuture.com/.well-known/oauth-protected-resource/mcp');
+
+  // A malformed scope (only possible by building Login directly: config.ts refuses it) never breaks the header.
+  const bad = ['offline_access "x"', 'a\\b', '"', 'x\r\nset-cookie: y', 'é', ''];
+  assert.equal(new Login({ ...kc.cfg, scopes: bad }, kc.keys).challenge(), bare, 'nothing usable: the challenge is unchanged');
+  assert.equal(new Login({ ...kc.cfg, scopes: ['offline_access', ...bad] }, kc.keys).challenge(), `${bare}, scope="offline_access"`, 'only the valid scope names');
+});
+
+test('the sign-in logs once per person whether the token is an offline one, never the token', async () => {
+  const kc = fakeKeycloak();
+  const lines: string[] = [];
+  const login = new Login(kc.cfg, kc.keys, Date.now, (s) => lines.push(s));
+  const online = kc.token({ scope: 'openid email profile' });
+  await login.verify(online);
+  await login.verify(online);
+  await login.verify(kc.token({ email: 'Ana@starkfuture.com' })); // no scope claim at all
+  await login.verify(kc.token({ scope: 'openid offline_access_x' }));
+  assert.deepEqual(lines, ['sign-in: ana · offline_access no'], 'once per person');
+  const offline = kc.token({ scope: 'openid offline_access email' });
+  await login.verify(offline);
+  await login.verify(offline);
+  assert.deepEqual(lines.slice(1), ['sign-in: ana · offline_access yes'], 'and once more when the answer changes (signed in again)');
+  await login.verify(kc.token({ email: 'bo@starkfuture.com', scope: 'offline_access' }));
+  assert.equal(lines[2], 'sign-in: bo · offline_access yes');
+  await refusal(login.verify(kc.token({ email: 'cy@starkfuture.com', exp: 1, scope: 'offline_access' })));
+  await refusal(login.verify(kc.token({ email: 'cy@gmail.com', scope: 'offline_access' })));
+  assert.equal(lines.length, 3, 'a refused token logs nothing');
+  for (const line of lines) {
+    for (const leak of [online, offline, online.split('.')[1]!, offline.split('.')[2]!, '@', 'f1d2c3b4', 'openid', 'email']) assert.ok(!line.includes(leak), `${line} leaks ${leak.slice(0, 12)}`);
+  }
+
+  // Bounded: the oldest person is forgotten first, and logged again on their next sign-in.
+  for (let i = 0; i < OFFLINE_LOG_MAX; i++) await login.verify(kc.token({ email: `u${i}@starkfuture.com` }));
+  assert.equal(lines.length, 3 + OFFLINE_LOG_MAX);
+  await login.verify(online);
+  assert.equal(lines.at(-1), 'sign-in: ana · offline_access no');
+  await login.verify(kc.token({ email: `u${OFFLINE_LOG_MAX - 1}@starkfuture.com` }));
+  assert.equal(lines.length, 4 + OFFLINE_LOG_MAX, 'a recent person is still remembered');
 });
 
 test('the document advertises KEYCLOAK_SCOPES so Claude Code asks for an offline session, and nothing by default', () => {
@@ -108,7 +162,7 @@ test('signing keys: cached, refetched for a new kid at most every 30 s, stale ke
   down = true;
   now += 11 * 60_000;
   assert.ok(await keys.keyFor('k1'), 'Keycloak unreachable: the cached key still verifies');
-  const login = new Login(kc.cfg, keys, () => now);
+  const login = new Login(kc.cfg, keys, () => now, quiet);
   assert.equal(await login.verify(kc.token()), 'ana@starkfuture.com');
 
   // During the outage, a key we don't hold can't be checked: 503, and no fetch per request.
